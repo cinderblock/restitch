@@ -1,0 +1,71 @@
+# Restitch - Configuration
+# Copy this to config.yaml and fill in your camera URLs.
+
+cameras:
+  - name: Camera 1
+    url: rtsp://192.168.1.100:554/stream    # RTSP URL for this camera
+    rotation: "0"    # 0, 90, 180, 270 (clockwise)
+    order: 0         # position in the stack (0 = first/top)
+
+  - name: Camera 2
+    url: rtsp://192.168.1.101:554/stream
+    rotation: "0"
+    order: 1
+
+  - name: Camera 3
+    url: rtsp://192.168.1.102:554/stream
+    rotation: "0"
+    order: 2
+
+# How the cameras are composited together
+composite:
+  name: full              # stream will be at rtsp://host:8554/full
+  direction: vertical     # vertical or horizontal stacking
+  rotation: "0"           # rotation applied AFTER stacking (0, 90, 180, 270)
+  # scale:                # uncomment to scale the composite output
+  #   width: 3600
+  #   height: 1280
+
+# Sub-streams: cropped regions from the full composite at native resolution
+# Coordinates are in the composite's pixel space (after stacking + rotation)
+# Supports pixel values or percentages (e.g. "50%")
+sub_streams:
+  - name: scaled
+    x: 0
+    y: 0
+    width: "100%"
+    height: "100%"
+    scale:
+      width: 1920
+      height: 1080
+
+  # - name: zone-a
+  #   x: "50%"
+  #   y: 0
+  #   width: "50%"
+  #   height: "100%"
+
+# Encoder settings (applied to all output streams)
+encoder:
+  codec: h264_nvenc         # h264_nvenc (NVIDIA), h264_qsv (Intel), libx264 (CPU)
+  preset: medium            # mapped to NVENC p1-p7, or libx264 preset names
+  crf: 18                   # quality (lower = better). Maps to -cq for NVENC
+  pixel_format: yuv420p
+  # maxrate: "20M"          # optional bitrate cap
+  # bufsize: "40M"          # optional buffer size
+  extra_args: []
+
+# Hardware acceleration for DECODING input streams
+# auto = try to detect, none = software only
+hwaccel: auto             # none, vaapi, qsv, nvenc, auto
+
+# Where to push output streams
+output:
+  format: rtsp            # rtsp, hls, or mpegts
+  base_url: rtsp://localhost:8554
+
+# Paths to FFmpeg binaries
+ffmpeg_path: ffmpeg
+ffprobe_path: ffprobe
+
+log_level: info           # quiet, error, warning, info, verbose, debug

@@ -1,0 +1,27 @@
+[Unit]
+Description=Restitch - Camera Compositing Pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=no
+User=__USER__
+WorkingDirectory=/opt/restitch
+ExecStart=/usr/bin/env bun run start
+Restart=always
+RestartSec=5
+
+# Give FFmpeg time to connect to all cameras on startup
+TimeoutStartSec=120
+
+# GPU access
+SupplementaryGroups=video render
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=restitch
+
+[Install]
+WantedBy=multi-user.target
