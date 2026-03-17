@@ -47,7 +47,7 @@ sub_streams:
 
 # Encoder settings (applied to all output streams)
 encoder:
-  codec: h264_nvenc         # h264_nvenc (NVIDIA), h264_qsv (Intel), libx264 (CPU)
+  codec: h264_nvenc         # h264_nvenc (max 4096w), hevc_nvenc (max 8192w), h264_qsv, libx264
   preset: medium            # mapped to NVENC p1-p7, or libx264 preset names
   crf: 18                   # quality (lower = better). Maps to -cq for NVENC
   pixel_format: yuv420p

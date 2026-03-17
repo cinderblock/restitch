@@ -9,7 +9,7 @@ export async function detectHwAccel(ffmpegPath: string): Promise<string> {
   // we try to actually initialize each device and see if it works.
   const candidates = isWindows
     ? ["cuda", "qsv"]         // vaapi is Linux-only
-    : ["vaapi", "qsv", "cuda"];
+    : ["cuda", "vaapi", "qsv"];
 
   for (const candidate of candidates) {
     if (await testHwAccel(ffmpegPath, candidate)) {

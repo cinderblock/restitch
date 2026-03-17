@@ -58,7 +58,7 @@ echo ""
 echo "--- Checking mediamtx ---"
 if ! command -v mediamtx &>/dev/null; then
   echo "Installing mediamtx..."
-  MEDIAMTX_VERSION="1.9.3"
+  MEDIAMTX_VERSION="1.16.3"
   ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
   curl -fsSL "https://github.com/bluenviron/mediamtx/releases/download/v${MEDIAMTX_VERSION}/mediamtx_v${MEDIAMTX_VERSION}_linux_${ARCH}.tar.gz" \
     | tar -xz -C /usr/local/bin mediamtx

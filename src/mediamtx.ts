@@ -48,7 +48,7 @@ export function generateMediaMTXConfig(
 
     // HLS server (useful for browser/HA access)
     hls: true,
-    hlsAddress: ":8888",
+    hlsAddress: ":8890",
 
     // WebRTC (low latency browser viewing)
     webrtc: true,
