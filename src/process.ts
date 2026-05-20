@@ -18,10 +18,10 @@ export type ProcessFactory = () => {
 export function launchManaged(
   name: string,
   factory: ProcessFactory,
-  opts: { maxRestarts?: number; restartDelayMs?: number } = {}
+  opts: { restartDelayMs?: number; maxDelayMs?: number } = {}
 ): ManagedProcess {
-  const maxRestarts = opts.maxRestarts ?? 10;
-  const restartDelayMs = opts.restartDelayMs ?? 3000;
+  const baseDelayMs = opts.restartDelayMs ?? 3000;
+  const maxDelayMs = opts.maxDelayMs ?? 60_000;
   let restartCount = 0;
   let stopped = false;
   let proc: Subprocess;
@@ -59,25 +59,19 @@ export function launchManaged(
       })();
     }
 
-    // Watch for exit and auto-restart
+    // Watch for exit and auto-restart with exponential backoff
     child.exited.then((code) => {
       if (stopped) return;
-      console.warn(`[${name}] Exited with code ${code}`);
-      if (restartCount < maxRestarts) {
-        restartCount++;
-        console.log(
-          `[${name}] Restarting (attempt ${restartCount}/${maxRestarts}) in ${restartDelayMs}ms...`
-        );
-        setTimeout(() => {
-          if (!stopped) {
-            proc = spawn();
-          }
-        }, restartDelayMs);
-      } else {
-        console.error(
-          `[${name}] Max restarts (${maxRestarts}) reached. Giving up.`
-        );
-      }
+      restartCount++;
+      const delay = Math.min(baseDelayMs * 2 ** (restartCount - 1), maxDelayMs);
+      console.warn(
+        `[${name}] Exited with code ${code}. Restarting (attempt ${restartCount}) in ${(delay / 1000).toFixed(0)}s...`
+      );
+      setTimeout(() => {
+        if (!stopped) {
+          proc = spawn();
+        }
+      }, delay);
     });
 
     return child;
