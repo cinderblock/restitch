@@ -2,16 +2,30 @@ import { z } from "zod";
 
 const RotationSchema = z.enum(["0", "90", "180", "270"]).default("0");
 
-const CameraSchema = z.object({
-  name: z.string().describe("Friendly name for this camera"),
-  url: z.string().describe("RTSP URL for the camera stream"),
-  rotation: RotationSchema.describe("Clockwise rotation in degrees"),
-  order: z
-    .number()
-    .int()
-    .nonnegative()
-    .describe("Position in the stack (0 = first)"),
-});
+const CameraSchema = z
+  .object({
+    name: z.string().describe("Friendly name for this camera"),
+    url: z.string().describe("RTSP URL for the camera stream"),
+    rotation: RotationSchema.describe("Clockwise rotation in degrees"),
+    order: z
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        "Position in the composite stack (0 = first). Required when composite is true."
+      ),
+    composite: z
+      .boolean()
+      .default(true)
+      .describe(
+        "If false, restream this camera through mediamtx but exclude it from the composite stack"
+      ),
+  })
+  .refine((cam) => cam.composite === false || cam.order !== undefined, {
+    message: "Cameras included in the composite must have 'order' set",
+    path: ["order"],
+  });
 
 /** Accepts a pixel count (number) or a percentage string like "50%" */
 const DimensionValue = z.union([

@@ -148,7 +148,12 @@ export function buildPipeline(
   config: Config,
   cameraProbes: Map<string, ProbeResult>
 ): Pipeline {
-  const cameras = [...config.cameras].sort((a, b) => a.order - b.order);
+  // Only cameras with composite !== false enter the stack. Restream-only
+  // cameras (composite: false) are still served by mediamtx for direct clients
+  // but skipped here — they have no order/rotation that matters to the stack.
+  const cameras = config.cameras
+    .filter((c) => c.composite !== false)
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
   const filters: string[] = [];
   const inputArgs: string[] = [];
 
