@@ -7,8 +7,17 @@ Built for Unifi cameras mounted across a shop ceiling, but works with any RTSP s
 ## Architecture
 
 ```
-RTSP Cameras  -->  FFmpeg (decode, rotate, stack, crop, encode)  -->  mediamtx (RTSP/HLS/WebRTC)  -->  Home Assistant / browsers
+                          .--> FFmpeg compositor --.    composite + crops
+                         /     (decode/stack/crop/  \
+RTSP Cameras --> mediamtx       encode, publishes    +--> clients
+                         \      back to mediamtx)   /    (HA, browsers, NVR replacements, ...)
+                          '----- raw per-camera --'
 ```
+
+mediamtx is the single upstream client of each camera: it holds one persistent
+TCP RTSP connection per camera and fans out to every consumer (the compositor,
+HA, browsers, etc.). That keeps the load on the upstream NVR fixed regardless of
+how many viewers are connected.
 
 ## Prerequisites
 

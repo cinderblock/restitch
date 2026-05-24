@@ -153,16 +153,20 @@ export function buildPipeline(
   const inputArgs: string[] = [];
 
   // --- Inputs ---
-  // Pull directly from cameras (or from local mediamtx raw streams if isolated).
+  // Pull from the local mediamtx raw paths, not the upstream cameras directly.
+  // mediamtx holds the single connection per camera and fans out — that keeps
+  // the upstream NVR's client count low (1 per camera, regardless of how many
+  // consumers there are: this compositor, HA, browsers, ...).
   // Wall clock timestamps ensure all inputs share the same time base,
   // which is critical for vstack to produce output frames.
   for (const cam of cameras) {
+    const sourceUrl = `${config.output.base_url}/${rawStreamName(cam)}`;
     inputArgs.push(
       ...hwaccelInputArgs(config.hwaccel),
       "-use_wallclock_as_timestamps", "1",
       "-thread_queue_size", "4096",
       "-rtsp_transport", "tcp",
-      "-i", cam.url
+      "-i", sourceUrl
     );
   }
 

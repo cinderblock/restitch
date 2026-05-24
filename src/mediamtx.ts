@@ -15,14 +15,27 @@ export function rawStreamName(cam: Camera): string {
 
 /**
  * Generate a mediamtx configuration file with paths for:
- *  - raw camera ingest streams (one per camera, fed by per-camera FFmpeg)
+ *  - raw camera streams (one per camera, sourced directly from the upstream URL)
  *  - composite + sub-stream outputs (fed by the compositor FFmpeg)
+ *
+ * The raw paths make mediamtx the single upstream client per camera: it pulls
+ * once and fans out to every consumer (the compositor, HA, browsers, …),
+ * offloading the upstream NVR.
  */
 export function generateMediaMTXConfig(
   config: Config,
   outputs: PipelineOutput[]
 ): string {
   const paths: Record<string, object> = {};
+
+  // Raw camera restream paths — mediamtx holds a persistent TCP RTSP
+  // connection to each camera and serves all downstream readers.
+  for (const cam of config.cameras) {
+    paths[rawStreamName(cam)] = {
+      source: cam.url,
+      rtspTransport: "tcp",
+    };
+  }
 
   // Composite and sub-stream output paths
   for (const out of outputs) {
