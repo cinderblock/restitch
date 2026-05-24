@@ -76,6 +76,30 @@ export function generateMediaMTXConfig(
     api: true,
     apiAddress: ":9997",
 
+    // mediamtx defaults API access to 127.0.0.1/::1 only. Widen the
+    // default user's permission set so LAN clients can also query.
+    // Safe because the host itself is LAN-only.
+    authInternalUsers: [
+      {
+        user: "any",
+        ips: [],
+        permissions: [
+          { action: "publish" },
+          { action: "read" },
+          { action: "playback" },
+        ],
+      },
+      {
+        user: "any",
+        ips: [],
+        permissions: [
+          { action: "api" },
+          { action: "metrics" },
+          { action: "pprof" },
+        ],
+      },
+    ],
+
     // Stream paths
     paths,
   };
