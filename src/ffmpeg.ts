@@ -93,6 +93,11 @@ function encoderArgs(encoder: Encoder, streamName: string, codecOverride?: strin
       args.push("-tune", "hq");
       args.push("-multipass", "fullres");
     }
+    // Force a 2-second GOP (60 frames @ 30fps). WebRTC and HLS clients
+    // can only start decoding from a keyframe — without this, NVENC was
+    // producing P-only streams that left browsers stuck on the spinner.
+    args.push("-g", "60");
+    args.push("-keyint_min", "60");
     args.push("-pix_fmt", encoder.pixel_format);
   } else if (isQsvEncoder(codec)) {
     // QSV: use ICQ (intelligent constant quality) rate control mode
