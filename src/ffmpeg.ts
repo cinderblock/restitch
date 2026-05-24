@@ -170,6 +170,12 @@ export function buildPipeline(
       ...hwaccelInputArgs(config.hwaccel),
       "-use_wallclock_as_timestamps", "1",
       "-thread_queue_size", "4096",
+      // Cameras advertise 3 tracks (MPEG-4 Audio, Opus, H264). We only encode
+      // video — pulling the audio tracks too floods FFmpeg's RTP demuxer with
+      // packets it just discards, producing "bad cseq" warnings and dropping
+      // video packets along the way. That corrupts the encoded output enough
+      // to keep WebRTC clients stuck waiting for a clean keyframe.
+      "-allowed_media_types", "video",
       "-rtsp_transport", "tcp",
       "-i", sourceUrl
     );
