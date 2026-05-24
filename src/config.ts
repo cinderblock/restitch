@@ -33,6 +33,7 @@ const SubStreamSchema = z.object({
     })
     .optional()
     .describe("Optional output scale. Omit to keep native crop resolution"),
+  codec: z.string().optional().describe("Override the global encoder codec for this sub-stream"),
 });
 
 const HwAccelSchema = z

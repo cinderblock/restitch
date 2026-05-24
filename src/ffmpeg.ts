@@ -71,12 +71,13 @@ function mapNvencPreset(preset: string): string {
   return map[preset] ?? "p4";
 }
 
-function encoderArgs(encoder: Encoder, streamName: string): string[] {
+function encoderArgs(encoder: Encoder, streamName: string, codecOverride?: string): string[] {
+  const codec = codecOverride ?? encoder.codec;
   const args: string[] = [];
 
-  args.push("-c:v", encoder.codec);
+  args.push("-c:v", codec);
 
-  if (isNvencEncoder(encoder.codec)) {
+  if (isNvencEncoder(codec)) {
     // NVENC: constant quality via VBR rate control with -cq.
     // -b:v 0 ensures true constant quality (no bitrate target).
     // -tune hq enables B-frames and look-ahead for better quality.
@@ -85,10 +86,15 @@ function encoderArgs(encoder: Encoder, streamName: string): string[] {
     args.push("-cq", String(encoder.crf));
     args.push("-b:v", "0");
     args.push("-preset", mapNvencPreset(encoder.preset));
-    args.push("-tune", "hq");
-    args.push("-multipass", "fullres");
+    if (codec.includes("264")) {
+      args.push("-tune", "ll");
+      args.push("-bf", "0");
+    } else {
+      args.push("-tune", "hq");
+      args.push("-multipass", "fullres");
+    }
     args.push("-pix_fmt", encoder.pixel_format);
-  } else if (isQsvEncoder(encoder.codec)) {
+  } else if (isQsvEncoder(codec)) {
     // QSV: use ICQ (intelligent constant quality) rate control mode
     // with -global_quality. Requires explicit -look_ahead 1 for quality.
     args.push("-global_quality", String(encoder.crf));
@@ -96,7 +102,7 @@ function encoderArgs(encoder: Encoder, streamName: string): string[] {
     args.push("-preset", encoder.preset);
     // QSV needs explicit framerate when input is variable or from filters
     args.push("-r", "30");
-  } else if (encoder.codec.includes("264") || encoder.codec.includes("265")) {
+  } else if (codec.includes("264") || codec.includes("265")) {
     args.push("-preset", encoder.preset);
     args.push("-crf", String(encoder.crf));
     args.push("-pix_fmt", encoder.pixel_format);
@@ -123,6 +129,7 @@ export interface ProbeResult {
 export interface PipelineOutput {
   name: string;
   mapLabel: string;
+  codecOverride?: string;
 }
 
 export interface Pipeline {
@@ -308,7 +315,7 @@ export function buildPipeline(
     }
 
     filters.push(`${cropFilter}${cropLabel}`);
-    outputs.push({ name: sub.name, mapLabel: cropLabel });
+    outputs.push({ name: sub.name, mapLabel: cropLabel, codecOverride: sub.codec });
   }
 
   const filterComplex = filters.join(";\n");
@@ -352,7 +359,7 @@ export function buildCommand(config: Config, pipeline: Pipeline): string[] {
   // Outputs
   for (const out of pipeline.outputs) {
     cmd.push("-map", out.mapLabel);
-    cmd.push(...encoderArgs(config.encoder, out.name));
+    cmd.push(...encoderArgs(config.encoder, out.name, out.codecOverride));
     cmd.push("-an"); // no audio
     if (config.output.format === "rtsp") {
       cmd.push("-rtsp_transport", "tcp");
