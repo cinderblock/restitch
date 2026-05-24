@@ -67,6 +67,15 @@ export function generateMediaMTXConfig(
     webrtc: true,
     webrtcAddress: ":8889",
 
+    // Control API — unauthenticated, LAN only. Endpoints under /v3/:
+    //   GET /v3/paths/list           paths + reader/source state + bytes
+    //   GET /v3/paths/get/<name>     one path
+    //   GET /v3/rtspsessions/list    active RTSP readers/publishers
+    //   GET /v3/webrtcsessions/list  active WebRTC viewers
+    //   GET /v3/hlsmuxers/list       active HLS muxers
+    api: true,
+    apiAddress: ":9997",
+
     // Stream paths
     paths,
   };
