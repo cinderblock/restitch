@@ -102,11 +102,11 @@ download_if_missing \
   "$MODELS_DIR/ggml-distil-large-v3.bin" \
   500000000
 
-# silero-v5 VAD ggml model (small; from ggml-org/whisper-vad HF repo)
+# silero-v5 VAD ggml model (~885 KB; from ggml-org/whisper-vad HF repo)
 download_if_missing \
   "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin" \
   "$MODELS_DIR/ggml-silero-v5.1.2.bin" \
-  1000000
+  500000
 
 echo ""
 echo "=== Done ==="
