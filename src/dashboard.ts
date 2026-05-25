@@ -31,7 +31,11 @@ const HTML = `<!DOCTYPE html>
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); }
   tr:last-child td { border-bottom: none; }
-  th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+  th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; user-select: none; }
+  th.sortable { cursor: pointer; }
+  th.sortable:hover { color: var(--text); }
+  th.sortable .arrow { display: inline-block; width: 10px; margin-left: 4px; color: var(--accent); opacity: 0; }
+  th.sortable.active .arrow { opacity: 1; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .pill { display: inline-block; font-size: 10px; padding: 2px 8px; border-radius: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
   .pill.good { color: var(--good); background: rgba(93,213,144,0.12); }
@@ -60,7 +64,16 @@ const HTML = `<!DOCTYPE html>
 <div class="panel">
   <h2>Streams</h2>
   <table>
-    <thead><tr><th>Name</th><th>State</th><th>Source</th><th>Tracks</th><th class="num">RX</th><th class="num">TX</th><th class="num">Bitrate</th><th class="num">Readers</th></tr></thead>
+    <thead><tr>
+      <th class="sortable" data-table="paths" data-key="name">Name<span class="arrow"></span></th>
+      <th class="sortable" data-table="paths" data-key="state">State<span class="arrow"></span></th>
+      <th class="sortable" data-table="paths" data-key="source">Source<span class="arrow"></span></th>
+      <th class="sortable" data-table="paths" data-key="tracks">Tracks<span class="arrow"></span></th>
+      <th class="sortable num" data-table="paths" data-key="rx">RX<span class="arrow"></span></th>
+      <th class="sortable num" data-table="paths" data-key="tx">TX<span class="arrow"></span></th>
+      <th class="sortable num" data-table="paths" data-key="bitrate">Bitrate<span class="arrow"></span></th>
+      <th class="sortable num" data-table="paths" data-key="readers">Readers<span class="arrow"></span></th>
+    </tr></thead>
     <tbody id="paths"></tbody>
   </table>
 </div>
@@ -68,7 +81,14 @@ const HTML = `<!DOCTYPE html>
 <div class="panel">
   <h2>Active sessions</h2>
   <table>
-    <thead><tr><th>Peer</th><th class="num">Streams</th><th>Reading</th><th>Publishing</th><th>Via</th><th class="num">Bytes</th></tr></thead>
+    <thead><tr>
+      <th class="sortable" data-table="sessions" data-key="peer">Peer<span class="arrow"></span></th>
+      <th class="sortable num" data-table="sessions" data-key="count">Streams<span class="arrow"></span></th>
+      <th class="sortable" data-table="sessions" data-key="reading">Reading<span class="arrow"></span></th>
+      <th class="sortable" data-table="sessions" data-key="publishing">Publishing<span class="arrow"></span></th>
+      <th>Via</th>
+      <th class="sortable num" data-table="sessions" data-key="bytes">Bytes<span class="arrow"></span></th>
+    </tr></thead>
     <tbody id="sessions"></tbody>
   </table>
 </div>
@@ -106,6 +126,56 @@ function stat(label, value, percent) {
 let prev = new Map();
 let prevTs = 0;
 
+// Sort state (persisted in localStorage so it survives reloads).
+function loadSort(k, def) { try { return JSON.parse(localStorage.getItem(k)) || def; } catch { return def; } }
+function saveSort(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+const sort = {
+  paths: loadSort('restitch.sort.paths', { key: 'name', dir: 1 }),
+  sessions: loadSort('restitch.sort.sessions', { key: 'bytes', dir: -1 }),
+};
+const pathKey = (p, key) => {
+  switch (key) {
+    case 'name': return p.name;
+    case 'state': return p.ready ? 1 : 0;
+    case 'source': return p.source ? p.source.type : 'publisher';
+    case 'tracks': return (p.tracks || []).length;
+    case 'rx': return p.bytesReceived || 0;
+    case 'tx': return p.bytesSent || 0;
+    case 'bitrate': return p._bps || 0;
+    case 'readers': return (p.readers || []).length;
+    default: return 0;
+  }
+};
+const sessionKey = (g, key) => {
+  switch (key) {
+    case 'peer': return g._sortPeer;
+    case 'count': return g.count;
+    case 'reading': return g.reading.size;
+    case 'publishing': return g.publishing.size;
+    case 'bytes': return g.bytes;
+    default: return 0;
+  }
+};
+const cmp = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+
+function updateSortIndicators() {
+  for (const th of document.querySelectorAll('th.sortable')) {
+    const t = th.dataset.table, k = th.dataset.key;
+    const active = sort[t] && sort[t].key === k;
+    th.classList.toggle('active', !!active);
+    th.querySelector('.arrow').textContent = active ? (sort[t].dir > 0 ? '▲' : '▼') : '';
+  }
+}
+document.addEventListener('click', e => {
+  const th = e.target.closest('th.sortable');
+  if (!th) return;
+  const t = th.dataset.table, k = th.dataset.key;
+  if (sort[t].key === k) sort[t].dir = -sort[t].dir;
+  else { sort[t].key = k; sort[t].dir = (k === 'name' || k === 'peer') ? 1 : -1; }
+  saveSort('restitch.sort.' + t, sort[t]);
+  tick();
+});
+
 async function tick() {
   try {
     const [paths, rtsp, webrtc, hls, sys, peers] = await Promise.all([
@@ -140,10 +210,15 @@ async function tick() {
     }
     document.getElementById('system').innerHTML = html;
 
-    // Paths
-    const pathRows = (paths.items || []).map(p => {
+    // Paths — enrich with computed bps, then sort.
+    const enrichedPaths = (paths.items || []).map(p => {
       const prevP = prev.get(p.name);
       const bps = prevP && dt > 0 ? Math.max(0, (p.bytesSent - prevP.bytesSent) / dt) : 0;
+      return Object.assign({}, p, { _bps: bps });
+    });
+    enrichedPaths.sort((a, b) => cmp(pathKey(a, sort.paths.key), pathKey(b, sort.paths.key)) * sort.paths.dir);
+    const pathRows = enrichedPaths.map(p => {
+      const bps = p._bps;
       const readerCount = (p.readers || []).length;
       const ready = p.ready
         ? '<span class="pill good">ready</span>'
@@ -176,15 +251,18 @@ async function tick() {
     for (const s of all) {
       const remote = s.remoteAddr;
       let key, displayPeer;
+      let sortLabel;
       if (remote && (remote.startsWith('127.') || remote.startsWith('[::1]') || remote.startsWith('::1'))) {
         const peer = peers[remote];
         if (peer) {
           key = 'local:' + peer.command + ':' + peer.pid;
           displayPeer = '<span style="color: var(--accent);">' + peer.command + '</span>'
             + ' <span style="color: var(--muted); font-size: 11px;">pid ' + peer.pid + '</span>';
+          sortLabel = peer.command + ':' + peer.pid;
         } else {
           key = 'local:' + remote;
           displayPeer = '<code>' + remote + '</code>';
+          sortLabel = remote;
         }
       } else if (remote) {
         // Strip ephemeral port so multiple connections from same IP collapse.
@@ -193,13 +271,15 @@ async function tick() {
         const addr = portIdx > 0 ? remote.slice(0, portIdx) : remote;
         key = 'remote:' + addr;
         displayPeer = '<code>' + addr + '</code>';
+        sortLabel = addr;
       } else {
         key = 'unknown';
         displayPeer = '<span style="color: var(--muted);">—</span>';
+        sortLabel = '';
       }
       let g = groups.get(key);
       if (!g) {
-        g = { displayPeer, count: 0, reading: new Set(), publishing: new Set(), protos: new Set(), bytes: 0 };
+        g = { displayPeer, _sortPeer: sortLabel.toLowerCase(), count: 0, reading: new Set(), publishing: new Set(), protos: new Set(), bytes: 0 };
         groups.set(key, g);
       }
       g.count++;
@@ -213,7 +293,7 @@ async function tick() {
       ? [...set].sort().map(p => '<code>' + p + '</code>').join(' ')
       : '<span style="color: var(--muted);">—</span>';
     const sessRows = [...groups.values()]
-      .sort((a, b) => b.bytes - a.bytes)
+      .sort((a, b) => cmp(sessionKey(a, sort.sessions.key), sessionKey(b, sort.sessions.key)) * sort.sessions.dir)
       .map(g => '<tr>'
         + '<td style="font-size: 12px;">' + g.displayPeer + '</td>'
         + '<td class="num">' + g.count + '</td>'
@@ -227,6 +307,7 @@ async function tick() {
 
     prev = new Map((paths.items || []).map(p => [p.name, p]));
     prevTs = now;
+    updateSortIndicators();
     document.getElementById('updated').textContent = 'updated ' + new Date(now).toLocaleTimeString();
   } catch (e) {
     document.getElementById('updated').textContent = 'error: ' + (e && e.message ? e.message : String(e));
