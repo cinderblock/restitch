@@ -68,7 +68,7 @@ const HTML = `<!DOCTYPE html>
 <div class="panel">
   <h2>Active sessions</h2>
   <table>
-    <thead><tr><th>Protocol</th><th>Path</th><th>Direction</th><th>Remote</th><th class="num">Bytes</th></tr></thead>
+    <thead><tr><th>Protocol</th><th>Path</th><th>Direction</th><th>Peer</th><th class="num">Bytes</th></tr></thead>
     <tbody id="sessions"></tbody>
   </table>
 </div>
@@ -108,12 +108,13 @@ let prevTs = 0;
 
 async function tick() {
   try {
-    const [paths, rtsp, webrtc, hls, sys] = await Promise.all([
+    const [paths, rtsp, webrtc, hls, sys, peers] = await Promise.all([
       fetch('api/paths').then(r => r.json()),
       fetch('api/rtsp').then(r => r.json()),
       fetch('api/webrtc').then(r => r.json()),
       fetch('api/hls').then(r => r.json()),
       fetch('api/system').then(r => r.json()),
+      fetch('api/peers').then(r => r.json()),
     ]);
     const now = Date.now();
     const dt = prevTs ? (now - prevTs) / 1000 : 1;
@@ -170,11 +171,20 @@ async function tick() {
     for (const s of rtsp.items || []) all.push({ proto: 'RTSP', ...s });
     for (const s of webrtc.items || []) all.push({ proto: 'WebRTC', ...s });
     for (const s of hls.items || []) all.push({ proto: 'HLS', ...s, state: 'reading' });
+    const peerLabel = remote => {
+      if (!remote) return '—';
+      const isLocal = remote.startsWith('127.') || remote.startsWith('[::1]') || remote.startsWith('::1');
+      if (isLocal && peers[remote]) {
+        return '<span style="color: var(--accent);">' + peers[remote].command + '</span>'
+          + ' <span style="color: var(--muted); font-size: 11px;">pid ' + peers[remote].pid + '</span>';
+      }
+      return '<code>' + remote + '</code>';
+    };
     const sessRows = all.map(s => '<tr>'
       + '<td><span class="pill warn">' + s.proto + '</span></td>'
       + '<td><code>' + (s.path || '—') + '</code></td>'
       + '<td style="color: var(--muted); font-size: 12px;">' + (s.state || '—') + '</td>'
-      + '<td style="color: var(--muted); font-size: 12px;"><code>' + (s.remoteAddr || '—') + '</code></td>'
+      + '<td style="font-size: 12px;">' + peerLabel(s.remoteAddr) + '</td>'
       + '<td class="num">' + fmtBytes((s.bytesSent || 0) + (s.bytesReceived || 0)) + '</td>'
       + '</tr>');
     document.getElementById('sessions').innerHTML = sessRows.join('')
@@ -216,6 +226,40 @@ async function proxyJson(url: string): Promise<Response> {
       { status: 502 }
     );
   }
+}
+
+/**
+ * Map of "addr:port" -> { command, pid } for every ESTABLISHED TCP socket,
+ * keyed by the *local* side of each socket. Used to translate a session's
+ * remote address (which from the OS view is some other process's local
+ * address) into a human-readable executable name.
+ *
+ * Calls `sudo ss` non-interactively. cameron has NOPASSWD on sentinel, so
+ * this never blocks; on a host without that, the call fails silently and
+ * the dashboard falls back to showing the raw address.
+ */
+async function readPeers(): Promise<Record<string, { command: string; pid: number }>> {
+  const peers: Record<string, { command: string; pid: number }> = {};
+  try {
+    const proc = Bun.spawn(["sudo", "-n", "ss", "-tnpH"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = await new Response(proc.stdout).text();
+    if ((await proc.exited) !== 0) return peers;
+    for (const line of out.split("\n")) {
+      // ESTAB 0 0 <local> <peer> users:(("name",pid=NNN,fd=NNN))
+      const m = line.match(
+        /^\s*ESTAB\s+\d+\s+\d+\s+(\S+)\s+\S+\s+users:\(\("([^"]+)",pid=(\d+)/
+      );
+      if (!m) continue;
+      const [, local, command, pidStr] = m;
+      peers[local!] = { command: command!, pid: Number(pidStr) };
+    }
+  } catch {
+    // sudo / ss unavailable — return what we have (empty).
+  }
+  return peers;
 }
 
 async function readSystemInfo(): Promise<unknown> {
@@ -296,6 +340,8 @@ export function startDashboard(dashboard: Dashboard): Server {
           return proxyJson(`${apiBase}/v3/hlsmuxers/list`);
         case "/api/system":
           return Response.json(await readSystemInfo());
+        case "/api/peers":
+          return Response.json(await readPeers());
         default:
           return new Response("Not found", { status: 404 });
       }
