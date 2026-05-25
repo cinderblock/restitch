@@ -68,7 +68,7 @@ const HTML = `<!DOCTYPE html>
 <div class="panel">
   <h2>Active sessions</h2>
   <table>
-    <thead><tr><th>Protocol</th><th>Path</th><th>Direction</th><th>Peer</th><th class="num">Bytes</th></tr></thead>
+    <thead><tr><th>Peer</th><th class="num">Streams</th><th>Reading</th><th>Publishing</th><th>Via</th><th class="num">Bytes</th></tr></thead>
     <tbody id="sessions"></tbody>
   </table>
 </div>
@@ -171,24 +171,59 @@ async function tick() {
     for (const s of rtsp.items || []) all.push({ proto: 'RTSP', ...s });
     for (const s of webrtc.items || []) all.push({ proto: 'WebRTC', ...s });
     for (const s of hls.items || []) all.push({ proto: 'HLS', ...s, state: 'reading' });
-    const peerLabel = remote => {
-      if (!remote) return '—';
-      const isLocal = remote.startsWith('127.') || remote.startsWith('[::1]') || remote.startsWith('::1');
-      if (isLocal && peers[remote]) {
-        return '<span style="color: var(--accent);">' + peers[remote].command + '</span>'
-          + ' <span style="color: var(--muted); font-size: 11px;">pid ' + peers[remote].pid + '</span>';
+    // Group sessions by peer process (localhost: command+pid; remote: IP).
+    const groups = new Map();
+    for (const s of all) {
+      const remote = s.remoteAddr;
+      let key, displayPeer;
+      if (remote && (remote.startsWith('127.') || remote.startsWith('[::1]') || remote.startsWith('::1'))) {
+        const peer = peers[remote];
+        if (peer) {
+          key = 'local:' + peer.command + ':' + peer.pid;
+          displayPeer = '<span style="color: var(--accent);">' + peer.command + '</span>'
+            + ' <span style="color: var(--muted); font-size: 11px;">pid ' + peer.pid + '</span>';
+        } else {
+          key = 'local:' + remote;
+          displayPeer = '<code>' + remote + '</code>';
+        }
+      } else if (remote) {
+        // Strip ephemeral port so multiple connections from same IP collapse.
+        const isIpv6Bracketed = remote.startsWith('[');
+        const portIdx = isIpv6Bracketed ? remote.lastIndexOf(']:') + 1 : remote.lastIndexOf(':');
+        const addr = portIdx > 0 ? remote.slice(0, portIdx) : remote;
+        key = 'remote:' + addr;
+        displayPeer = '<code>' + addr + '</code>';
+      } else {
+        key = 'unknown';
+        displayPeer = '<span style="color: var(--muted);">—</span>';
       }
-      return '<code>' + remote + '</code>';
-    };
-    const sessRows = all.map(s => '<tr>'
-      + '<td><span class="pill warn">' + s.proto + '</span></td>'
-      + '<td><code>' + (s.path || '—') + '</code></td>'
-      + '<td style="color: var(--muted); font-size: 12px;">' + (s.state || '—') + '</td>'
-      + '<td style="font-size: 12px;">' + peerLabel(s.remoteAddr) + '</td>'
-      + '<td class="num">' + fmtBytes((s.bytesSent || 0) + (s.bytesReceived || 0)) + '</td>'
-      + '</tr>');
+      let g = groups.get(key);
+      if (!g) {
+        g = { displayPeer, count: 0, reading: new Set(), publishing: new Set(), protos: new Set(), bytes: 0 };
+        groups.set(key, g);
+      }
+      g.count++;
+      g.protos.add(s.proto);
+      g.bytes += (s.bytesSent || 0) + (s.bytesReceived || 0);
+      const path = s.path || '—';
+      if (s.state === 'publish') g.publishing.add(path);
+      else g.reading.add(path); // HLS, WebRTC, and RTSP state=read all count as reading
+    }
+    const fmtPaths = set => set.size
+      ? [...set].sort().map(p => '<code>' + p + '</code>').join(' ')
+      : '<span style="color: var(--muted);">—</span>';
+    const sessRows = [...groups.values()]
+      .sort((a, b) => b.bytes - a.bytes)
+      .map(g => '<tr>'
+        + '<td style="font-size: 12px;">' + g.displayPeer + '</td>'
+        + '<td class="num">' + g.count + '</td>'
+        + '<td>' + fmtPaths(g.reading) + '</td>'
+        + '<td>' + fmtPaths(g.publishing) + '</td>'
+        + '<td>' + [...g.protos].sort().map(p => '<span class="pill warn">' + p + '</span>').join(' ') + '</td>'
+        + '<td class="num">' + fmtBytes(g.bytes) + '</td>'
+        + '</tr>');
     document.getElementById('sessions').innerHTML = sessRows.join('')
-      || '<tr><td colspan="5" class="empty">no active sessions</td></tr>';
+      || '<tr><td colspan="6" class="empty">no active sessions</td></tr>';
 
     prev = new Map((paths.items || []).map(p => [p.name, p]));
     prevTs = now;
