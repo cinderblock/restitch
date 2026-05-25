@@ -138,6 +138,17 @@ const TranscriptionSchema = z.object({
     .positive()
     .default(200)
     .describe("Ring buffer size per camera (oldest dropped beyond this)"),
+  language: z
+    .string()
+    .default("en")
+    .describe("Whisper language hint (e.g. 'en'); skips auto-detection"),
+  initial_prompt: z
+    .string()
+    .default(
+      "Conversation in a warehouse. Voices may be muffled by machinery, " +
+        "forklifts, drills, and other industrial equipment in the background."
+    )
+    .describe("Few-shot prompt that biases whisper's vocabulary toward the domain"),
 });
 
 export const ConfigSchema = z.object({
@@ -177,6 +188,10 @@ export const ConfigSchema = z.object({
     },
     chunk_seconds: 30,
     max_entries_per_camera: 200,
+    language: "en",
+    initial_prompt:
+      "Conversation in a warehouse. Voices may be muffled by machinery, " +
+      "forklifts, drills, and other industrial equipment in the background.",
   }),
   ffmpeg_path: z.string().default("ffmpeg"),
   ffprobe_path: z.string().default("ffprobe"),

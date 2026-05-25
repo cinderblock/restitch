@@ -112,7 +112,12 @@ function makeWavHeader(
   return new Uint8Array(buf);
 }
 
-async function transcribe(serverUrl: string, pcm: Uint8Array): Promise<string> {
+async function transcribe(
+  serverUrl: string,
+  pcm: Uint8Array,
+  language: string,
+  initialPrompt: string
+): Promise<string> {
   const header = makeWavHeader(pcm.length);
   const wav = new Uint8Array(header.length + pcm.length);
   wav.set(header, 0);
@@ -121,7 +126,8 @@ async function transcribe(serverUrl: string, pcm: Uint8Array): Promise<string> {
   const form = new FormData();
   form.append("file", new Blob([wav], { type: "audio/wav" }), "audio.wav");
   form.append("response_format", "json");
-  // No language hint — let whisper auto-detect (multilingual model).
+  if (language) form.append("language", language);
+  if (initialPrompt) form.append("prompt", initialPrompt);
 
   const r = await fetch(`${serverUrl}/inference`, {
     method: "POST",
@@ -216,7 +222,12 @@ function startCameraPump(
     pending = [];
     pendingBytes = 0;
     try {
-      const text = await transcribe(whisperUrl, pcm);
+      const text = await transcribe(
+        whisperUrl,
+        pcm,
+        config.transcription.language,
+        config.transcription.initial_prompt
+      );
       if (text) {
         console.log(`[${cam.name}] ${text}`);
         ring.push(cam.name, text);
