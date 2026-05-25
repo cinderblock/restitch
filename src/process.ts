@@ -10,6 +10,9 @@ export interface ManagedProcess {
 export type ProcessFactory = () => {
   cmd: string[];
   onStderr?: (line: string) => void;
+  /** Optional raw stdout chunk callback. When set, stdout is piped instead
+   *  of inherited so callers can consume the byte stream (e.g. audio PCM). */
+  onStdout?: (chunk: Uint8Array) => void;
 };
 
 /**
@@ -27,13 +30,29 @@ export function launchManaged(
   let proc: Subprocess;
 
   function spawn(): Subprocess {
-    const { cmd, onStderr } = factory();
+    const { cmd, onStderr, onStdout } = factory();
     console.log(`[${name}] Starting: ${cmd.join(" ").slice(0, 200)}...`);
 
     const child = Bun.spawn(cmd, {
-      stdout: "inherit",
+      stdout: onStdout ? "pipe" : "inherit",
       stderr: "pipe",
     });
+
+    // Stream stdout to caller as raw byte chunks if requested
+    if (onStdout && child.stdout) {
+      const stdoutReader = child.stdout.getReader();
+      (async () => {
+        try {
+          while (true) {
+            const { done, value } = await stdoutReader.read();
+            if (done) break;
+            if (value) onStdout(value);
+          }
+        } catch {
+          // stream closed
+        }
+      })();
+    }
 
     // Stream stderr for logging
     if (child.stderr) {

@@ -1,0 +1,24 @@
+[Unit]
+Description=Restitch transcription service (whisper.cpp per-camera)
+Documentation=https://github.com/cinderblock/restitch
+After=network-online.target restitch.service
+Wants=network-online.target
+# Depend on restitch but don't require it — transcription can run on its own
+# if someone wants to transcribe raw mediamtx paths without the compositor.
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=/opt/restitch
+ExecStart=/home/__USER__/.bun/bin/bun run /opt/restitch/src/transcribe.ts --config /opt/restitch/config.yaml
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits — whisper.cpp + 8 ffmpeg pumps + Bun
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

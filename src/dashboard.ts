@@ -62,6 +62,11 @@ const HTML = `<!DOCTYPE html>
 </div>
 
 <div class="panel">
+  <h2>Recent transcriptions <span id="transcriptionsMeta" style="color: var(--muted); font-weight: 400; font-size: 11px; margin-left: 6px;"></span></h2>
+  <div id="transcriptions" style="max-height: 280px; overflow-y: auto; font-size: 13px; line-height: 1.6;"></div>
+</div>
+
+<div class="panel">
   <h2>Streams</h2>
   <table>
     <thead><tr>
@@ -178,13 +183,14 @@ document.addEventListener('click', e => {
 
 async function tick() {
   try {
-    const [paths, rtsp, webrtc, hls, sys, peers] = await Promise.all([
+    const [paths, rtsp, webrtc, hls, sys, peers, transcripts] = await Promise.all([
       fetch('api/paths').then(r => r.json()),
       fetch('api/rtsp').then(r => r.json()),
       fetch('api/webrtc').then(r => r.json()),
       fetch('api/hls').then(r => r.json()),
       fetch('api/system').then(r => r.json()),
       fetch('api/peers').then(r => r.json()),
+      fetch('api/transcriptions?limit=50').then(r => r.ok ? r.json() : {items: [], counts: {}, _down: true}).catch(() => ({items: [], counts: {}, _down: true})),
     ]);
     const now = Date.now();
     const dt = prevTs ? (now - prevTs) / 1000 : 1;
@@ -304,6 +310,35 @@ async function tick() {
         + '</tr>');
     document.getElementById('sessions').innerHTML = sessRows.join('')
       || '<tr><td colspan="6" class="empty">no active sessions</td></tr>';
+
+    // Transcriptions
+    const tEl = document.getElementById('transcriptions');
+    const tMeta = document.getElementById('transcriptionsMeta');
+    if (transcripts._down) {
+      tMeta.textContent = '(service unreachable)';
+      tEl.innerHTML = '<div style="color: var(--muted); padding: 8px;">transcription service not responding on /api/transcriptions</div>';
+    } else {
+      const items = transcripts.items || [];
+      const counts = transcripts.counts || {};
+      const totalCounts = Object.values(counts).reduce((s, n) => s + n, 0);
+      const camCount = Object.keys(counts).length;
+      tMeta.textContent = camCount > 0
+        ? totalCounts + ' entries from ' + camCount + ' camera(s)'
+        : 'no entries yet';
+      if (items.length === 0) {
+        tEl.innerHTML = '<div style="color: var(--muted); padding: 8px;">waiting for speech…</div>';
+      } else {
+        tEl.innerHTML = items.map(e => {
+          const dt = (now - e.ts) / 1000;
+          const ago = dt < 60 ? Math.floor(dt) + 's' : dt < 3600 ? Math.floor(dt/60) + 'm' : Math.floor(dt/3600) + 'h';
+          return '<div style="padding: 4px 0; border-bottom: 1px solid #1f2128;">'
+            + '<span style="color: var(--accent); font-weight: 600; margin-right: 8px;">' + e.camera + '</span>'
+            + '<span style="color: var(--muted); font-size: 11px; margin-right: 8px;">' + ago + ' ago</span>'
+            + '<span>' + e.text.replace(/</g, '&lt;') + '</span>'
+            + '</div>';
+        }).join('');
+      }
+    }
 
     prev = new Map((paths.items || []).map(p => [p.name, p]));
     prevTs = now;
@@ -433,6 +468,7 @@ async function readSystemInfo(): Promise<unknown> {
 
 export function startDashboard(dashboard: Dashboard): Server {
   const apiBase = dashboard.mediamtx_api_url.replace(/\/$/, "");
+  const transcribeBase = dashboard.transcription_api_url.replace(/\/$/, "");
   const { hostname, port } = parseAddress(dashboard.address);
 
   const server = Bun.serve({
@@ -458,6 +494,10 @@ export function startDashboard(dashboard: Dashboard): Server {
           return Response.json(await readSystemInfo());
         case "/api/peers":
           return Response.json(await readPeers());
+        case "/api/transcriptions": {
+          const q = url.search; // pass through ?limit=…
+          return proxyJson(`${transcribeBase}/api/transcriptions${q}`);
+        }
         default:
           return new Response("Not found", { status: 404 });
       }
