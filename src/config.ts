@@ -99,6 +99,45 @@ const DashboardSchema = z.object({
     .string()
     .default("http://localhost:9997")
     .describe("Where the dashboard reaches the mediamtx control API"),
+  transcription_api_url: z
+    .string()
+    .default("http://localhost:9001")
+    .describe("Where the dashboard reaches the transcription service (proxied to /api/transcriptions)"),
+});
+
+const TranscriptionSchema = z.object({
+  enabled: z.boolean().default(true),
+  api_address: z
+    .string()
+    .default(":9001")
+    .describe("Bind address for the transcription service's HTTP API"),
+  whisper_server: z
+    .object({
+      bin: z.string().default("whisper-server"),
+      address: z.string().default("127.0.0.1:9876"),
+      model: z.string().default("/opt/restitch/models/ggml-distil-large-v3.bin"),
+      vad_model: z
+        .string()
+        .default("/opt/restitch/models/ggml-silero-v5.1.2.bin"),
+    })
+    .default({
+      bin: "whisper-server",
+      address: "127.0.0.1:9876",
+      model: "/opt/restitch/models/ggml-distil-large-v3.bin",
+      vad_model: "/opt/restitch/models/ggml-silero-v5.1.2.bin",
+    }),
+  chunk_seconds: z
+    .number()
+    .int()
+    .positive()
+    .default(30)
+    .describe("Seconds of audio per transcription chunk"),
+  max_entries_per_camera: z
+    .number()
+    .int()
+    .positive()
+    .default(200)
+    .describe("Ring buffer size per camera (oldest dropped beyond this)"),
 });
 
 export const ConfigSchema = z.object({
@@ -125,6 +164,19 @@ export const ConfigSchema = z.object({
     enabled: true,
     address: ":9000",
     mediamtx_api_url: "http://localhost:9997",
+    transcription_api_url: "http://localhost:9001",
+  }),
+  transcription: TranscriptionSchema.default({
+    enabled: true,
+    api_address: ":9001",
+    whisper_server: {
+      bin: "whisper-server",
+      address: "127.0.0.1:9876",
+      model: "/opt/restitch/models/ggml-distil-large-v3.bin",
+      vad_model: "/opt/restitch/models/ggml-silero-v5.1.2.bin",
+    },
+    chunk_seconds: 30,
+    max_entries_per_camera: 200,
   }),
   ffmpeg_path: z.string().default("ffmpeg"),
   ffprobe_path: z.string().default("ffprobe"),
@@ -137,3 +189,4 @@ export type SubStream = z.infer<typeof SubStreamSchema>;
 export type Composite = z.infer<typeof CompositeSchema>;
 export type Encoder = z.infer<typeof EncoderSchema>;
 export type Dashboard = z.infer<typeof DashboardSchema>;
+export type Transcription = z.infer<typeof TranscriptionSchema>;
