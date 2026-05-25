@@ -126,12 +126,37 @@ const TranscriptionSchema = z.object({
       model: "/opt/restitch/models/ggml-distil-large-v3.bin",
       vad_model: "/opt/restitch/models/ggml-silero-v5.1.2.bin",
     }),
-  chunk_seconds: z
+  silence_threshold_db: z
+    .number()
+    .default(-30)
+    .describe(
+      "ffmpeg silencedetect noise threshold in dB. Audio below this is treated as silence " +
+        "(higher value = stricter, only loud speech triggers; lower value = more sensitive)."
+    ),
+  silence_min_seconds: z
+    .number()
+    .positive()
+    .default(0.8)
+    .describe(
+      "Seconds of continuous silence required before considering a speech segment ended. " +
+        "This is the floor on end-of-speech latency; too low chops mid-sentence on natural pauses."
+    ),
+  pad_ms: z
     .number()
     .int()
+    .nonnegative()
+    .default(200)
+    .describe("Milliseconds of audio padding around each detected speech segment"),
+  max_segment_seconds: z
+    .number()
     .positive()
-    .default(30)
-    .describe("Seconds of audio per transcription chunk"),
+    .default(20)
+    .describe("Maximum length of a single speech segment before forced flush (rare; long monologue)"),
+  min_segment_seconds: z
+    .number()
+    .positive()
+    .default(0.4)
+    .describe("Minimum speech length to bother transcribing (drops short blips / coughs)"),
   max_entries_per_camera: z
     .number()
     .int()
@@ -186,7 +211,11 @@ export const ConfigSchema = z.object({
       model: "/opt/restitch/models/ggml-distil-large-v3.bin",
       vad_model: "/opt/restitch/models/ggml-silero-v5.1.2.bin",
     },
-    chunk_seconds: 30,
+    silence_threshold_db: -30,
+    silence_min_seconds: 0.8,
+    pad_ms: 200,
+    max_segment_seconds: 20,
+    min_segment_seconds: 0.4,
     max_entries_per_camera: 200,
     language: "en",
     initial_prompt:

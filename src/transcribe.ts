@@ -203,30 +203,51 @@ function startCameraPump(
   ring: RingBuffer
 ): ManagedProcess {
   const sourceUrl = `${config.output.base_url}/${rawStreamName(cam)}`;
-  const bytesPerSecond = 16_000 * 2; // 16 kHz mono s16le
-  const chunkBytes = bytesPerSecond * config.transcription.chunk_seconds;
+  const t = config.transcription;
+  const BYTES_PER_SEC = 16_000 * 2; // 16 kHz mono s16le
+  const PAD_BYTES = Math.floor((t.pad_ms / 1000) * BYTES_PER_SEC);
+  const MIN_BYTES = Math.floor(t.min_segment_seconds * BYTES_PER_SEC);
+  const MAX_BYTES = Math.floor(t.max_segment_seconds * BYTES_PER_SEC);
+  // Keep enough recent audio so silencedetect (which reports times AT WHICH
+  // events happened, but FIRES after silence_min_seconds elapsed) can still
+  // scrub back into the past.
+  const KEEP_BYTES = Math.floor(
+    (t.silence_min_seconds + t.max_segment_seconds + 2) * BYTES_PER_SEC
+  );
 
-  let pending: Uint8Array[] = [];
-  let pendingBytes = 0;
-  let inflight = false;
+  // Rolling byte buffer. `firstByte` is the absolute offset (from ffmpeg
+  // input t=0) of buffer[0]; `nextByte` is the offset of the next sample
+  // that will be written.
+  let buffer: Uint8Array = new Uint8Array(0);
+  let firstByte = 0;
+  let nextByte = 0;
 
-  const flush = async () => {
-    if (inflight || pendingBytes < chunkBytes) return;
-    inflight = true;
-    const pcm = new Uint8Array(pendingBytes);
-    let off = 0;
-    for (const c of pending) {
-      pcm.set(c, off);
-      off += c.length;
-    }
-    pending = [];
-    pendingBytes = 0;
+  // Speech state — set by silence_end events, cleared after flush.
+  let speechStartByte: number | null = null;
+  // Latest silenceStart event byte (set on silence_start). Used together
+  // with speechStartByte to bracket a complete segment.
+  let inflight = 0;
+
+  const flushSegment = async (startByte: number, endByte: number) => {
+    inflight++;
     try {
+      const padStart = Math.max(firstByte, startByte - PAD_BYTES);
+      const padEnd = Math.min(nextByte, endByte + PAD_BYTES);
+      if (padEnd - padStart < MIN_BYTES) return;
+      const bufStart = padStart - firstByte;
+      const bufEnd = padEnd - firstByte;
+      if (bufStart < 0 || bufEnd > buffer.length) {
+        console.warn(
+          `[${cam.name}] segment out of buffer range — dropped`
+        );
+        return;
+      }
+      const pcm = buffer.slice(bufStart, bufEnd);
       const text = await transcribe(
         whisperUrl,
         pcm,
-        config.transcription.language,
-        config.transcription.initial_prompt
+        t.language,
+        t.initial_prompt
       );
       if (text) {
         console.log(`[${cam.name}] ${text}`);
@@ -235,7 +256,62 @@ function startCameraPump(
     } catch (e) {
       console.error(`[${cam.name}] transcribe failed:`, e);
     } finally {
-      inflight = false;
+      inflight--;
+    }
+  };
+
+  const onStdout = (chunk: Uint8Array) => {
+    // Append to rolling buffer
+    const merged = new Uint8Array(buffer.length + chunk.length);
+    merged.set(buffer, 0);
+    merged.set(chunk, buffer.length);
+    buffer = merged;
+    nextByte += chunk.length;
+
+    // Trim from the front to keep only KEEP_BYTES of audio
+    if (buffer.length > KEEP_BYTES) {
+      const trim = buffer.length - KEEP_BYTES;
+      buffer = buffer.slice(trim);
+      firstByte += trim;
+    }
+
+    // Force-flush very long monologues
+    if (
+      speechStartByte !== null &&
+      nextByte - speechStartByte > MAX_BYTES
+    ) {
+      const start = speechStartByte;
+      speechStartByte = nextByte; // continue with a new segment from here
+      void flushSegment(start, nextByte);
+    }
+  };
+
+  const onStderr = (line: string) => {
+    // ffmpeg silencedetect at -loglevel info emits:
+    //   [silencedetect @ 0x...] silence_start: 12.345
+    //   [silencedetect @ 0x...] silence_end: 14.567 | silence_duration: 2.222
+    const endMatch = line.match(/silence_end:\s*([\d.]+)/);
+    const startMatch = line.match(/silence_start:\s*(-?[\d.]+)/);
+    if (endMatch) {
+      const tSec = parseFloat(endMatch[1]!);
+      speechStartByte = Math.max(0, Math.floor(tSec * BYTES_PER_SEC));
+      return;
+    }
+    if (startMatch) {
+      const tSec = parseFloat(startMatch[1]!);
+      const endByte = Math.max(0, Math.floor(tSec * BYTES_PER_SEC));
+      if (speechStartByte !== null && endByte > speechStartByte) {
+        void flushSegment(speechStartByte, endByte);
+      }
+      speechStartByte = null;
+      return;
+    }
+    // Suppress silencedetect noise; surface real warnings/errors.
+    if (
+      /error|fail/i.test(line) &&
+      !/silencedetect/i.test(line)
+    ) {
+      console.error(`[${cam.name}] ${line}`);
     }
   };
 
@@ -244,8 +320,10 @@ function startCameraPump(
     () => ({
       cmd: [
         config.ffmpeg_path,
+        // 'info' level so silencedetect lines reach stderr — they're filtered
+        // server-side in onStderr.
         "-loglevel",
-        "warning",
+        "info",
         "-rtsp_transport",
         "tcp",
         "-allowed_media_types",
@@ -253,6 +331,8 @@ function startCameraPump(
         "-i",
         sourceUrl,
         "-vn",
+        "-af",
+        `silencedetect=noise=${t.silence_threshold_db}dB:d=${t.silence_min_seconds}`,
         "-ac",
         "1",
         "-ar",
@@ -261,17 +341,8 @@ function startCameraPump(
         "s16le",
         "-",
       ],
-      onStdout: (chunk) => {
-        pending.push(chunk);
-        pendingBytes += chunk.length;
-        // Fire-and-forget; flush() guards against re-entry with inflight.
-        void flush();
-      },
-      onStderr: (line) => {
-        if (/error|fail/i.test(line)) {
-          console.error(`[${cam.name}] ${line}`);
-        }
-      },
+      onStdout,
+      onStderr,
     }),
     { restartDelayMs: 5000 }
   );
