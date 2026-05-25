@@ -62,6 +62,11 @@ const HTML = `<!DOCTYPE html>
 </div>
 
 <div class="panel">
+  <h2>Activity timeline <span style="color: var(--muted); font-weight: 400; font-size: 11px; margin-left: 6px;">last 5 minutes</span></h2>
+  <div id="timeline"></div>
+</div>
+
+<div class="panel">
   <h2>Recent transcriptions <span id="transcriptionsMeta" style="color: var(--muted); font-weight: 400; font-size: 11px; margin-left: 6px;"></span></h2>
   <div id="transcriptions" style="max-height: 280px; overflow-y: auto; font-size: 13px; line-height: 1.6;"></div>
 </div>
@@ -131,6 +136,112 @@ function stat(label, value, percent) {
 let prev = new Map();
 let prevTs = 0;
 
+const TIMELINE_WINDOW_MS = 5 * 60 * 1000;
+const gpuHistory = []; // {ts, gpu, nvenc, nvdec}
+
+const slugToCameraName = slug => slug
+  .split('-')
+  .map(w => w ? w[0].toUpperCase() + w.slice(1) : '')
+  .join(' ');
+
+function renderTimeline(transcriptItems, paths) {
+  const now = Date.now();
+  const start = now - TIMELINE_WINDOW_MS;
+  const trimmed = gpuHistory.filter(p => p.ts >= start);
+
+  // Cameras come from raw/* mediamtx paths so empty rows still show up.
+  const cameraOrder = (paths.items || [])
+    .filter(p => p.name.startsWith('raw/'))
+    .map(p => slugToCameraName(p.name.slice(4)))
+    .sort();
+
+  const PLOT_W = 1000;
+  const LEFT_PAD = 110;
+  const GPU_H = 70;
+  const ROW_H = 14;
+  const ROWS_PAD = 8;
+  const voiceRowsH = cameraOrder.length * ROW_H + ROWS_PAD;
+  const totalH = GPU_H + 14 + voiceRowsH + 18;
+  const xs = ts => LEFT_PAD + ((ts - start) / TIMELINE_WINDOW_MS) * (PLOT_W - LEFT_PAD);
+
+  // --- GPU sparkline (3 line series) ---
+  const series = [
+    { key: 'gpu',   color: '#6cb8ff', label: 'GPU'   },
+    { key: 'nvenc', color: '#5dd590', label: 'NVENC' },
+    { key: 'nvdec', color: '#e5c67a', label: 'NVDEC' },
+  ];
+  let gpuPaths = '';
+  for (const s of series) {
+    if (trimmed.length < 2) continue;
+    let d = '';
+    for (let i = 0; i < trimmed.length; i++) {
+      const p = trimmed[i];
+      const x = xs(p.ts).toFixed(1);
+      const y = (GPU_H - (Math.min(100, Math.max(0, p[s.key])) / 100) * GPU_H + 4).toFixed(1);
+      d += (i === 0 ? 'M' : 'L') + x + ',' + y + ' ';
+    }
+    gpuPaths += '<path d="' + d.trim() + '" stroke="' + s.color + '" fill="none" stroke-width="1.5" opacity="0.95"/>';
+  }
+  // GPU current values on the right side of the chart
+  const cur = trimmed[trimmed.length - 1];
+  const gpuLegend = series.map((s, i) =>
+    '<g transform="translate(' + (8 + i * 78) + ',12)">'
+    + '<rect width="9" height="9" fill="' + s.color + '"/>'
+    + '<text x="13" y="8" font-size="11" fill="var(--muted)">' + s.label
+    + (cur ? ' <tspan fill="var(--text)" font-weight="600">' + Math.round(cur[s.key]) + '%</tspan>' : '')
+    + '</text></g>'
+  ).join('');
+
+  // --- GPU grid (0/50/100%) ---
+  const gpuGrid = [0, 50, 100].map(p => {
+    const y = (GPU_H - (p / 100) * GPU_H + 4).toFixed(1);
+    return '<line x1="' + LEFT_PAD + '" x2="' + PLOT_W + '" y1="' + y + '" y2="' + y + '" stroke="#1f2128" stroke-dasharray="2,3"/>'
+      + '<text x="' + (LEFT_PAD - 6) + '" y="' + (parseFloat(y) + 4) + '" text-anchor="end" font-size="10" fill="var(--muted)">' + p + '%</text>';
+  }).join('');
+
+  // --- Voice rows ---
+  // Build per-camera index of events in window
+  const inWindow = (transcriptItems || []).filter(e => e.ts >= start);
+  const eventsByCam = new Map();
+  for (const e of inWindow) {
+    if (!eventsByCam.has(e.camera)) eventsByCam.set(e.camera, []);
+    eventsByCam.get(e.camera).push(e);
+  }
+
+  const voiceYOffset = GPU_H + 14;
+  let voiceContent = '';
+  cameraOrder.forEach((cam, i) => {
+    const rowY = voiceYOffset + i * ROW_H;
+    const baseline = rowY + ROW_H / 2;
+    // Camera label
+    voiceContent += '<text x="' + (LEFT_PAD - 6) + '" y="' + (baseline + 4) + '" text-anchor="end" font-size="11" fill="var(--muted)">' + cam + '</text>';
+    // Row background
+    voiceContent += '<line x1="' + LEFT_PAD + '" x2="' + PLOT_W + '" y1="' + baseline + '" y2="' + baseline + '" stroke="#1f2128" stroke-width="1"/>';
+    // Event ticks
+    const events = eventsByCam.get(cam) || [];
+    for (const e of events) {
+      const x = xs(e.ts);
+      voiceContent += '<line x1="' + x.toFixed(1) + '" x2="' + x.toFixed(1) + '" y1="' + (rowY + 2) + '" y2="' + (rowY + ROW_H - 2) + '" stroke="var(--accent)" stroke-width="2" opacity="0.85"><title>' + cam + ' · ' + e.text.replace(/</g, '&lt;').replace(/"/g, '&quot;') + '</title></line>';
+    }
+  });
+
+  // --- X-axis labels (minutes ago) ---
+  const xAxisY = totalH - 4;
+  let xAxis = '';
+  for (let m = 5; m >= 0; m--) {
+    const ts = now - m * 60 * 1000;
+    const x = xs(ts);
+    xAxis += '<line x1="' + x.toFixed(1) + '" x2="' + x.toFixed(1) + '" y1="' + (voiceYOffset + voiceRowsH) + '" y2="' + (voiceYOffset + voiceRowsH + 3) + '" stroke="var(--muted)"/>';
+    xAxis += '<text x="' + x.toFixed(1) + '" y="' + xAxisY + '" text-anchor="middle" font-size="10" fill="var(--muted)">' + (m === 0 ? 'now' : '-' + m + 'm') + '</text>';
+  }
+
+  return '<svg viewBox="0 0 ' + PLOT_W + ' ' + totalH + '" preserveAspectRatio="xMidYMid meet" style="width:100%; display:block; height:' + (totalH + 4) + 'px; max-height: ' + (totalH + 4) + 'px;">'
+    + gpuGrid + gpuPaths + gpuLegend
+    + voiceContent
+    + xAxis
+    + '</svg>';
+}
+
 // Sort state (persisted in localStorage so it survives reloads).
 function loadSort(k, def) { try { return JSON.parse(localStorage.getItem(k)) || def; } catch { return def; } }
 function saveSort(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
@@ -190,13 +301,23 @@ async function tick() {
       fetch('api/hls').then(r => r.json()),
       fetch('api/system').then(r => r.json()),
       fetch('api/peers').then(r => r.json()),
-      fetch('api/transcriptions?limit=50').then(r => r.ok ? r.json() : {items: [], counts: {}, _down: true}).catch(() => ({items: [], counts: {}, _down: true})),
+      fetch('api/transcriptions?limit=500').then(r => r.ok ? r.json() : {items: [], counts: {}, _down: true}).catch(() => ({items: [], counts: {}, _down: true})),
     ]);
     const now = Date.now();
     const dt = prevTs ? (now - prevTs) / 1000 : 1;
 
-    // System
+    // System + GPU history
     const g = sys.gpu;
+    if (g) {
+      gpuHistory.push({
+        ts: now,
+        gpu: g.utilization.gpu,
+        nvenc: g.utilization.encoder,
+        nvdec: g.utilization.decoder,
+      });
+      const cutoff = now - TIMELINE_WINDOW_MS - 5000;
+      while (gpuHistory.length && gpuHistory[0].ts < cutoff) gpuHistory.shift();
+    }
     let html = '';
     if (g) {
       html += stat('GPU', g.utilization.gpu + '%', g.utilization.gpu);
@@ -310,6 +431,12 @@ async function tick() {
         + '</tr>');
     document.getElementById('sessions').innerHTML = sessRows.join('')
       || '<tr><td colspan="6" class="empty">no active sessions</td></tr>';
+
+    // Timeline (GPU history + voice activity)
+    document.getElementById('timeline').innerHTML = renderTimeline(
+      transcripts._down ? [] : (transcripts.items || []),
+      paths
+    );
 
     // Transcriptions
     const tEl = document.getElementById('transcriptions');
