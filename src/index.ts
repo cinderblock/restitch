@@ -7,6 +7,7 @@ import { probeAllCameras } from "./probe.ts";
 import { writeMediaMTXConfig } from "./mediamtx.ts";
 import { launchManaged, type ManagedProcess } from "./process.ts";
 import { detectHwAccel, suggestEncoder } from "./hwaccel.ts";
+import { startDashboard } from "./dashboard.ts";
 
 const { values } = parseArgs({
   args: Bun.argv.slice(2),
@@ -118,12 +119,23 @@ async function main() {
   }));
   processes.push(ffmpegProc);
 
+  // Dashboard HTTP server (proxies mediamtx API + exposes /api/system)
+  const dashServer = config.dashboard.enabled
+    ? startDashboard(config.dashboard)
+    : null;
+  if (dashServer) {
+    console.log(
+      `[dashboard] listening on http://${dashServer.hostname}:${dashServer.port}`
+    );
+  }
+
   // Handle shutdown
   const shutdown = () => {
     console.log("\nShutting down...");
     for (const p of processes) {
       p.stop();
     }
+    dashServer?.stop();
     process.exit(0);
   };
 

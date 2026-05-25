@@ -89,6 +89,18 @@ const OutputSchema = z.object({
     .describe("Base URL for the restream server"),
 });
 
+const DashboardSchema = z.object({
+  enabled: z.boolean().default(true),
+  address: z
+    .string()
+    .default(":9000")
+    .describe("Bind address for the dashboard HTTP server (host:port or :port)"),
+  mediamtx_api_url: z
+    .string()
+    .default("http://localhost:9997")
+    .describe("Where the dashboard reaches the mediamtx control API"),
+});
+
 export const ConfigSchema = z.object({
   cameras: z.array(CameraSchema).min(1),
   composite: CompositeSchema.default({
@@ -109,6 +121,11 @@ export const ConfigSchema = z.object({
     format: "rtsp",
     base_url: "rtsp://localhost:8554",
   }),
+  dashboard: DashboardSchema.default({
+    enabled: true,
+    address: ":9000",
+    mediamtx_api_url: "http://localhost:9997",
+  }),
   ffmpeg_path: z.string().default("ffmpeg"),
   ffprobe_path: z.string().default("ffprobe"),
   log_level: z.enum(["quiet", "error", "warning", "info", "verbose", "debug"]).default("info"),
@@ -119,3 +136,4 @@ export type Camera = z.infer<typeof CameraSchema>;
 export type SubStream = z.infer<typeof SubStreamSchema>;
 export type Composite = z.infer<typeof CompositeSchema>;
 export type Encoder = z.infer<typeof EncoderSchema>;
+export type Dashboard = z.infer<typeof DashboardSchema>;
