@@ -206,11 +206,21 @@ function startWhisperServer(t: Transcription): ManagedProcess {
  * Single fused-audio pump: one ffmpeg pulls all camera audio, Bun does the
  * mixing and silence detection, then triggers a transcription per segment.
  */
+interface LiveStats {
+  state: "silent" | "speaking" | "pending";
+  threshold_db: number;
+  mono_rms_db: number;
+  per_cam_rms_db: Record<string, number>;
+  transitions_total: number;
+  last_segment_at: number | null;
+}
+
 function startCombinedPump(
   cameras: Camera[],
   config: Config,
   whisperUrl: string,
-  ring: RingBuffer
+  ring: RingBuffer,
+  stats: LiveStats
 ): ManagedProcess {
   const t = config.transcription;
   const N = cameras.length;
@@ -345,12 +355,14 @@ function startCombinedPump(
       console.log(
         `[combined] [${primary}${contributors.length > 1 ? ` +${contributors.length - 1}` : ""}] ${text}`
       );
+      const now = Date.now();
       ring.push({
-        ts: Date.now(),
+        ts: now,
         text,
         primary_camera: primary,
         contributors,
       });
+      stats.last_segment_at = now;
     } catch (e) {
       console.error("[combined] transcribe failed:", e);
     } finally {
@@ -370,7 +382,15 @@ function startCombinedPump(
       perCam,
     });
 
+    // Live stats for the dashboard
+    stats.mono_rms_db = monoRms > 0 ? 20 * Math.log10(monoRms / 32768) : -100;
+    for (let c = 0; c < N; c++) {
+      stats.per_cam_rms_db[cameras[c]!.name] =
+        perCam[c]! > 0 ? 20 * Math.log10(perCam[c]! / 32768) : -100;
+    }
+
     const above = monoRms > THRESHOLD_AMP;
+    const prevState = state;
     if (state === "silent" && above) {
       state = "speaking";
       speechStartByte = nextMonoByte - samples * BYTES_PER_SAMPLE;
@@ -392,6 +412,10 @@ function startCombinedPump(
           silencePendingSamples = 0;
         }
       }
+    }
+    if (state !== prevState) {
+      stats.transitions_total++;
+      stats.state = state;
     }
 
     // Reset window accumulators
@@ -543,6 +567,15 @@ async function main(): Promise<void> {
   const whisperUrl = `http://${t.whisper_server.address.replace(/^:/, "127.0.0.1:")}`;
   const ring = new RingBuffer(t.max_entries_per_camera);
 
+  const stats: LiveStats = {
+    state: "silent",
+    threshold_db: t.silence_threshold_db,
+    mono_rms_db: -100,
+    per_cam_rms_db: Object.fromEntries(config.cameras.map((c) => [c.name, -100])),
+    transitions_total: 0,
+    last_segment_at: null,
+  };
+
   const processes: ManagedProcess[] = [];
 
   console.log("[transcribe] starting whisper-server...");
@@ -554,7 +587,7 @@ async function main(): Promise<void> {
   console.log(
     `[transcribe] starting combined pump for ${config.cameras.length} camera(s)`
   );
-  processes.push(startCombinedPump(config.cameras, config, whisperUrl, ring));
+  processes.push(startCombinedPump(config.cameras, config, whisperUrl, ring, stats));
 
   const { hostname, port } = parseAddress(t.api_address);
   const server = Bun.serve({
@@ -572,6 +605,9 @@ async function main(): Promise<void> {
           counts: ring.countByCamera(),
           contributor_counts: ring.contributorCountByCamera(),
         });
+      }
+      if (url.pathname === "/api/stats") {
+        return Response.json(stats);
       }
       if (url.pathname === "/health") {
         return new Response("ok");

@@ -62,6 +62,11 @@ const HTML = `<!DOCTYPE html>
 </div>
 
 <div class="panel">
+  <h2>Audio levels <span id="audioMeta" style="color: var(--muted); font-weight: 400; font-size: 11px; margin-left: 6px;"></span></h2>
+  <div id="audio"></div>
+</div>
+
+<div class="panel">
   <h2>Activity timeline <span style="color: var(--muted); font-weight: 400; font-size: 11px; margin-left: 6px;">last 5 minutes</span></h2>
   <div id="timeline"></div>
 </div>
@@ -314,7 +319,7 @@ document.addEventListener('click', e => {
 
 async function tick() {
   try {
-    const [paths, rtsp, webrtc, hls, sys, peers, transcripts] = await Promise.all([
+    const [paths, rtsp, webrtc, hls, sys, peers, transcripts, audioStats] = await Promise.all([
       fetch('api/paths').then(r => r.json()),
       fetch('api/rtsp').then(r => r.json()),
       fetch('api/webrtc').then(r => r.json()),
@@ -322,6 +327,7 @@ async function tick() {
       fetch('api/system').then(r => r.json()),
       fetch('api/peers').then(r => r.json()),
       fetch('api/transcriptions?limit=500').then(r => r.ok ? r.json() : {items: [], counts: {}, _down: true}).catch(() => ({items: [], counts: {}, _down: true})),
+      fetch('api/transcription-stats').then(r => r.ok ? r.json() : null).catch(() => null),
     ]);
     const now = Date.now();
     const dt = prevTs ? (now - prevTs) / 1000 : 1;
@@ -451,6 +457,51 @@ async function tick() {
         + '</tr>');
     document.getElementById('sessions').innerHTML = sessRows.join('')
       || '<tr><td colspan="6" class="empty">no active sessions</td></tr>';
+
+    // Audio levels (live RMS per camera + mono mix vs threshold)
+    const audioEl = document.getElementById('audio');
+    const audioMeta = document.getElementById('audioMeta');
+    if (!audioStats) {
+      audioMeta.textContent = '(service unreachable)';
+      audioEl.innerHTML = '<div style="color: var(--muted); padding: 8px;">transcription stats not responding</div>';
+    } else {
+      const threshold = audioStats.threshold_db;
+      const lastSeg = audioStats.last_segment_at
+        ? ((now - audioStats.last_segment_at) / 1000)
+        : null;
+      const lastSegStr = lastSeg == null ? 'no segments yet'
+        : lastSeg < 60 ? Math.floor(lastSeg) + 's ago'
+        : lastSeg < 3600 ? Math.floor(lastSeg / 60) + 'm ago'
+        : Math.floor(lastSeg / 3600) + 'h ago';
+      audioMeta.textContent = 'threshold ' + threshold + ' dB · state ' + audioStats.state
+        + ' · ' + audioStats.transitions_total + ' transitions · last segment ' + lastSegStr;
+
+      // Render a per-camera level row + the combined "mono" row vs the threshold
+      const entries = [
+        { name: 'Combined (max-abs mix)', db: audioStats.mono_rms_db, highlight: true },
+        ...Object.entries(audioStats.per_cam_rms_db).sort().map(([name, db]) => ({ name, db, highlight: false }))
+      ];
+      // Map dB range -60..0 to width 0..100%
+      const dbToPct = db => Math.max(0, Math.min(100, ((db + 60) / 60) * 100));
+      const thresholdPct = dbToPct(threshold);
+      audioEl.innerHTML = '<div style="font-size: 12px;">'
+        + entries.map(e => {
+          const pct = dbToPct(e.db);
+          const above = e.db > threshold;
+          const labelColor = e.highlight ? 'var(--accent)' : 'var(--muted)';
+          const labelWeight = e.highlight ? '600' : '400';
+          const fillColor = above ? 'var(--good)' : (e.highlight ? 'var(--accent)' : '#3b4150');
+          return '<div style="display: flex; align-items: center; padding: 2px 0;">'
+            + '<span style="width: 170px; color: ' + labelColor + '; font-weight: ' + labelWeight + ';">' + e.name + '</span>'
+            + '<div style="flex: 1; position: relative; height: 10px; background: #1a1c22; border-radius: 2px; overflow: hidden;">'
+            +   '<div style="position: absolute; left: 0; top: 0; bottom: 0; width: ' + pct.toFixed(1) + '%; background: ' + fillColor + ';"></div>'
+            +   '<div style="position: absolute; left: ' + thresholdPct.toFixed(1) + '%; top: -2px; bottom: -2px; width: 1px; background: var(--bad);" title="silence threshold ' + threshold + ' dB"></div>'
+            + '</div>'
+            + '<span style="width: 70px; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); margin-left: 8px;">' + e.db.toFixed(1) + ' dB</span>'
+            + '</div>';
+        }).join('')
+        + '</div>';
+    }
 
     // Timeline (GPU history + voice activity)
     document.getElementById('timeline').innerHTML = renderTimeline(
@@ -650,6 +701,8 @@ export function startDashboard(dashboard: Dashboard): Server {
           const q = url.search; // pass through ?limit=…
           return proxyJson(`${transcribeBase}/api/transcriptions${q}`);
         }
+        case "/api/transcription-stats":
+          return proxyJson(`${transcribeBase}/api/stats`);
         default:
           return new Response("Not found", { status: 404 });
       }
