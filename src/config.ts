@@ -130,8 +130,24 @@ const TranscriptionSchema = z.object({
     .number()
     .default(-30)
     .describe(
-      "ffmpeg silencedetect noise threshold in dB. Audio below this is treated as silence " +
-        "(higher value = stricter, only loud speech triggers; lower value = more sensitive)."
+      "RMS threshold in dBFS on the combined mono mix. Below this is treated as silence. " +
+        "Higher (e.g. -25) = stricter; lower (e.g. -35) = more sensitive."
+    ),
+  rms_window_ms: z
+    .number()
+    .int()
+    .positive()
+    .default(100)
+    .describe(
+      "Window over which to compute RMS for silence detection and per-camera attribution"
+    ),
+  contribution_threshold_db: z
+    .number()
+    .nonnegative()
+    .default(10)
+    .describe(
+      "A camera is listed as contributing to a transcription if its segment-mean RMS is " +
+        "within this many dB of the loudest camera. Lower = stricter (only the loudest few)."
     ),
   silence_min_seconds: z
     .number()
@@ -212,6 +228,8 @@ export const ConfigSchema = z.object({
       vad_model: "/opt/restitch/models/ggml-silero-v5.1.2.bin",
     },
     silence_threshold_db: -30,
+    rms_window_ms: 100,
+    contribution_threshold_db: 10,
     silence_min_seconds: 0.8,
     pad_ms: 200,
     max_segment_seconds: 20,

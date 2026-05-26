@@ -1,16 +1,22 @@
 /**
  * Standalone transcription service.
  *
- * Spawns a single whisper-server on the GPU plus one ffmpeg per camera
- * pulling 16 kHz mono PCM audio from mediamtx's raw/<slug> paths. Audio is
- * buffered into ~chunk_seconds windows, POSTed to whisper-server, and the
- * resulting text appended to an in-memory ring buffer per camera.
+ * Architecture (combined-fusion):
+ *   1 ffmpeg with 8 RTSP audio inputs (one per camera). amerge gives us an
+ *   8-channel interleaved s16le stream at 16 kHz.
+ *   ↓
+ *   Bun reads 8-channel groups, picks max(|sample|) per timestep to produce a
+ *   mono "loudest mic wins" mix (no comb-filtering from unsynchronized mics).
+ *   Simultaneously accumulates per-channel RMS for attribution.
+ *   ↓
+ *   Bun runs its own silence detection on the mono RMS — speech segments
+ *   trigger a single whisper transcription with the per-segment mean RMS
+ *   per camera attached.
+ *   ↓
+ *   Ring buffer entry: { ts, text, primary_camera, contributors[] }.
+ *   /api/transcriptions exposes it; the main dashboard proxies through.
  *
- * Exposes /api/transcriptions on its own HTTP port; the main dashboard
- * proxies through to it.
- *
- * Run as a separate systemd unit (restitch-transcribe.service) so a
- * transcription crash doesn't take down the compositor.
+ * Runs as a separate systemd unit (restitch-transcribe.service).
  */
 
 import { parseArgs } from "util";
@@ -25,54 +31,57 @@ import {
 import { rawStreamName } from "./mediamtx.ts";
 import { launchManaged, type ManagedProcess } from "./process.ts";
 
+interface Contributor {
+  camera: string;
+  rms_db: number;
+}
+
 interface Entry {
   ts: number;
-  camera: string;
   text: string;
+  primary_camera: string;
+  contributors: Contributor[];
 }
 
 class RingBuffer {
-  private buffers = new Map<string, Entry[]>();
+  private entries: Entry[] = [];
 
-  constructor(private maxPerCamera: number) {}
+  constructor(private maxEntries: number) {}
 
-  push(camera: string, text: string): void {
-    const trimmed = text.trim();
-    if (!trimmed) return;
-    if (isFiller(trimmed)) return;
-    let arr = this.buffers.get(camera);
-    if (!arr) {
-      arr = [];
-      this.buffers.set(camera, arr);
-    }
-    arr.push({ ts: Date.now(), camera, text: trimmed });
-    while (arr.length > this.maxPerCamera) arr.shift();
+  push(entry: Entry): void {
+    const text = entry.text.trim();
+    if (!text) return;
+    if (isFiller(text)) return;
+    this.entries.push({ ...entry, text });
+    while (this.entries.length > this.maxEntries) this.entries.shift();
   }
 
   recent(limit = 100): Entry[] {
-    const all: Entry[] = [];
-    for (const arr of this.buffers.values()) all.push(...arr);
-    all.sort((a, b) => b.ts - a.ts);
-    return all.slice(0, limit);
+    return this.entries.slice(-limit).reverse();
   }
 
   countByCamera(): Record<string, number> {
     const out: Record<string, number> = {};
-    for (const [cam, arr] of this.buffers) out[cam] = arr.length;
+    for (const e of this.entries) {
+      out[e.primary_camera] = (out[e.primary_camera] ?? 0) + 1;
+    }
+    return out;
+  }
+
+  contributorCountByCamera(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const e of this.entries) {
+      for (const c of e.contributors) {
+        out[c.camera] = (out[c.camera] ?? 0) + 1;
+      }
+    }
     return out;
   }
 }
 
-/**
- * Whisper often emits noise transcriptions like "[Music]", "(silence)",
- * "thank you for watching" on dead air. Drop them so they don't clutter
- * the ring buffer.
- */
 function isFiller(text: string): boolean {
   if (text.length < 2) return true;
-  // Drop transcripts that are entirely bracketed annotations.
   if (/^[\[\(\<].*[\]\)\>]$/.test(text)) return true;
-  // Common Whisper hallucinations on silence (case-insensitive).
   const fillers = [
     "thanks for watching",
     "thank you for watching",
@@ -101,7 +110,7 @@ function makeWavHeader(
   writeStr(8, "WAVE");
   writeStr(12, "fmt ");
   dv.setUint32(16, 16, true);
-  dv.setUint16(20, 1, true); // PCM
+  dv.setUint16(20, 1, true);
   dv.setUint16(22, channels, true);
   dv.setUint32(24, sampleRate, true);
   dv.setUint32(28, (sampleRate * channels * bitsPerSample) / 8, true);
@@ -147,7 +156,6 @@ async function waitForServer(url: string, timeoutMs = 90_000): Promise<void> {
   while (Date.now() < deadline) {
     try {
       const r = await fetch(url, { method: "GET" });
-      // Any HTTP response (even 404 on /) means it's listening
       if (r.status > 0) return;
     } catch {
       // not up yet
@@ -181,12 +189,10 @@ function startWhisperServer(t: Transcription): ManagedProcess {
         hostname ?? "127.0.0.1",
         "--port",
         String(port),
-        // Lower threshold helps with quieter shop audio
         "--vad-threshold",
         "0.4",
       ],
       onStderr: (line) => {
-        // whisper-server is chatty; only log warnings/errors at INFO+
         if (/error|fail|warning/i.test(line)) {
           console.error(`[whisper-server] ${line}`);
         }
@@ -196,153 +202,313 @@ function startWhisperServer(t: Transcription): ManagedProcess {
   );
 }
 
-function startCameraPump(
-  cam: Camera,
+/**
+ * Single fused-audio pump: one ffmpeg pulls all camera audio, Bun does the
+ * mixing and silence detection, then triggers a transcription per segment.
+ */
+function startCombinedPump(
+  cameras: Camera[],
   config: Config,
   whisperUrl: string,
   ring: RingBuffer
 ): ManagedProcess {
-  const sourceUrl = `${config.output.base_url}/${rawStreamName(cam)}`;
   const t = config.transcription;
-  const BYTES_PER_SEC = 16_000 * 2; // 16 kHz mono s16le
-  const PAD_BYTES = Math.floor((t.pad_ms / 1000) * BYTES_PER_SEC);
-  const MIN_BYTES = Math.floor(t.min_segment_seconds * BYTES_PER_SEC);
-  const MAX_BYTES = Math.floor(t.max_segment_seconds * BYTES_PER_SEC);
-  // Keep enough recent audio so silencedetect (which reports times AT WHICH
-  // events happened, but FIRES after silence_min_seconds elapsed) can still
-  // scrub back into the past.
+  const N = cameras.length;
+  const SAMPLE_RATE = 16000;
+  const BYTES_PER_SAMPLE = 2;
+  const GROUP_SIZE = N * BYTES_PER_SAMPLE; // bytes per output sample (one timestep across all channels)
+  const MONO_BYTES_PER_SEC = SAMPLE_RATE * BYTES_PER_SAMPLE;
+
+  const PAD_BYTES = Math.floor((t.pad_ms / 1000) * MONO_BYTES_PER_SEC);
+  const MIN_SEG_BYTES = Math.floor(t.min_segment_seconds * MONO_BYTES_PER_SEC);
+  const MAX_SEG_BYTES = Math.floor(t.max_segment_seconds * MONO_BYTES_PER_SEC);
   const KEEP_BYTES = Math.floor(
-    (t.silence_min_seconds + t.max_segment_seconds + 2) * BYTES_PER_SEC
+    (t.silence_min_seconds + t.max_segment_seconds + 2) * MONO_BYTES_PER_SEC
   );
+  const RMS_WINDOW_SAMPLES = Math.max(
+    1,
+    Math.floor((SAMPLE_RATE * t.rms_window_ms) / 1000)
+  );
+  const SILENCE_MIN_SAMPLES = Math.floor(
+    SAMPLE_RATE * t.silence_min_seconds
+  );
+  // RMS threshold compared as integer amplitude (16-bit range).
+  const THRESHOLD_AMP = Math.pow(10, t.silence_threshold_db / 20) * 32768;
 
-  // Rolling byte buffer. `firstByte` is the absolute offset (from ffmpeg
-  // input t=0) of buffer[0]; `nextByte` is the offset of the next sample
-  // that will be written.
-  let buffer: Uint8Array = new Uint8Array(0);
-  let firstByte = 0;
-  let nextByte = 0;
+  // --- Rolling mono PCM buffer ---
+  let monoBuffer = new Uint8Array(0);
+  let firstMonoByte = 0;
+  let nextMonoByte = 0;
+  let leftoverBytes = new Uint8Array(0); // unparsed bytes from prev chunk
 
-  // Speech state — set by silence_end events, cleared after flush.
-  let speechStartByte: number | null = null;
-  // Latest silenceStart event byte (set on silence_start). Used together
-  // with speechStartByte to bracket a complete segment.
+  // --- Per-camera RMS history (one bin per completed RMS window) ---
+  type RmsBin = { sampleOffset: number; perCam: number[] };
+  let rmsHistory: RmsBin[] = [];
+
+  // --- Current window accumulators ---
+  let windowSamples = 0;
+  let windowMonoSumSq = 0;
+  const windowChanSumSq = new Float64Array(N);
+
+  // --- Silence-detection state machine ---
+  let state: "silent" | "speaking" | "pending" = "silent";
+  let speechStartByte = 0;
+  let silencePotentialStartByte = 0;
+  let silencePendingSamples = 0;
+
   let inflight = 0;
 
-  const flushSegment = async (startByte: number, endByte: number) => {
+  function appendMono(samples: Int16Array): void {
+    if (samples.length === 0) return;
+    const bytes = new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength);
+    const merged = new Uint8Array(monoBuffer.length + bytes.length);
+    merged.set(monoBuffer, 0);
+    merged.set(bytes, monoBuffer.length);
+    monoBuffer = merged;
+    nextMonoByte += bytes.length;
+
+    if (monoBuffer.length > KEEP_BYTES + SAMPLE_RATE) {
+      const trim = monoBuffer.length - KEEP_BYTES;
+      monoBuffer = monoBuffer.slice(trim);
+      firstMonoByte += trim;
+      const sampleCutoff = firstMonoByte / BYTES_PER_SAMPLE;
+      while (rmsHistory.length > 0 && rmsHistory[0]!.sampleOffset < sampleCutoff) {
+        rmsHistory.shift();
+      }
+    }
+  }
+
+  async function flushSegment(startByte: number, endByte: number): Promise<void> {
     inflight++;
     try {
-      const padStart = Math.max(firstByte, startByte - PAD_BYTES);
-      const padEnd = Math.min(nextByte, endByte + PAD_BYTES);
-      if (padEnd - padStart < MIN_BYTES) return;
-      const bufStart = padStart - firstByte;
-      const bufEnd = padEnd - firstByte;
-      if (bufStart < 0 || bufEnd > buffer.length) {
-        console.warn(
-          `[${cam.name}] segment out of buffer range — dropped`
-        );
+      const padStart = Math.max(firstMonoByte, startByte - PAD_BYTES);
+      const padEnd = Math.min(nextMonoByte, endByte + PAD_BYTES);
+      if (padEnd - padStart < MIN_SEG_BYTES) return;
+      const bufStart = padStart - firstMonoByte;
+      const bufEnd = padEnd - firstMonoByte;
+      if (bufStart < 0 || bufEnd > monoBuffer.length) {
+        console.warn("[combined] segment out of buffer range — dropped");
         return;
       }
-      const pcm = buffer.slice(bufStart, bufEnd);
+      const pcm = monoBuffer.slice(bufStart, bufEnd);
+
+      // Compute per-camera mean RMS across all bins that fall inside the
+      // unpadded segment [startByte, endByte).
+      const startSample = startByte / BYTES_PER_SAMPLE;
+      const endSample = endByte / BYTES_PER_SAMPLE;
+      const sumSq = new Float64Array(N);
+      let bins = 0;
+      for (const bin of rmsHistory) {
+        if (bin.sampleOffset >= startSample && bin.sampleOffset < endSample) {
+          for (let c = 0; c < N; c++) {
+            const r = bin.perCam[c]!;
+            sumSq[c]! += r * r;
+          }
+          bins++;
+        }
+      }
+
       const text = await transcribe(
         whisperUrl,
         pcm,
         t.language,
         t.initial_prompt
       );
-      if (text) {
-        console.log(`[${cam.name}] ${text}`);
-        ring.push(cam.name, text);
+      if (!text) return;
+
+      // Attribution
+      let primaryIdx = 0;
+      let primaryRms = 0;
+      const camRms: number[] = new Array(N);
+      for (let c = 0; c < N; c++) {
+        const rms = bins > 0 ? Math.sqrt(sumSq[c]! / bins) : 0;
+        camRms[c] = rms;
+        if (rms > primaryRms) {
+          primaryRms = rms;
+          primaryIdx = c;
+        }
       }
+      const cutoffRms =
+        primaryRms * Math.pow(10, -t.contribution_threshold_db / 20);
+      const contributors: Contributor[] = [];
+      for (let c = 0; c < N; c++) {
+        if (camRms[c]! >= cutoffRms && camRms[c]! > 0) {
+          contributors.push({
+            camera: cameras[c]!.name,
+            rms_db: 20 * Math.log10(camRms[c]! / 32768),
+          });
+        }
+      }
+      contributors.sort((a, b) => b.rms_db - a.rms_db);
+
+      const primary = cameras[primaryIdx]!.name;
+      console.log(
+        `[combined] [${primary}${contributors.length > 1 ? ` +${contributors.length - 1}` : ""}] ${text}`
+      );
+      ring.push({
+        ts: Date.now(),
+        text,
+        primary_camera: primary,
+        contributors,
+      });
     } catch (e) {
-      console.error(`[${cam.name}] transcribe failed:`, e);
+      console.error("[combined] transcribe failed:", e);
     } finally {
       inflight--;
     }
-  };
+  }
 
-  const onStdout = (chunk: Uint8Array) => {
-    // Append to rolling buffer
-    const merged = new Uint8Array(buffer.length + chunk.length);
-    merged.set(buffer, 0);
-    merged.set(chunk, buffer.length);
-    buffer = merged;
-    nextByte += chunk.length;
+  function finishWindow(): void {
+    const samples = windowSamples;
+    if (samples === 0) return;
+    const monoRms = Math.sqrt(windowMonoSumSq / samples);
+    const perCam = new Array<number>(N);
+    for (let c = 0; c < N; c++) perCam[c] = Math.sqrt(windowChanSumSq[c]! / samples);
 
-    // Trim from the front to keep only KEEP_BYTES of audio
-    if (buffer.length > KEEP_BYTES) {
-      const trim = buffer.length - KEEP_BYTES;
-      buffer = buffer.slice(trim);
-      firstByte += trim;
-    }
+    rmsHistory.push({
+      sampleOffset: nextMonoByte / BYTES_PER_SAMPLE - samples,
+      perCam,
+    });
 
-    // Force-flush very long monologues
-    if (
-      speechStartByte !== null &&
-      nextByte - speechStartByte > MAX_BYTES
-    ) {
-      const start = speechStartByte;
-      speechStartByte = nextByte; // continue with a new segment from here
-      void flushSegment(start, nextByte);
-    }
-  };
-
-  const onStderr = (line: string) => {
-    // ffmpeg silencedetect at -loglevel info emits:
-    //   [silencedetect @ 0x...] silence_start: 12.345
-    //   [silencedetect @ 0x...] silence_end: 14.567 | silence_duration: 2.222
-    const endMatch = line.match(/silence_end:\s*([\d.]+)/);
-    const startMatch = line.match(/silence_start:\s*(-?[\d.]+)/);
-    if (endMatch) {
-      const tSec = parseFloat(endMatch[1]!);
-      speechStartByte = Math.max(0, Math.floor(tSec * BYTES_PER_SEC));
-      return;
-    }
-    if (startMatch) {
-      const tSec = parseFloat(startMatch[1]!);
-      const endByte = Math.max(0, Math.floor(tSec * BYTES_PER_SEC));
-      if (speechStartByte !== null && endByte > speechStartByte) {
-        void flushSegment(speechStartByte, endByte);
+    const above = monoRms > THRESHOLD_AMP;
+    if (state === "silent" && above) {
+      state = "speaking";
+      speechStartByte = nextMonoByte - samples * BYTES_PER_SAMPLE;
+    } else if (state === "speaking" && !above) {
+      state = "pending";
+      silencePotentialStartByte = nextMonoByte - samples * BYTES_PER_SAMPLE;
+      silencePendingSamples = samples;
+    } else if (state === "pending") {
+      if (above) {
+        state = "speaking";
+        silencePendingSamples = 0;
+      } else {
+        silencePendingSamples += samples;
+        if (silencePendingSamples >= SILENCE_MIN_SAMPLES) {
+          if (silencePotentialStartByte > speechStartByte) {
+            void flushSegment(speechStartByte, silencePotentialStartByte);
+          }
+          state = "silent";
+          silencePendingSamples = 0;
+        }
       }
-      speechStartByte = null;
-      return;
     }
-    // Suppress silencedetect noise; surface real warnings/errors.
+
+    // Reset window accumulators
+    windowSamples = 0;
+    windowMonoSumSq = 0;
+    for (let c = 0; c < N; c++) windowChanSumSq[c] = 0;
+
+    // Emergency flush for absurdly long speech
     if (
-      /error|fail/i.test(line) &&
-      !/silencedetect/i.test(line)
+      state === "speaking" &&
+      nextMonoByte - speechStartByte > MAX_SEG_BYTES
     ) {
-      console.error(`[${cam.name}] ${line}`);
+      void flushSegment(speechStartByte, nextMonoByte);
+      speechStartByte = nextMonoByte;
+    }
+  }
+
+  const onStdout = (chunk: Uint8Array): void => {
+    let data: Uint8Array;
+    if (leftoverBytes.length > 0) {
+      data = new Uint8Array(leftoverBytes.length + chunk.length);
+      data.set(leftoverBytes, 0);
+      data.set(chunk, leftoverBytes.length);
+    } else {
+      data = chunk;
+    }
+
+    const groupCount = Math.floor(data.length / GROUP_SIZE);
+    const usedBytes = groupCount * GROUP_SIZE;
+    leftoverBytes = data.slice(usedBytes);
+    if (groupCount === 0) return;
+
+    const dv = new DataView(data.buffer, data.byteOffset, usedBytes);
+    const mono = new Int16Array(groupCount);
+    let committed = 0; // index in `mono` of first uncommitted sample
+
+    for (let g = 0; g < groupCount; g++) {
+      let maxAbs = 0;
+      let maxSigned = 0;
+      const base = g * GROUP_SIZE;
+      for (let c = 0; c < N; c++) {
+        const s = dv.getInt16(base + c * BYTES_PER_SAMPLE, true);
+        const a = s < 0 ? -s : s;
+        windowChanSumSq[c]! += s * s;
+        if (a > maxAbs) {
+          maxAbs = a;
+          maxSigned = s;
+        }
+      }
+      mono[g] = maxSigned;
+      windowMonoSumSq += maxSigned * maxSigned;
+      windowSamples++;
+
+      if (windowSamples >= RMS_WINDOW_SAMPLES) {
+        if (g + 1 > committed) {
+          appendMono(mono.slice(committed, g + 1));
+          committed = g + 1;
+        }
+        finishWindow();
+      }
+    }
+    if (committed < groupCount) {
+      appendMono(mono.slice(committed, groupCount));
     }
   };
+
+  // Build the ffmpeg invocation.
+  const cmd: string[] = [
+    config.ffmpeg_path,
+    "-loglevel",
+    "warning",
+  ];
+  for (const cam of cameras) {
+    cmd.push(
+      "-use_wallclock_as_timestamps",
+      "1",
+      "-rtsp_transport",
+      "tcp",
+      "-allowed_media_types",
+      "audio",
+      "-i",
+      `${config.output.base_url}/${rawStreamName(cam)}`
+    );
+  }
+  // Per-input: resample to 16k mono, then amerge into N channels.
+  const filterParts: string[] = [];
+  for (let i = 0; i < cameras.length; i++) {
+    filterParts.push(
+      `[${i}:a]aresample=async=1,aformat=sample_rates=16000:channel_layouts=mono[a${i}]`
+    );
+  }
+  const inputs = Array.from({ length: cameras.length }, (_, i) => `[a${i}]`).join("");
+  filterParts.push(`${inputs}amerge=inputs=${cameras.length}[merged]`);
+  cmd.push(
+    "-filter_complex",
+    filterParts.join("; "),
+    "-map",
+    "[merged]",
+    "-ac",
+    String(cameras.length),
+    "-ar",
+    "16000",
+    "-f",
+    "s16le",
+    "-"
+  );
 
   return launchManaged(
-    `audio-${cam.name.toLowerCase().replace(/\s+/g, "-")}`,
+    "audio-combined",
     () => ({
-      cmd: [
-        config.ffmpeg_path,
-        // 'info' level so silencedetect lines reach stderr — they're filtered
-        // server-side in onStderr.
-        "-loglevel",
-        "info",
-        "-rtsp_transport",
-        "tcp",
-        "-allowed_media_types",
-        "audio",
-        "-i",
-        sourceUrl,
-        "-vn",
-        "-af",
-        `silencedetect=noise=${t.silence_threshold_db}dB:d=${t.silence_min_seconds}`,
-        "-ac",
-        "1",
-        "-ar",
-        "16000",
-        "-f",
-        "s16le",
-        "-",
-      ],
+      cmd,
       onStdout,
-      onStderr,
+      onStderr: (line) => {
+        if (/error|fail/i.test(line)) {
+          console.error(`[combined] ${line}`);
+        }
+      },
     }),
     { restartDelayMs: 5000 }
   );
@@ -353,7 +519,7 @@ async function loadConfig(path: string): Promise<Config> {
   return ConfigSchema.parse(YAML.parse(raw));
 }
 
-async function main() {
+async function main(): Promise<void> {
   const { values } = parseArgs({
     args: Bun.argv.slice(2),
     options: {
@@ -368,6 +534,10 @@ async function main() {
     console.log("[transcribe] disabled in config — exiting");
     return;
   }
+  if (config.cameras.length === 0) {
+    console.error("[transcribe] no cameras configured");
+    return;
+  }
 
   const t = config.transcription;
   const whisperUrl = `http://${t.whisper_server.address.replace(/^:/, "127.0.0.1:")}`;
@@ -375,21 +545,17 @@ async function main() {
 
   const processes: ManagedProcess[] = [];
 
-  // 1. whisper-server first; cameras can't transcribe until it's up.
   console.log("[transcribe] starting whisper-server...");
   processes.push(startWhisperServer(t));
 
   await waitForServer(whisperUrl);
   console.log(`[transcribe] whisper-server ready at ${whisperUrl}`);
 
-  // 2. One ffmpeg-to-whisper pump per camera (every camera, including
-  //    restream-only ones).
-  for (const cam of config.cameras) {
-    console.log(`[transcribe] starting pump for ${cam.name}`);
-    processes.push(startCameraPump(cam, config, whisperUrl, ring));
-  }
+  console.log(
+    `[transcribe] starting combined pump for ${config.cameras.length} camera(s)`
+  );
+  processes.push(startCombinedPump(config.cameras, config, whisperUrl, ring));
 
-  // 3. HTTP API for the dashboard to poll.
   const { hostname, port } = parseAddress(t.api_address);
   const server = Bun.serve({
     hostname,
@@ -404,6 +570,7 @@ async function main() {
         return Response.json({
           items: ring.recent(limit),
           counts: ring.countByCamera(),
+          contributor_counts: ring.contributorCountByCamera(),
         });
       }
       if (url.pathname === "/health") {
@@ -425,7 +592,7 @@ async function main() {
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
-  await new Promise(() => {}); // keep alive
+  await new Promise(() => {});
 }
 
 if (import.meta.main) {

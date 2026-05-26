@@ -149,18 +149,21 @@ function renderTimeline(transcriptItems, paths) {
   const start = now - TIMELINE_WINDOW_MS;
   const trimmed = gpuHistory.filter(p => p.ts >= start);
 
-  // Cameras come from raw/* mediamtx paths so empty rows still show up.
+  // Per-camera rows: derived from raw/* mediamtx paths (always show all
+  // cameras, even ones with no recent voice activity).
   const cameraOrder = (paths.items || [])
     .filter(p => p.name.startsWith('raw/'))
     .map(p => slugToCameraName(p.name.slice(4)))
     .sort();
+  // 'Combined' row is shown above the per-camera rows.
+  const allRows = ['Combined', ...cameraOrder];
 
   const PLOT_W = 1000;
   const LEFT_PAD = 110;
   const GPU_H = 70;
   const ROW_H = 14;
   const ROWS_PAD = 8;
-  const voiceRowsH = cameraOrder.length * ROW_H + ROWS_PAD;
+  const voiceRowsH = allRows.length * ROW_H + ROWS_PAD;
   const totalH = GPU_H + 14 + voiceRowsH + 18;
   const xs = ts => LEFT_PAD + ((ts - start) / TIMELINE_WINDOW_MS) * (PLOT_W - LEFT_PAD);
 
@@ -200,28 +203,45 @@ function renderTimeline(transcriptItems, paths) {
   }).join('');
 
   // --- Voice rows ---
-  // Build per-camera index of events in window
+  // Combined transcripts feed the top "Combined" row directly; each entry's
+  // contributors feed ticks on the per-camera rows below.
   const inWindow = (transcriptItems || []).filter(e => e.ts >= start);
   const eventsByCam = new Map();
+  const combined = [];
   for (const e of inWindow) {
-    if (!eventsByCam.has(e.camera)) eventsByCam.set(e.camera, []);
-    eventsByCam.get(e.camera).push(e);
+    combined.push(e);
+    for (const c of (e.contributors || [])) {
+      if (!eventsByCam.has(c.camera)) eventsByCam.set(c.camera, []);
+      eventsByCam.get(c.camera).push({ ...e, contributor: c });
+    }
   }
 
   const voiceYOffset = GPU_H + 14;
   let voiceContent = '';
-  cameraOrder.forEach((cam, i) => {
+  allRows.forEach((cam, i) => {
     const rowY = voiceYOffset + i * ROW_H;
     const baseline = rowY + ROW_H / 2;
-    // Camera label
-    voiceContent += '<text x="' + (LEFT_PAD - 6) + '" y="' + (baseline + 4) + '" text-anchor="end" font-size="11" fill="var(--muted)">' + cam + '</text>';
-    // Row background
+    const isCombined = cam === 'Combined';
+    const labelColor = isCombined ? 'var(--accent)' : 'var(--muted)';
+    voiceContent += '<text x="' + (LEFT_PAD - 6) + '" y="' + (baseline + 4) + '" text-anchor="end" font-size="11" font-weight="' + (isCombined ? '600' : '400') + '" fill="' + labelColor + '">' + cam + '</text>';
     voiceContent += '<line x1="' + LEFT_PAD + '" x2="' + PLOT_W + '" y1="' + baseline + '" y2="' + baseline + '" stroke="#1f2128" stroke-width="1"/>';
-    // Event ticks
-    const events = eventsByCam.get(cam) || [];
+    const events = isCombined ? combined : (eventsByCam.get(cam) || []);
     for (const e of events) {
       const x = xs(e.ts);
-      voiceContent += '<line x1="' + x.toFixed(1) + '" x2="' + x.toFixed(1) + '" y1="' + (rowY + 2) + '" y2="' + (rowY + ROW_H - 2) + '" stroke="var(--accent)" stroke-width="2" opacity="0.85"><title>' + cam + ' · ' + e.text.replace(/</g, '&lt;').replace(/"/g, '&quot;') + '</title></line>';
+      // On the per-camera row, brighten the tick if this camera was the
+      // PRIMARY contributor; dim it if it was a secondary contributor.
+      let opacity = '0.85';
+      let strokeWidth = '2';
+      if (!isCombined && e.camera !== e.primary_camera) {
+        // 'contributor' was attached above for per-camera rows
+        const isPrimary = cam === e.primary_camera;
+        opacity = isPrimary ? '0.95' : '0.5';
+        strokeWidth = isPrimary ? '2.5' : '1.5';
+      }
+      const tipPeer = isCombined
+        ? e.primary_camera + (e.contributors && e.contributors.length > 1 ? ' (+' + (e.contributors.length - 1) + ')' : '')
+        : cam + (e.contributor ? ' (' + e.contributor.rms_db.toFixed(1) + ' dB)' : '');
+      voiceContent += '<line x1="' + x.toFixed(1) + '" x2="' + x.toFixed(1) + '" y1="' + (rowY + 2) + '" y2="' + (rowY + ROW_H - 2) + '" stroke="var(--accent)" stroke-width="' + strokeWidth + '" opacity="' + opacity + '"><title>' + tipPeer + ' · ' + e.text.replace(/</g, '&lt;').replace(/"/g, '&quot;') + '</title></line>';
     }
   });
 
@@ -458,10 +478,15 @@ async function tick() {
         tEl.innerHTML = items.map(e => {
           const dt = (now - e.ts) / 1000;
           const ago = dt < 60 ? Math.floor(dt) + 's' : dt < 3600 ? Math.floor(dt/60) + 'm' : Math.floor(dt/3600) + 'h';
+          const others = (e.contributors || []).filter(c => c.camera !== e.primary_camera);
+          const alsoHeard = others.length
+            ? ' <span style="color: var(--muted); font-size: 11px;">+ ' + others.map(c => c.camera).join(', ') + '</span>'
+            : '';
           return '<div style="padding: 4px 0; border-bottom: 1px solid #1f2128;">'
-            + '<span style="color: var(--accent); font-weight: 600; margin-right: 8px;">' + e.camera + '</span>'
+            + '<span style="color: var(--accent); font-weight: 600; margin-right: 8px;">' + (e.primary_camera || '?') + '</span>'
             + '<span style="color: var(--muted); font-size: 11px; margin-right: 8px;">' + ago + ' ago</span>'
             + '<span>' + e.text.replace(/</g, '&lt;') + '</span>'
+            + alsoHeard
             + '</div>';
         }).join('');
       }
