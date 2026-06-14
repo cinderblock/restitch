@@ -164,7 +164,10 @@ const streamUrls = name => ({
   hls: 'http://' + HOST + ':8890/' + name + '/',
 });
 
-window.copyRtsp = (btn, url) => {
+document.addEventListener('click', e => {
+  const btn = e.target.closest('.copy-rtsp');
+  if (!btn) return;
+  const url = btn.dataset.url;
   navigator.clipboard.writeText(url).then(() => {
     const orig = btn.textContent;
     btn.textContent = 'copied!';
@@ -173,11 +176,11 @@ window.copyRtsp = (btn, url) => {
       btn.textContent = orig;
       btn.classList.remove('copied');
     }, 1200);
-  }).catch(e => {
+  }).catch(() => {
     btn.textContent = 'copy failed';
     setTimeout(() => { btn.textContent = 'copy rtsp'; }, 1200);
   });
-};
+});
 
 function renderTimeline(transcriptItems, paths) {
   const now = Date.now();
@@ -409,7 +412,7 @@ async function tick() {
         + '<span class="sep">·</span>'
         + '<a href="' + urls.hls + '" target="_blank" rel="noopener" title="' + urls.hls + '">hls</a>'
         + '<span class="sep">·</span>'
-        + '<button type="button" title="' + urls.rtsp + '" onclick="copyRtsp(this, \'' + urls.rtsp + '\')">copy rtsp</button>'
+        + '<button type="button" class="copy-rtsp" data-url="' + urls.rtsp + '" title="' + urls.rtsp + '">copy rtsp</button>'
         + '</span>';
       const ready = p.ready
         ? '<span class="pill good">ready</span>'
