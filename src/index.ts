@@ -2,7 +2,13 @@ import { parseArgs } from "util";
 import { resolve, dirname } from "path";
 import YAML from "yaml";
 import { ConfigSchema, type Config } from "./config.ts";
-import { buildPipeline, buildCommand, type ProbeResult } from "./ffmpeg.ts";
+import {
+  buildPipeline,
+  buildExtraCompositePipeline,
+  buildCommand,
+  type ProbeResult,
+  type Pipeline,
+} from "./ffmpeg.ts";
 import { probeAllCameras } from "./probe.ts";
 import { writeMediaMTXConfig } from "./mediamtx.ts";
 import { launchManaged, type ManagedProcess } from "./process.ts";
@@ -60,21 +66,43 @@ async function main() {
     }
   }
 
-  // Build the FFmpeg pipeline
+  // Build the main FFmpeg pipeline (Bay 1-5 composite + sub-streams)
   const pipeline = buildPipeline(config, cameraProbes);
 
-  console.log("\n--- Filter Complex ---");
+  // Build a separate pipeline per extra composite
+  const extraPipelines: { name: string; pipeline: Pipeline; cmd: string[] }[] =
+    config.extra_composites.map((extra) => {
+      const p = buildExtraCompositePipeline(config, extra, cameraProbes);
+      return { name: extra.name, pipeline: p, cmd: buildCommand(config, p) };
+    });
+
+  console.log("\n--- Filter Complex (main) ---");
   console.log(pipeline.filterComplex);
   console.log("\n--- Output Streams ---");
-  for (const out of pipeline.outputs) {
+  const allOutputs = [
+    ...pipeline.outputs,
+    ...extraPipelines.flatMap((e) => e.pipeline.outputs),
+  ];
+  for (const out of allOutputs) {
     console.log(`  ${out.name} -> ${config.output.base_url}/${out.name}`);
+  }
+  if (extraPipelines.length > 0) {
+    console.log("\n--- Extra Composites ---");
+    for (const e of extraPipelines) {
+      console.log(`[${e.name}]`);
+      console.log(e.pipeline.filterComplex);
+    }
   }
 
   const fullCmd = buildCommand(config, pipeline);
 
   if (values["dry-run"]) {
-    console.log("\n--- FFmpeg Command (dry run) ---");
+    console.log("\n--- FFmpeg Command (main, dry run) ---");
     console.log(fullCmd.join(" \\\n  "));
+    for (const e of extraPipelines) {
+      console.log(`\n--- FFmpeg Command (${e.name}, dry run) ---`);
+      console.log(e.cmd.join(" \\\n  "));
+    }
     return;
   }
 
@@ -86,7 +114,7 @@ async function main() {
     const mtxConfigPath = await writeMediaMTXConfig(
       configDir,
       config,
-      pipeline.outputs
+      allOutputs
     );
     const mtxBin = values["mediamtx-bin"]!;
 
@@ -111,13 +139,21 @@ async function main() {
     console.error(`[${prefix}] ${line}`);
   };
 
-  // Launch single FFmpeg that pulls directly from cameras,
-  // composites, and pushes to mediamtx
+  // Main FFmpeg: composite + sub-streams
   const ffmpegProc = launchManaged("ffmpeg", () => ({
     cmd: fullCmd,
     onStderr: stderrFilter("ffmpeg"),
   }));
   processes.push(ffmpegProc);
+
+  // One FFmpeg per extra composite — independent restart, independent CPU/GPU
+  for (const e of extraPipelines) {
+    const proc = launchManaged(`ffmpeg-${e.name}`, () => ({
+      cmd: e.cmd,
+      onStderr: stderrFilter(`ffmpeg-${e.name}`),
+    }));
+    processes.push(proc);
+  }
 
   // Dashboard HTTP server (proxies mediamtx API + exposes /api/system)
   const dashServer = config.dashboard.enabled

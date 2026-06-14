@@ -1,4 +1,10 @@
-import type { Config, Camera, SubStream, Encoder } from "./config.ts";
+import type {
+  Config,
+  Camera,
+  SubStream,
+  Encoder,
+  ExtraComposite,
+} from "./config.ts";
 import { rawStreamName } from "./mediamtx.ts";
 
 /**
@@ -340,6 +346,167 @@ export function buildPipeline(
 
   const filterComplex = filters.join(";\n");
 
+  return { inputArgs, filterComplex, outputs };
+}
+
+/**
+ * Build an FFmpeg pipeline for a single "extra" composite — a vstack or hstack
+ * of an arbitrary subset of cameras, with optional per-input crop and
+ * post-stack rotation/scale. Produces a single output stream named
+ * extra.name. Inputs are pulled from local mediamtx raw paths.
+ *
+ * Inputs are auto-scaled to the FIRST input's stacking-axis dimension so
+ * vstack/hstack doesn't reject mismatched widths/heights.
+ */
+export function buildExtraCompositePipeline(
+  config: Config,
+  extra: ExtraComposite,
+  cameraProbes: Map<string, ProbeResult>
+): Pipeline {
+  const cameraByName = new Map<string, Camera>(
+    config.cameras.map((c) => [c.name, c])
+  );
+  const filters: string[] = [];
+  const inputArgs: string[] = [];
+
+  // Resolve inputs against the top-level cameras list
+  const resolved = extra.inputs.map((ref) => {
+    const cam = cameraByName.get(ref.name);
+    if (!cam) {
+      throw new Error(
+        `extra_composite "${extra.name}" references unknown camera "${ref.name}"`
+      );
+    }
+    const probe = cameraProbes.get(ref.name);
+    if (!probe) {
+      throw new Error(
+        `extra_composite "${extra.name}": no probe result for "${ref.name}"`
+      );
+    }
+    return { ref, cam, probe };
+  });
+
+  // --- Inputs ---
+  for (const { cam } of resolved) {
+    const sourceUrl = `${config.output.base_url}/${rawStreamName(cam)}`;
+    inputArgs.push(
+      ...hwaccelInputArgs(config.hwaccel),
+      "-use_wallclock_as_timestamps",
+      "1",
+      "-thread_queue_size",
+      "4096",
+      "-allowed_media_types",
+      "video",
+      "-rtsp_transport",
+      "tcp",
+      "-i",
+      sourceUrl
+    );
+  }
+
+  // --- Per-input fps / rotation / crop / scale ---
+  // For each input we want: fps norm → rotate → crop → (later) scale-to-first
+  // First pass compute post-rotation, post-crop dimensions for each input so
+  // we can auto-scale them all to match in the stacking axis.
+  type Resolved = {
+    label: string; // output label for this input after fps+rotate+crop
+    width: number;
+    height: number;
+  };
+  const perInput: Resolved[] = [];
+
+  for (let i = 0; i < resolved.length; i++) {
+    const { ref, cam, probe } = resolved[i]!;
+    const fpsLabel = `[xc_fps_${i}]`;
+    filters.push(`[${i}:v]fps=${probe.fps}${fpsLabel}`);
+    let prev = fpsLabel;
+
+    // Rotation: input ref override > camera default
+    const rotation = ref.rotation ?? cam.rotation;
+    const rots = rotationFilters(rotation);
+    for (let r = 0; r < rots.length; r++) {
+      const lbl = `[xc_rot_${i}_${r}]`;
+      filters.push(`${prev}${rots[r]}${lbl}`);
+      prev = lbl;
+    }
+    const rotated = rotatedDimensions(probe.width, probe.height, rotation);
+    let w = rotated.width;
+    let h = rotated.height;
+
+    // Optional crop (percentages resolve against post-rotation dimensions)
+    if (ref.crop) {
+      const cx = resolveDimension(ref.crop.x, w);
+      const cy = resolveDimension(ref.crop.y, h);
+      const cw = resolveDimension(ref.crop.width, w);
+      const ch = resolveDimension(ref.crop.height, h);
+      const cropLbl = `[xc_crop_${i}]`;
+      filters.push(`${prev}crop=${cw}:${ch}:${cx}:${cy}${cropLbl}`);
+      prev = cropLbl;
+      w = cw;
+      h = ch;
+    }
+
+    perInput.push({ label: prev, width: w, height: h });
+  }
+
+  // --- Auto-scale to first input's stacking-axis dimension ---
+  const referenceWidth = perInput[0]!.width;
+  const referenceHeight = perInput[0]!.height;
+  const stackLabels: string[] = [];
+
+  for (let i = 0; i < perInput.length; i++) {
+    const r = perInput[i]!;
+    let lbl = r.label;
+    let needScale = false;
+    let targetW = r.width;
+    let targetH = r.height;
+    if (extra.direction === "vertical" && r.width !== referenceWidth) {
+      needScale = true;
+      targetW = referenceWidth;
+      // Preserve aspect ratio (-2 = compute even integer)
+      targetH = -2;
+    } else if (extra.direction === "horizontal" && r.height !== referenceHeight) {
+      needScale = true;
+      targetH = referenceHeight;
+      targetW = -2;
+    }
+    if (needScale) {
+      const scaleLbl = `[xc_scale_${i}]`;
+      filters.push(
+        `${lbl}scale=${targetW}:${targetH}:flags=lanczos${scaleLbl}`
+      );
+      lbl = scaleLbl;
+    }
+    stackLabels.push(lbl);
+  }
+
+  // --- Stack ---
+  const stackFilter = extra.direction === "vertical" ? "vstack" : "hstack";
+  const stackedLbl = `[xc_stacked]`;
+  filters.push(
+    `${stackLabels.join("")}${stackFilter}=inputs=${perInput.length}${stackedLbl}`
+  );
+
+  // --- Post-stack rotation ---
+  let outLbl = stackedLbl;
+  const postRot = rotationFilters(extra.rotation);
+  for (let r = 0; r < postRot.length; r++) {
+    const lbl = `[xc_post_rot_${r}]`;
+    filters.push(`${outLbl}${postRot[r]}${lbl}`);
+    outLbl = lbl;
+  }
+
+  // --- Optional post-stack scale ---
+  if (extra.scale) {
+    const lbl = `[xc_scaled]`;
+    filters.push(
+      `${outLbl}scale=${extra.scale.width}:${extra.scale.height}:flags=lanczos${lbl}`
+    );
+    outLbl = lbl;
+  }
+
+  const filterComplex = filters.join(";\n");
+  const outputs: PipelineOutput[] = [{ name: extra.name, mapLabel: outLbl }];
   return { inputArgs, filterComplex, outputs };
 }
 

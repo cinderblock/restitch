@@ -33,6 +33,13 @@ const DimensionValue = z.union([
   z.string().regex(/^\d+(\.\d+)?%$/, 'Must be a percentage like "50%"'),
 ]);
 
+const CropSchema = z.object({
+  x: DimensionValue,
+  y: DimensionValue,
+  width: DimensionValue,
+  height: DimensionValue,
+});
+
 const SubStreamSchema = z.object({
   name: z.string().describe("Stream name, used in the output URL path"),
   x: DimensionValue.describe("Crop origin X — pixels or percentage of composite width"),
@@ -55,6 +62,33 @@ const HwAccelSchema = z
   .default("auto");
 
 const StackDirectionSchema = z.enum(["vertical", "horizontal"]).default("vertical");
+
+const InputRefSchema = z.object({
+  name: z.string().describe("Camera name (must exist in top-level cameras list)"),
+  rotation: RotationSchema.optional().describe(
+    "Rotation override for this composite; falls back to the camera's own rotation"
+  ),
+  crop: CropSchema.optional().describe(
+    "Crop applied to this input BEFORE stacking. Percentages resolve against " +
+      "the source camera's post-rotation dimensions."
+  ),
+});
+
+const ExtraCompositeSchema = z.object({
+  name: z.string().describe("Output stream name (rtsp://host:8554/<name>)"),
+  direction: StackDirectionSchema,
+  rotation: RotationSchema.describe(
+    "Rotation applied to the stacked composite (after stacking, before scale)"
+  ),
+  scale: z
+    .object({
+      width: z.number().int().positive(),
+      height: z.number().int().positive(),
+    })
+    .optional()
+    .describe("Optional scale applied to the final stacked output"),
+  inputs: z.array(InputRefSchema).min(1),
+});
 
 const CompositeSchema = z.object({
   name: z.string().default("full").describe("Stream name for the composite"),
@@ -200,6 +234,13 @@ export const ConfigSchema = z.object({
     rotation: "0",
   }),
   sub_streams: z.array(SubStreamSchema).default([]),
+  extra_composites: z
+    .array(ExtraCompositeSchema)
+    .default([])
+    .describe(
+      "Additional composites built from arbitrary camera subsets. Each runs " +
+        "as its own FFmpeg pipeline alongside the main composite."
+    ),
   encoder: EncoderSchema.default({
     codec: "libx264",
     preset: "medium",
@@ -248,6 +289,9 @@ export const ConfigSchema = z.object({
 export type Config = z.infer<typeof ConfigSchema>;
 export type Camera = z.infer<typeof CameraSchema>;
 export type SubStream = z.infer<typeof SubStreamSchema>;
+export type ExtraComposite = z.infer<typeof ExtraCompositeSchema>;
+export type InputRef = z.infer<typeof InputRefSchema>;
+export type Crop = z.infer<typeof CropSchema>;
 export type Composite = z.infer<typeof CompositeSchema>;
 export type Encoder = z.infer<typeof EncoderSchema>;
 export type Dashboard = z.infer<typeof DashboardSchema>;
