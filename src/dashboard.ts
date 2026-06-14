@@ -48,6 +48,13 @@ const HTML = `<!DOCTYPE html>
   header .updated { color: var(--muted); font-size: 12px; }
   code { font: 13px/1 "JetBrains Mono", Consolas, "Courier New", monospace; color: var(--accent); }
   .empty { color: var(--muted); text-align: center; padding: 12px; font-style: italic; }
+  .actions a, .actions button {
+    color: var(--accent); background: none; border: none; padding: 2px 4px; cursor: pointer;
+    font: inherit; text-decoration: none; font-size: 11px;
+  }
+  .actions a:hover, .actions button:hover { text-decoration: underline; }
+  .actions .sep { color: var(--border); margin: 0 2px; }
+  .actions .copied { color: var(--good); }
 </style>
 </head>
 <body>
@@ -88,6 +95,7 @@ const HTML = `<!DOCTYPE html>
       <th class="sortable num" data-table="paths" data-key="tx">TX<span class="arrow"></span></th>
       <th class="sortable num" data-table="paths" data-key="bitrate">Bitrate<span class="arrow"></span></th>
       <th class="sortable num" data-table="paths" data-key="readers">Readers<span class="arrow"></span></th>
+      <th>Open</th>
     </tr></thead>
     <tbody id="paths"></tbody>
   </table>
@@ -148,6 +156,28 @@ const slugToCameraName = slug => slug
   .split('-')
   .map(w => w ? w[0].toUpperCase() + w.slice(1) : '')
   .join(' ');
+
+const HOST = location.hostname;
+const streamUrls = name => ({
+  rtsp: 'rtsp://' + HOST + ':8554/' + name,
+  webrtc: 'http://' + HOST + ':8889/' + name + '/',
+  hls: 'http://' + HOST + ':8890/' + name + '/',
+});
+
+window.copyRtsp = (btn, url) => {
+  navigator.clipboard.writeText(url).then(() => {
+    const orig = btn.textContent;
+    btn.textContent = 'copied!';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = orig;
+      btn.classList.remove('copied');
+    }, 1200);
+  }).catch(e => {
+    btn.textContent = 'copy failed';
+    setTimeout(() => { btn.textContent = 'copy rtsp'; }, 1200);
+  });
+};
 
 function renderTimeline(transcriptItems, paths) {
   const now = Date.now();
@@ -373,6 +403,14 @@ async function tick() {
     const pathRows = enrichedPaths.map(p => {
       const bps = p._bps;
       const readerCount = (p.readers || []).length;
+      const urls = streamUrls(p.name);
+      const actions = '<span class="actions">'
+        + '<a href="' + urls.webrtc + '" target="_blank" rel="noopener" title="' + urls.webrtc + '">webrtc</a>'
+        + '<span class="sep">·</span>'
+        + '<a href="' + urls.hls + '" target="_blank" rel="noopener" title="' + urls.hls + '">hls</a>'
+        + '<span class="sep">·</span>'
+        + '<button type="button" title="' + urls.rtsp + '" onclick="copyRtsp(this, \'' + urls.rtsp + '\')">copy rtsp</button>'
+        + '</span>';
       const ready = p.ready
         ? '<span class="pill good">ready</span>'
         : '<span class="pill bad">down</span>';
@@ -389,10 +427,11 @@ async function tick() {
         + '<td class="num">' + fmtBytes(p.bytesSent) + '</td>'
         + '<td class="num">' + fmtBps(bps) + '</td>'
         + '<td class="num">' + readerCount + '</td>'
+        + '<td>' + actions + '</td>'
         + '</tr>';
     });
     document.getElementById('paths').innerHTML = pathRows.join('')
-      || '<tr><td colspan="8" class="empty">no paths configured</td></tr>';
+      || '<tr><td colspan="9" class="empty">no paths configured</td></tr>';
 
     // Sessions
     const all = [];
