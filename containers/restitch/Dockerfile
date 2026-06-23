@@ -12,7 +12,7 @@
 # includes 'video' so NVENC/NVDEC encoder libraries are mounted in.
 
 # --- builder: whisper.cpp with cuBLAS ---
-FROM nvidia/cuda:12.4.1-devel-ubuntu24.04 AS whisper-builder
+FROM nvidia/cuda:12.9.2-devel-ubuntu24.04 AS whisper-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -qq && \
@@ -29,7 +29,7 @@ RUN git clone --depth 1 --branch "${WHISPER_REF}" \
 
 
 # --- runtime ---
-FROM nvidia/cuda:12.4.1-runtime-ubuntu24.04
+FROM nvidia/cuda:12.9.2-runtime-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -qq && \

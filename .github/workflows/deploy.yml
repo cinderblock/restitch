@@ -59,71 +59,15 @@ jobs:
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/restitch:buildcache
           cache-to:   type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/restitch:buildcache,mode=max
 
-  # 2. Make sure the self-hosted runner on sentinel is online; if not,
-  #    print registration instructions and wait (up to 60 minutes).
-  ensure-runner:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check / register runner
-        uses: actions/github-script@v9
-        with:
-          github-token: ${{ secrets.RUNNER_ADMIN_TOKEN || secrets.GITHUB_TOKEN }}
-          script: |
-            const serverLabel = 'sentinel';
-            const { data } = await github.rest.actions.listSelfHostedRunnersForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-            });
-            const runner = data.runners.find(r =>
-              r.labels.some(l => l.name === serverLabel)
-            );
-            if (runner && runner.status === 'online') {
-              console.log(`✓ Runner '${serverLabel}' is online (id ${runner.id})`);
-              return;
-            }
-            if (runner) {
-              console.log(`Runner '${serverLabel}' is ${runner.status} — removing stale registration (id ${runner.id})`);
-              await github.rest.actions.deleteSelfHostedRunnerFromRepo({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                runner_id: runner.id,
-              });
-            }
+  # Runner provisioning is owned by the jackson ops workflow (the
+  # install-restitch-runner job there registers a `sentinel,self-hosted`
+  # runner on cinderblock/restitch). If the runner isn't online when the
+  # deploy job below tries to run, the job sits in "queued" until it
+  # appears — re-run the jackson workflow to register it.
 
-            // Mint a registration token + print setup instructions, then wait.
-            const { data: tok } = await github.rest.actions.createRegistrationTokenForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-            });
-            const { data: rel } = await github.rest.repos.getLatestRelease({
-              owner: 'actions', repo: 'runner',
-            });
-            const v = rel.tag_name.replace(/^v/, '');
-            console.log('Runner missing or offline. Provisioning is normally handled by');
-            console.log('the jackson ops workflow (install-restitch-runner job). To do it');
-            console.log('by hand, ssh to sentinel as cameron and run:');
-            console.log('');
-            console.log(`RUNNER_VERSION=${v} && mkdir -p ~/actions-runner-restitch && cd ~/actions-runner-restitch && curl -sL https://github.com/actions/runner/releases/download/v\${RUNNER_VERSION}/actions-runner-linux-x64-\${RUNNER_VERSION}.tar.gz | tar xz && ./config.sh --unattended --replace --url https://github.com/${context.repo.owner}/${context.repo.repo} --token ${tok.token} --name sentinel-restitch --labels sentinel,self-hosted && sudo ./svc.sh install && sudo ./svc.sh start`);
-            console.log('');
-            console.log('Waiting up to 60 minutes...');
-
-            const deadline = Date.now() + 60 * 60 * 1000;
-            while (Date.now() < deadline) {
-              const { data: d } = await github.rest.actions.listSelfHostedRunnersForRepo({
-                owner: context.repo.owner, repo: context.repo.repo,
-              });
-              const r = d.runners.find(rr => rr.labels.some(l => l.name === serverLabel));
-              if (r && r.status === 'online') {
-                console.log(`✓ Runner '${serverLabel}' is online`);
-                return;
-              }
-              await new Promise(res => setTimeout(res, 10_000));
-            }
-            core.setFailed(`Runner '${serverLabel}' never came online`);
-
-  # 3. Build the deployment bundle (resolves image version into compose)
+  # Build the deployment bundle (resolves image version into compose)
   build-bundle:
-    needs: [build-image, ensure-runner]
+    needs: [build-image]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -144,9 +88,9 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # 4. Deploy on the self-hosted runner
+  # Deploy on the self-hosted runner (label `sentinel`)
   deploy:
-    needs: [build-bundle, ensure-runner]
+    needs: [build-bundle]
     runs-on: [self-hosted, sentinel]
     concurrency:
       group: deploy-sentinel-restitch
