@@ -21,12 +21,14 @@ RUN apt-get update -qq && \
     rm -rf /var/lib/apt/lists/*
 
 ARG WHISPER_REF=v1.8.7
-# nvidia/cuda:*-devel ships libcuda.so as a stub at .../stubs/. The linker
-# doesn't pick that up by default, so symbols like cuGetErrorString come
-# back undefined. LIBRARY_PATH points ld at the stubs dir at build time
-# only; at runtime the real libcuda.so comes from the host driver via
-# nvidia-container-toolkit.
-ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH}
+# nvidia/cuda:*-devel ships libcuda.so as a stub at .../stubs/ but cmake's
+# find_library only looks in the standard lib dir, so ggml's CUDA driver
+# symbols (cuMemCreate, cuGetErrorString, ...) come back undefined.
+# Symlinking the stub into the standard location lets the link succeed.
+# At runtime the real libcuda.so comes from the host driver via the
+# nvidia-container-toolkit and shadows the stub.
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/libcuda.so && \
+    ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/libcuda.so.1
 # Repo moved from ggerganov to ggml-org. Note the binary names changed
 # from `server`/`main` to `whisper-server`/`whisper-cli` in 1.8.x.
 RUN git clone --depth 1 --branch "${WHISPER_REF}" \
