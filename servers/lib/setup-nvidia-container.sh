@@ -29,13 +29,29 @@ ensure_nvidia_driver() {
 		return 0
 	fi
 
-	echo "NVIDIA driver not loaded. Installing via ubuntu-drivers..."
+	echo "NVIDIA driver not loaded. Installing..."
 	sudo apt-get update -qq
-	# ubuntu-drivers-common ships `ubuntu-drivers` (auto-detects the recommended
-	# driver for the installed GPU). On a server we use --gpgpu to skip the X
-	# desktop bits.
+	# ubuntu-drivers-common ships `ubuntu-drivers` which detects the right
+	# driver for the GPU. For newer cards `ubuntu-drivers install --gpgpu` is
+	# a no-op (the device gets manual_install:True) so we parse the
+	# recommended driver and apt-install it directly.
 	sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ubuntu-drivers-common
-	sudo ubuntu-drivers install --gpgpu
+	local recommended
+	recommended=$(ubuntu-drivers devices 2>/dev/null \
+		| awk '/^driver.*nvidia-driver-.*recommended/ {print $3; exit}')
+	if [ -z "$recommended" ]; then
+		# Fallback: any nvidia-driver-* entry
+		recommended=$(ubuntu-drivers devices 2>/dev/null \
+			| awk '/^driver.*nvidia-driver-/ {print $3; exit}')
+	fi
+	if [ -z "$recommended" ]; then
+		echo "Error: no NVIDIA driver candidate found by ubuntu-drivers." >&2
+		echo "ubuntu-drivers devices output:" >&2
+		ubuntu-drivers devices 2>&1 | sed 's/^/  /' >&2
+		return 1
+	fi
+	echo "Installing ${recommended}..."
+	sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${recommended}"
 
 	# Some boxes pick up the driver without a reboot (modprobe nvidia works),
 	# but the safe and consistent answer is to reboot. Schedule a delayed
