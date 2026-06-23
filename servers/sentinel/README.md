@@ -20,23 +20,18 @@ pull && up -d` on sentinel. Config push to jackson → jackson writes the new
 
 ## Box prerequisites
 
-These two are one-time, manual, because they require a reboot and are too
-heavy for a CI step:
+Only one thing has to be true before the first deploy:
 
-1. **NVIDIA driver**
-	```bash
-	sudo ubuntu-drivers install --gpgpu
-	sudo reboot
-	# Verify after reboot
-	nvidia-smi
-	```
-2. **`cameron` user with passwordless sudo** (already true if jackson's runner
-   is installed). Required so `deploy.sh` can apt-install docker and the
-   NVIDIA container toolkit without prompts.
+- **`cameron` user with passwordless sudo** (already true if jackson's runner
+  is installed). Required so `deploy.sh` can apt-install docker, the NVIDIA
+  driver, and the NVIDIA container toolkit without prompts.
 
-Everything else — Docker, `nvidia-container-toolkit`, the `nvidia` Docker
-runtime, the restitch container itself — is installed by `deploy.sh` on the
-first run.
+Everything else — Docker, the NVIDIA driver, `nvidia-container-toolkit`, the
+`nvidia` Docker runtime, the restitch container itself — is installed by
+`deploy.sh`. On a fresh box the first deploy installs the NVIDIA driver and
+reboots; the workflow run fails when the box restarts. Re-trigger the
+workflow once the box is back up and the second run skips the driver step
+and proceeds normally.
 
 ## Self-hosted runner
 

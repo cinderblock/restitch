@@ -32,9 +32,11 @@ cd "${SCRIPT_DIR}"
 source "${SCRIPT_DIR}/lib/setup-docker.sh"
 ensure_docker "${SCRIPT_DIR}/deploy.sh"
 
-# --- 2. NVIDIA Container Toolkit ---
+# --- 2. NVIDIA driver (may reboot the host on a fresh box and fail this
+#      run; re-trigger after the box is back) + container toolkit ---
 # shellcheck source=lib/setup-nvidia-container.sh
 source "${SCRIPT_DIR}/lib/setup-nvidia-container.sh"
+ensure_nvidia_driver
 ensure_nvidia_container
 
 # --- 3. Validate config ---
