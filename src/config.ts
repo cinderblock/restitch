@@ -133,18 +133,10 @@ const DashboardSchema = z.object({
     .string()
     .default("http://localhost:9997")
     .describe("Where the dashboard reaches the mediamtx control API"),
-  transcription_api_url: z
-    .string()
-    .default("http://localhost:9001")
-    .describe("Where the dashboard reaches the transcription service (proxied to /api/transcriptions)"),
 });
 
 const TranscriptionSchema = z.object({
   enabled: z.boolean().default(true),
-  api_address: z
-    .string()
-    .default(":9001")
-    .describe("Bind address for the transcription service's HTTP API"),
   whisper_server: z
     .object({
       bin: z.string().default("whisper-server"),
@@ -257,11 +249,9 @@ export const ConfigSchema = z.object({
     enabled: true,
     address: ":9000",
     mediamtx_api_url: "http://localhost:9997",
-    transcription_api_url: "http://localhost:9001",
   }),
   transcription: TranscriptionSchema.default({
     enabled: true,
-    api_address: ":9001",
     whisper_server: {
       bin: "whisper-server",
       address: "127.0.0.1:9876",

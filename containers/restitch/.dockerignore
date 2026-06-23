@@ -1,0 +1,13 @@
+.git
+.github
+node_modules
+config.yaml
+config.yaml.bak*
+mediamtx.generated.yml
+scripts/
+servers/
+docs/
+README.md
+plans/
+.t3/
+*.md

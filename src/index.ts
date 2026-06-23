@@ -14,6 +14,7 @@ import { writeMediaMTXConfig } from "./mediamtx.ts";
 import { launchManaged, type ManagedProcess } from "./process.ts";
 import { detectHwAccel, suggestEncoder } from "./hwaccel.ts";
 import { startDashboard } from "./dashboard.ts";
+import { startTranscription } from "./transcribe.ts";
 
 const { values } = parseArgs({
   args: Bun.argv.slice(2),
@@ -155,9 +156,16 @@ async function main() {
     processes.push(proc);
   }
 
-  // Dashboard HTTP server (proxies mediamtx API + exposes /api/system)
+  // Transcription stack (whisper-server + audio fusion pump). Spawns its
+  // own supervised subprocesses into `processes`. Returns the ring+stats
+  // synchronously; the audio pump attaches once whisper warms up.
+  const transcription = startTranscription(config, processes);
+
+  // Dashboard HTTP server (proxies mediamtx API + exposes /api/system +
+  // /api/transcriptions + /api/transcription-stats from the in-process
+  // ring buffer)
   const dashServer = config.dashboard.enabled
-    ? startDashboard(config.dashboard)
+    ? startDashboard(config.dashboard, transcription)
     : null;
   if (dashServer) {
     console.log(

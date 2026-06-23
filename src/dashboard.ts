@@ -1,5 +1,6 @@
 import type { Server } from "bun";
 import type { Dashboard } from "./config.ts";
+import type { RingBuffer, LiveStats } from "./transcribe.ts";
 
 const HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -711,9 +712,11 @@ async function readSystemInfo(): Promise<unknown> {
   return result;
 }
 
-export function startDashboard(dashboard: Dashboard): Server {
+export function startDashboard(
+  dashboard: Dashboard,
+  transcription?: { ring: RingBuffer; stats: LiveStats }
+): Server {
   const apiBase = dashboard.mediamtx_api_url.replace(/\/$/, "");
-  const transcribeBase = dashboard.transcription_api_url.replace(/\/$/, "");
   const { hostname, port } = parseAddress(dashboard.address);
 
   const server = Bun.serve({
@@ -740,11 +743,21 @@ export function startDashboard(dashboard: Dashboard): Server {
         case "/api/peers":
           return Response.json(await readPeers());
         case "/api/transcriptions": {
-          const q = url.search; // pass through ?limit=…
-          return proxyJson(`${transcribeBase}/api/transcriptions${q}`);
+          if (!transcription) return Response.json({ items: [], counts: {}, contributor_counts: {} });
+          const limit = Math.max(
+            1,
+            Math.min(500, parseInt(url.searchParams.get("limit") ?? "100", 10))
+          );
+          return Response.json({
+            items: transcription.ring.recent(limit),
+            counts: transcription.ring.countByCamera(),
+            contributor_counts: transcription.ring.contributorCountByCamera(),
+          });
         }
         case "/api/transcription-stats":
-          return proxyJson(`${transcribeBase}/api/stats`);
+          return transcription
+            ? Response.json(transcription.stats)
+            : new Response("disabled", { status: 503 });
         default:
           return new Response("Not found", { status: 404 });
       }

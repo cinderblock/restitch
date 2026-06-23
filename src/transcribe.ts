@@ -1,11 +1,10 @@
 /**
- * Standalone transcription service.
+ * Transcription pipeline (combined-fusion).
  *
- * Architecture (combined-fusion):
- *   1 ffmpeg with 8 RTSP audio inputs (one per camera). amerge gives us an
- *   8-channel interleaved s16le stream at 16 kHz.
+ *   1 ffmpeg with N RTSP audio inputs (one per camera). amerge gives us an
+ *   N-channel interleaved s16le stream at 16 kHz.
  *   ↓
- *   Bun reads 8-channel groups, picks max(|sample|) per timestep to produce a
+ *   Bun reads N-channel groups, picks max(|sample|) per timestep to produce a
  *   mono "loudest mic wins" mix (no comb-filtering from unsynchronized mics).
  *   Simultaneously accumulates per-channel RMS for attribution.
  *   ↓
@@ -14,36 +13,31 @@
  *   per camera attached.
  *   ↓
  *   Ring buffer entry: { ts, text, primary_camera, contributors[] }.
- *   /api/transcriptions exposes it; the main dashboard proxies through.
- *
- * Runs as a separate systemd unit (restitch-transcribe.service).
+ *   Exposed via startTranscription() to the host (index.ts), which serves
+ *   the ring/stats from the dashboard HTTP server in-process.
  */
 
-import { parseArgs } from "util";
-import { resolve } from "path";
-import YAML from "yaml";
-import {
-  ConfigSchema,
-  type Config,
-  type Camera,
-  type Transcription,
+import type {
+  Config,
+  Camera,
+  Transcription,
 } from "./config.ts";
 import { rawStreamName } from "./mediamtx.ts";
 import { launchManaged, type ManagedProcess } from "./process.ts";
 
-interface Contributor {
+export interface Contributor {
   camera: string;
   rms_db: number;
 }
 
-interface Entry {
+export interface Entry {
   ts: number;
   text: string;
   primary_camera: string;
   contributors: Contributor[];
 }
 
-class RingBuffer {
+export class RingBuffer {
   private entries: Entry[] = [];
 
   constructor(private maxEntries: number) {}
@@ -206,7 +200,7 @@ function startWhisperServer(t: Transcription): ManagedProcess {
  * Single fused-audio pump: one ffmpeg pulls all camera audio, Bun does the
  * mixing and silence detection, then triggers a transcription per segment.
  */
-interface LiveStats {
+export interface LiveStats {
   state: "silent" | "speaking" | "pending";
   threshold_db: number;
   mono_rms_db: number;
@@ -538,102 +532,68 @@ function startCombinedPump(
   );
 }
 
-async function loadConfig(path: string): Promise<Config> {
-  const raw = await Bun.file(path).text();
-  return ConfigSchema.parse(YAML.parse(raw));
-}
-
-async function main(): Promise<void> {
-  const { values } = parseArgs({
-    args: Bun.argv.slice(2),
-    options: {
-      config: { type: "string", short: "c", default: "config.yaml" },
-    },
-  });
-  const configPath = resolve(values.config!);
-  console.log(`[transcribe] Loading config from ${configPath}`);
-  const config = await loadConfig(configPath);
-
-  if (!config.transcription.enabled) {
-    console.log("[transcribe] disabled in config — exiting");
-    return;
-  }
-  if (config.cameras.length === 0) {
-    console.error("[transcribe] no cameras configured");
-    return;
-  }
-
+/**
+ * Set up the transcription stack as part of the main restitch process.
+ *
+ * - Allocates the in-process ring buffer and live stats objects.
+ * - Spawns whisper-server (CUDA) as a supervised subprocess.
+ * - Waits for whisper-server in the background and, once ready, spawns
+ *   the audio fusion ffmpeg pump. Returns immediately so it doesn't
+ *   block the rest of index.ts startup (the dashboard panel will show
+ *   "waiting" until segments start landing).
+ * - Caller passes a shared `processes` array; the supervisor entries
+ *   land in it so a single shutdown handler stops everything cleanly.
+ *
+ * Returns the ring + stats so the dashboard server can read them
+ * in-process (no HTTP proxy across services).
+ */
+export function startTranscription(
+  config: Config,
+  processes: ManagedProcess[]
+): { ring: RingBuffer; stats: LiveStats } {
   const t = config.transcription;
-  const whisperUrl = `http://${t.whisper_server.address.replace(/^:/, "127.0.0.1:")}`;
   const ring = new RingBuffer(t.max_entries_per_camera);
-
   const stats: LiveStats = {
     state: "silent",
     threshold_db: t.silence_threshold_db,
     mono_rms_db: -100,
-    per_cam_rms_db: Object.fromEntries(config.cameras.map((c) => [c.name, -100])),
+    per_cam_rms_db: Object.fromEntries(
+      config.cameras.map((c) => [c.name, -100])
+    ),
     transitions_total: 0,
     last_segment_at: null,
   };
 
-  const processes: ManagedProcess[] = [];
+  if (!t.enabled) {
+    console.log("[transcribe] disabled in config");
+    return { ring, stats };
+  }
+  if (config.cameras.length === 0) {
+    console.error("[transcribe] no cameras configured");
+    return { ring, stats };
+  }
+
+  const whisperUrl = `http://${t.whisper_server.address.replace(/^:/, "127.0.0.1:")}`;
 
   console.log("[transcribe] starting whisper-server...");
   processes.push(startWhisperServer(t));
 
-  await waitForServer(whisperUrl);
-  console.log(`[transcribe] whisper-server ready at ${whisperUrl}`);
+  // Don't block restitch startup on whisper warm-up — the audio pump
+  // attaches as soon as whisper is ready, in the background.
+  void (async () => {
+    try {
+      await waitForServer(whisperUrl);
+      console.log(`[transcribe] whisper-server ready at ${whisperUrl}`);
+      console.log(
+        `[transcribe] starting combined pump for ${config.cameras.length} camera(s)`
+      );
+      processes.push(
+        startCombinedPump(config.cameras, config, whisperUrl, ring, stats)
+      );
+    } catch (err) {
+      console.error("[transcribe] whisper-server never came up:", err);
+    }
+  })();
 
-  console.log(
-    `[transcribe] starting combined pump for ${config.cameras.length} camera(s)`
-  );
-  processes.push(startCombinedPump(config.cameras, config, whisperUrl, ring, stats));
-
-  const { hostname, port } = parseAddress(t.api_address);
-  const server = Bun.serve({
-    hostname,
-    port,
-    async fetch(req) {
-      const url = new URL(req.url);
-      if (url.pathname === "/api/transcriptions") {
-        const limit = Math.max(
-          1,
-          Math.min(500, parseInt(url.searchParams.get("limit") ?? "100", 10))
-        );
-        return Response.json({
-          items: ring.recent(limit),
-          counts: ring.countByCamera(),
-          contributor_counts: ring.contributorCountByCamera(),
-        });
-      }
-      if (url.pathname === "/api/stats") {
-        return Response.json(stats);
-      }
-      if (url.pathname === "/health") {
-        return new Response("ok");
-      }
-      return new Response("Not found", { status: 404 });
-    },
-  });
-  console.log(
-    `[transcribe] HTTP API listening on http://${server.hostname}:${server.port}`
-  );
-
-  const shutdown = () => {
-    console.log("\n[transcribe] shutting down...");
-    server.stop();
-    for (const p of processes) p.stop();
-    process.exit(0);
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
-
-  await new Promise(() => {});
-}
-
-if (import.meta.main) {
-  main().catch((err) => {
-    console.error("[transcribe] fatal:", err);
-    process.exit(1);
-  });
+  return { ring, stats };
 }

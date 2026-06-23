@@ -1,0 +1,33 @@
+services:
+  restitch:
+    image: ${REGISTRY}/${IMAGE_PREFIX}/restitch:${RESTITCH_VERSION:-latest}
+    container_name: restitch
+    restart: unless-stopped
+    # host networking so the RTSP (8554), WebRTC (8889 + UDP 8189), HLS (8890),
+    # mediamtx API (9997), and dashboard (9000) ports are reachable on the LAN
+    # without per-port mappings, AND so the compositor can pull
+    # rtsp://localhost:8554/raw/* from mediamtx (same process tree).
+    network_mode: host
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, compute, video]
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      # compute = CUDA (whisper), video = NVENC + NVDEC (ffmpeg)
+      NVIDIA_DRIVER_CAPABILITIES: compute,video
+    volumes:
+      # Config is owned by jackson; this deploy never writes it. Mounted
+      # read-only so the container can't drift the source of truth.
+      - /opt/restitch/config.yaml:/etc/restitch/config.yaml:ro
+      # Models are big (~1.5 GB); the entrypoint pulls them on first start
+      # if the volume is empty, then they persist across container/image
+      # restarts on this volume.
+      - whisper_models:/var/lib/whisper-models
+
+volumes:
+  whisper_models:
