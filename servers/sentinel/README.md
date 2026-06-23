@@ -1,7 +1,7 @@
 # Sentinel — restitch deploy
 
 Restitch runs on **sentinel** (RTX 4090, Ubuntu 24.04), the same box that hosts
-Caddy via the [jackson ops repo](https://github.com/cinderblock/jackson). Both
+Caddy via the [jackson ops repo](https://github.com/cinderblock/ops). Both
 apps share the host driver / Docker / hardware but each has its own GitHub
 Actions self-hosted runner and deploys independently.
 

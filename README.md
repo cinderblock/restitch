@@ -32,7 +32,7 @@ A single bun process supervises the whole stack:
 
 ## Deployment
 
-This project deploys via the **IaC + self-hosted-runner** pattern shared with the [jackson ops repo](https://github.com/cinderblock/jackson). On push to `master`:
+This project deploys via the **IaC + self-hosted-runner** pattern shared with the [jackson ops repo](https://github.com/cinderblock/ops). On push to `master`:
 
 1. A GitHub-hosted job builds the `restitch` container image and pushes it to GHCR.
 2. A self-hosted runner on the target box (`sentinel`) pulls the new image and runs `docker compose up -d`.
