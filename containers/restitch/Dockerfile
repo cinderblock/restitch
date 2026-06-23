@@ -20,15 +20,17 @@ RUN apt-get update -qq && \
         build-essential cmake git ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-ARG WHISPER_REF=v1.7.2
+ARG WHISPER_REF=v1.8.7
 # nvidia/cuda:*-devel ships libcuda.so as a stub at .../stubs/. The linker
-# doesn't pick that up by default, so loud symbols like cuGetErrorString
-# come back undefined. LIBRARY_PATH points ld at the stubs dir at build
-# time only; at runtime the real libcuda.so comes from the host driver
-# via nvidia-container-toolkit.
+# doesn't pick that up by default, so symbols like cuGetErrorString come
+# back undefined. LIBRARY_PATH points ld at the stubs dir at build time
+# only; at runtime the real libcuda.so comes from the host driver via
+# nvidia-container-toolkit.
 ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH}
+# Repo moved from ggerganov to ggml-org. Note the binary names changed
+# from `server`/`main` to `whisper-server`/`whisper-cli` in 1.8.x.
 RUN git clone --depth 1 --branch "${WHISPER_REF}" \
-        https://github.com/ggerganov/whisper.cpp.git /opt/whisper.cpp && \
+        https://github.com/ggml-org/whisper.cpp.git /opt/whisper.cpp && \
     cd /opt/whisper.cpp && \
     cmake -B build \
         -DGGML_CUDA=ON \
