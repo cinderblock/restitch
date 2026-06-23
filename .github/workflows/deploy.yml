@@ -18,9 +18,14 @@ env:
   IMAGE_PREFIX: ${{ github.repository }}
 
 jobs:
-  # 1. Build + push the restitch container image
+  # 1. Build + push the restitch container image. Runs on sentinel so the
+  # CUDA whisper.cpp compile uses its 24 cores (~3-5 min) instead of a GH-
+  # hosted 4-core ubuntu VM (~15-25 min), and skips the 6-8 GB push/pull
+  # roundtrip to GHCR (sentinel pulls from its own local layer cache during
+  # deploy). Run `docker system prune -af --filter "until=168h"` occasionally
+  # to keep disk usage in check.
   build-image:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, sentinel]
     permissions:
       contents: read
       packages: write
