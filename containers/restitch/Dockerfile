@@ -35,6 +35,7 @@ RUN git clone --depth 1 --branch "${WHISPER_REF}" \
         https://github.com/ggml-org/whisper.cpp.git /opt/whisper.cpp && \
     cd /opt/whisper.cpp && \
     cmake -B build \
+        -DBUILD_SHARED_LIBS=OFF \
         -DGGML_CUDA=ON \
         -DWHISPER_BUILD_TESTS=OFF \
         -DWHISPER_BUILD_EXAMPLES=ON \
