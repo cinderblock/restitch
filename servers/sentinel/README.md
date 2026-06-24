@@ -20,18 +20,14 @@ pull && up -d` on sentinel. Config push to jackson → jackson writes the new
 
 ## Box prerequisites
 
-Only one thing has to be true before the first deploy:
+Host bootstrap (Docker, NVIDIA driver, nvidia-container-toolkit, `/opt/
+restitch/config.yaml`) is owned by **jackson**. Push jackson first; once
+its `deploy-server-bundle (sentinel)` job succeeds, sentinel is ready for
+restitch. On a fresh box jackson's deploy installs the NVIDIA driver and
+reboots — re-trigger that workflow once the box is back up.
 
-- **`cameron` user with passwordless sudo** (already true if jackson's runner
-  is installed). Required so `deploy.sh` can apt-install docker, the NVIDIA
-  driver, and the NVIDIA container toolkit without prompts.
-
-Everything else — Docker, the NVIDIA driver, `nvidia-container-toolkit`, the
-`nvidia` Docker runtime, the restitch container itself — is installed by
-`deploy.sh`. On a fresh box the first deploy installs the NVIDIA driver and
-reboots; the workflow run fails when the box restarts. Re-trigger the
-workflow once the box is back up and the second run skips the driver step
-and proceeds normally.
+Restitch's deploy assumes the GPU is wired up and just builds + brings up
+the container.
 
 ## Self-hosted runner
 
@@ -47,15 +43,19 @@ lives in `/home/cameron/actions-runner-restitch`.
 Automated on push to `master` affecting `containers/restitch/**`,
 `servers/sentinel/**`, `src/**`, or the deploy workflow itself.
 
-1. GitHub-hosted job builds the `restitch` container image and pushes it to
-   `ghcr.io/cinderblock/restitch/restitch:<sha>` and `:latest`.
-2. `ensure-runners` checks the `sentinel` runner is online; if not, prints
-   re-registration commands and waits.
-3. `build-server-bundle` runs `build.sh`, resolving the just-built image SHA
-   into `docker-compose.yml`, bundling `deploy.sh` + lib helpers.
-4. `deploy-server-bundle` runs on the self-hosted runner, downloads the
-   bundle, runs `deploy.sh`, which bootstraps Docker + nvidia-container-
-   toolkit on a clean box and brings the stack up.
+One job, on the self-hosted `sentinel-restitch` runner:
+
+1. `actions/checkout` pulls the repo onto sentinel.
+2. `bash servers/sentinel/deploy.sh`:
+   - validates Docker + nvidia runtime + config.yaml are present (jackson
+     should have set these up),
+   - `docker build -t restitch:latest -f containers/restitch/Dockerfile .`
+     — uses sentinel's 24 cores + local layer cache,
+   - `docker compose up -d --remove-orphans` — `pull_policy: never` keeps
+     compose from looking for a registry image.
+
+No GHCR push/pull. No bundle artifact. Image lives only in sentinel's
+local docker layer cache.
 
 ## Stream URLs
 

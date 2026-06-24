@@ -1,6 +1,10 @@
 services:
   restitch:
-    image: ${REGISTRY}/${IMAGE_PREFIX}/restitch:${RESTITCH_VERSION:-latest}
+    # Built locally by the deploy step (servers/sentinel/deploy.sh) — never
+    # pushed to or pulled from a registry. pull_policy: never stops compose
+    # from trying to look it up.
+    image: restitch:latest
+    pull_policy: never
     container_name: restitch
     restart: unless-stopped
     # host networking so the RTSP (8554), WebRTC (8889 + UDP 8189), HLS (8890),
@@ -21,8 +25,8 @@ services:
       # compute = CUDA (whisper), video = NVENC + NVDEC (ffmpeg)
       NVIDIA_DRIVER_CAPABILITIES: compute,video
     volumes:
-      # Config is owned by jackson; this deploy never writes it. Mounted
-      # read-only so the container can't drift the source of truth.
+      # Config is owned by the jackson ops repo; this deploy never writes it.
+      # Mounted read-only so the container can't drift the source of truth.
       - /opt/restitch/config.yaml:/etc/restitch/config.yaml:ro
       # Models are big (~1.5 GB); the entrypoint pulls them on first start
       # if the volume is empty, then they persist across container/image

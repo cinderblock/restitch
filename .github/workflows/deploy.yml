@@ -1,4 +1,4 @@
-name: Build & Deploy
+name: Deploy
 
 on:
   push:
@@ -13,104 +13,17 @@ on:
       - .github/workflows/deploy.yml
   workflow_dispatch:
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_PREFIX: ${{ github.repository }}
-
+# Single self-hosted job: bootstrap → build → compose up. The image stays
+# on sentinel's local docker layer cache; no GHCR push/pull, no bundle
+# artifact, no separate jobs. Build uses sentinel's 24 cores + GPU for
+# fast iteration.
 jobs:
-  # 1. Build + push the restitch container image. Runs on sentinel so the
-  # CUDA whisper.cpp compile uses its 24 cores (~3-5 min) instead of a GH-
-  # hosted 4-core ubuntu VM (~15-25 min), and skips the 6-8 GB push/pull
-  # roundtrip to GHCR (sentinel pulls from its own local layer cache during
-  # deploy). Run `docker system prune -af --filter "until=168h"` occasionally
-  # to keep disk usage in check.
-  build-image:
-    runs-on: [self-hosted, sentinel]
-    permissions:
-      contents: read
-      packages: write
-    outputs:
-      image_sha_tag: ${{ steps.meta.outputs.sha_tag }}
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute tags
-        id: meta
-        run: |
-          SHA_TAG="sha-${GITHUB_SHA::12}"
-          echo "sha_tag=${SHA_TAG}" >> "$GITHUB_OUTPUT"
-          echo "Will tag image as ${SHA_TAG} and latest"
-
-      - name: Build + push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: containers/restitch/Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/restitch:${{ steps.meta.outputs.sha_tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/restitch:latest
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/restitch:buildcache
-          cache-to:   type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/restitch:buildcache,mode=max
-
-  # Runner provisioning is owned by the jackson ops workflow (the
-  # install-restitch-runner job there registers a `sentinel,self-hosted`
-  # runner on cinderblock/restitch). If the runner isn't online when the
-  # deploy job below tries to run, the job sits in "queued" until it
-  # appears — re-run the jackson workflow to register it.
-
-  # Build the deployment bundle (resolves image version into compose)
-  build-bundle:
-    needs: [build-image]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Run build.sh
-        env:
-          REGISTRY: ${{ env.REGISTRY }}
-          IMAGE_PREFIX: ${{ env.IMAGE_PREFIX }}
-          RESTITCH_VERSION: ${{ needs.build-image.outputs.image_sha_tag }}
-        run: |
-          mkdir -p /tmp/bundle
-          bash servers/sentinel/build.sh /tmp/bundle
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: deployment-bundle-sentinel
-          path: /tmp/bundle
-          retention-days: 1
-          if-no-files-found: error
-
-  # Deploy on the self-hosted runner (label `sentinel`)
   deploy:
-    needs: [build-bundle]
     runs-on: [self-hosted, sentinel]
     concurrency:
       group: deploy-sentinel-restitch
       cancel-in-progress: true
     steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: deployment-bundle-sentinel
-          path: /tmp/deployment-bundle
-
-      - name: Run deploy.sh
-        env:
-          REGISTRY: ${{ env.REGISTRY }}
-          REGISTRY_USERNAME: ${{ github.actor }}
-          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          IMAGE_PREFIX: ${{ env.IMAGE_PREFIX }}
-        working-directory: /tmp/deployment-bundle
-        run: bash deploy.sh
+      - uses: actions/checkout@v6
+      - name: Bootstrap + build + deploy
+        run: bash servers/sentinel/deploy.sh
