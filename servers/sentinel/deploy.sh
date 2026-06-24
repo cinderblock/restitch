@@ -33,6 +33,11 @@ docker build -t restitch:latest -f containers/restitch/Dockerfile .
 
 echo "=== Bringing up the stack ==="
 cd "${SCRIPT_DIR}"
+# Clear any container already holding the fixed `restitch` name. This is
+# needed when an earlier deploy used a different compose project (e.g.,
+# the old GHCR-based bundle layout), since docker won't let compose
+# recreate a container whose name is already taken.
+docker rm -f restitch 2>/dev/null || true
 docker compose up -d --remove-orphans
 
 echo ""
