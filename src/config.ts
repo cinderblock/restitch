@@ -141,16 +141,16 @@ const TranscriptionSchema = z.object({
     .object({
       bin: z.string().default("whisper-server"),
       address: z.string().default("127.0.0.1:9876"),
-      model: z.string().default("/opt/restitch/models/ggml-distil-large-v3.bin"),
+      model: z.string().default("/var/lib/whisper-models/ggml-distil-large-v3.bin"),
       vad_model: z
         .string()
-        .default("/opt/restitch/models/ggml-silero-v5.1.2.bin"),
+        .default("/var/lib/whisper-models/ggml-silero-v5.1.2.bin"),
     })
     .default({
       bin: "whisper-server",
       address: "127.0.0.1:9876",
-      model: "/opt/restitch/models/ggml-distil-large-v3.bin",
-      vad_model: "/opt/restitch/models/ggml-silero-v5.1.2.bin",
+      model: "/var/lib/whisper-models/ggml-distil-large-v3.bin",
+      vad_model: "/var/lib/whisper-models/ggml-silero-v5.1.2.bin",
     }),
   silence_threshold_db: z
     .number()
@@ -255,8 +255,8 @@ export const ConfigSchema = z.object({
     whisper_server: {
       bin: "whisper-server",
       address: "127.0.0.1:9876",
-      model: "/opt/restitch/models/ggml-distil-large-v3.bin",
-      vad_model: "/opt/restitch/models/ggml-silero-v5.1.2.bin",
+      model: "/var/lib/whisper-models/ggml-distil-large-v3.bin",
+      vad_model: "/var/lib/whisper-models/ggml-silero-v5.1.2.bin",
     },
     silence_threshold_db: -30,
     rms_window_ms: 100,
