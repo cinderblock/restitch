@@ -49,7 +49,8 @@ FROM nvidia/cuda:12.9.2-runtime-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends \
-        ca-certificates curl xz-utils tar jq unzip && \
+        ca-certificates curl xz-utils tar jq unzip \
+        libgomp1 && \
     rm -rf /var/lib/apt/lists/*
 
 # FFmpeg with NVENC/NVDEC support. BtbN's static GPL build bundles all the
