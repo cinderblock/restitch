@@ -519,21 +519,30 @@ export function buildExtraCompositePipeline(
 }
 
 function hwaccelInputArgs(hwaccel: string): string[] {
-  // hwaccel_output_format=yuv420p tells the hw decoder to deliver CPU
-  // frames the software filter chain can consume directly. Per-frame
-  // NVDEC failures (cuvid sometimes rejects odd RTSP packets) fall back
-  // to software for that frame without breaking the filter chain.
+  // hwaccel_output_format picks the pixel format the hw decoder delivers
+  // to the software filter chain. We use the GPU's NATIVE CPU layout:
   //
-  // CATASTROPHIC failure (driver missing, container misconfigured) is
-  // surfaced at startup by ensureHwaccelWorks() in index.ts — not via
-  // per-process exit codes.
+  //   NVDEC → nv12  (interleaved UV plane)
+  //   VAAPI → nv12  (native)
+  //   QSV   → nv12  (native)
+  //
+  // ffmpeg auto-converts to yuv420p (or whatever -pix_fmt the encoder
+  // wants) right before encode. The vstack/crop/scale/transpose filters
+  // along the way all handle nv12 natively, so we avoid the lossy /
+  // green-frames bug we hit when claiming "yuv420p" while the bytes
+  // were actually nv12.
+  //
+  // Per-frame NVDEC failures (cuvid sometimes rejects odd RTSP packets)
+  // still fall back to software for that frame without breaking the
+  // filter chain. CATASTROPHIC failure (driver missing, container
+  // misconfigured) is surfaced at startup by ensureHwaccelWorks().
   switch (hwaccel) {
     case "vaapi":
-      return ["-hwaccel", "vaapi", "-hwaccel_output_format", "yuv420p"];
+      return ["-hwaccel", "vaapi", "-hwaccel_output_format", "nv12"];
     case "qsv":
-      return ["-hwaccel", "qsv", "-hwaccel_output_format", "yuv420p"];
+      return ["-hwaccel", "qsv", "-hwaccel_output_format", "nv12"];
     case "nvenc":
-      return ["-hwaccel", "cuda", "-hwaccel_output_format", "yuv420p"];
+      return ["-hwaccel", "cuda", "-hwaccel_output_format", "nv12"];
     default:
       return [];
   }
