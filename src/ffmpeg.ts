@@ -105,6 +105,10 @@ function encoderArgs(encoder: Encoder, streamName: string, codecOverride?: strin
     args.push("-g", "60");
     args.push("-keyint_min", "60");
     args.push("-pix_fmt", encoder.pixel_format);
+    // Force limited (TV) range output. Without this NVENC inherits the
+    // full-range flag from UniFi's H.264 VUI, encodes as yuvj420p, and
+    // strict players (VLC's H.264 path) refuse to load the result.
+    args.push("-color_range", "tv");
   } else if (isQsvEncoder(codec)) {
     // QSV: use ICQ (intelligent constant quality) rate control mode
     // with -global_quality. Requires explicit -look_ahead 1 for quality.
