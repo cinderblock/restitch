@@ -6,6 +6,7 @@ import {
   buildPipeline,
   buildExtraCompositePipeline,
   buildCommand,
+  ensureHwaccelWorks,
   type ProbeResult,
   type Pipeline,
 } from "./ffmpeg.ts";
@@ -46,6 +47,14 @@ async function main() {
     console.log(`[hwaccel] Detected: ${detected}`);
     // Re-parse with the detected value applied
     config = { ...config, hwaccel: detected } as Config;
+  }
+
+  // Fail loudly if hwaccel is requested but the box can't actually use it
+  // (driver missing, container missing NVIDIA capabilities, etc.). Catches
+  // the "silent CPU fallback" footgun before we spawn long-running pipelines.
+  await ensureHwaccelWorks(config);
+  if (config.hwaccel !== "none") {
+    console.log(`[hwaccel] ${config.hwaccel}: probe ok`);
   }
 
   // Probe cameras for native resolution

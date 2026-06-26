@@ -208,13 +208,9 @@ export function buildPipeline(
       );
     }
 
-    // fps filter forces constant framerate, dropping/duplicating as needed.
-    // Prefix with hwdownload when CUDA/etc. decoded so the downstream
-    // software filters (vstack/crop/transpose/scale) see CPU frames.
+    // fps filter forces constant framerate, dropping/duplicating as needed
     const fpsLabel = `[fps_${i}]`;
-    filters.push(
-      `[${i}:v]${hwaccelInputFilterPrefix(config.hwaccel)}fps=${probe.fps}${fpsLabel}`
-    );
+    filters.push(`[${i}:v]fps=${probe.fps}${fpsLabel}`);
 
     const rots = rotationFilters(cam.rotation);
     if (rots.length > 0) {
@@ -429,12 +425,8 @@ export function buildExtraCompositePipeline(
 
   for (let i = 0; i < resolved.length; i++) {
     const { ref, cam, probe } = resolved[i]!;
-    // hwdownload prefix is a no-op when hwaccel=none; it brings CUDA
-    // frames back to CPU yuv420p for the software filter chain otherwise.
     const fpsLabel = `[xc_fps_${i}]`;
-    filters.push(
-      `[${i}:v]${hwaccelInputFilterPrefix(config.hwaccel)}fps=${probe.fps}${fpsLabel}`
-    );
+    filters.push(`[${i}:v]fps=${probe.fps}${fpsLabel}`);
     let prev = fpsLabel;
 
     // Rotation: input ref override > camera default
@@ -527,35 +519,60 @@ export function buildExtraCompositePipeline(
 }
 
 function hwaccelInputArgs(hwaccel: string): string[] {
-  // STRICT: we ask for the hw-native output format (cuda / vaapi / qsv).
-  // If the hwaccel can't initialize at runtime, ffmpeg exits with an
-  // error instead of silently falling back to CPU decode. The filter
-  // chain handles the GPU→CPU transfer via hwaccelInputFilterPrefix().
+  // hwaccel_output_format=yuv420p tells the hw decoder to deliver CPU
+  // frames the software filter chain can consume directly. Per-frame
+  // NVDEC failures (cuvid sometimes rejects odd RTSP packets) fall back
+  // to software for that frame without breaking the filter chain.
+  //
+  // CATASTROPHIC failure (driver missing, container misconfigured) is
+  // surfaced at startup by ensureHwaccelWorks() in index.ts — not via
+  // per-process exit codes.
   switch (hwaccel) {
     case "vaapi":
-      return ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"];
+      return ["-hwaccel", "vaapi", "-hwaccel_output_format", "yuv420p"];
     case "qsv":
-      return ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"];
+      return ["-hwaccel", "qsv", "-hwaccel_output_format", "yuv420p"];
     case "nvenc":
-      return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"];
+      return ["-hwaccel", "cuda", "-hwaccel_output_format", "yuv420p"];
     default:
       return [];
   }
 }
 
 /**
- * Filter chain prefix to bring hw frames back to CPU yuv420p so the
- * downstream software filters (vstack/crop/scale/transpose) keep working.
- * Returns "" for hwaccel: none so the chain compiles untouched.
+ * Run a tiny ffmpeg command that exercises CUDA decode + NVENC. Throws
+ * with a clear error if the box can't actually use the GPU. Catches the
+ * "running on a host without a driver" / "container missing NVIDIA caps"
+ * case at startup, before we spawn the real long-running pipelines.
  */
-function hwaccelInputFilterPrefix(hwaccel: string): string {
-  switch (hwaccel) {
-    case "vaapi":
-    case "qsv":
-    case "nvenc":
-      return "hwdownload,format=yuv420p,";
-    default:
-      return "";
+export async function ensureHwaccelWorks(config: Config): Promise<void> {
+  if (config.hwaccel === "none") return;
+  if (config.hwaccel !== "nvenc") {
+    // For vaapi/qsv we don't have a probe set up; trust the config.
+    return;
+  }
+  const cmd = [
+    config.ffmpeg_path,
+    "-loglevel", "error",
+    "-hide_banner",
+    "-hwaccel", "cuda",
+    "-f", "lavfi",
+    "-i", "testsrc=duration=0.1:size=320x240:rate=10",
+    "-c:v", "hevc_nvenc",
+    "-frames:v", "3",
+    "-f", "null",
+    "-",
+  ];
+  const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
+  const stderr = await new Response(proc.stderr).text();
+  const code = await proc.exited;
+  if (code !== 0) {
+    throw new Error(
+      `hwaccel=${config.hwaccel} requested but CUDA / NVENC probe failed (exit ${code}).\n` +
+        `Probe command: ${cmd.join(" ")}\n` +
+        `stderr:\n${stderr}\n` +
+        `Set hwaccel: none in config.yaml to opt into CPU decode if this is intentional.`
+    );
   }
 }
 
