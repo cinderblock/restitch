@@ -190,7 +190,7 @@ export function buildPipeline(
       // Exit if no RTSP data for 30s. Without this the compositor will
       // keep running with the last frame from a stalled input forever,
       // and the supervisor never gets a chance to restart it.
-      "-rw_timeout", "30000000",
+      "-timeout", "30000000",
       "-rtsp_transport", "tcp",
       "-i", sourceUrl
     );
@@ -403,7 +403,7 @@ export function buildExtraCompositePipeline(
       "video",
       // Exit if no RTSP data for 30s so the supervisor restarts us
       // instead of running forever with one input frozen.
-      "-rw_timeout",
+      "-timeout",
       "30000000",
       "-rtsp_transport",
       "tcp",
