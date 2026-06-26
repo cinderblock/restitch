@@ -208,9 +208,13 @@ export function buildPipeline(
       );
     }
 
-    // fps filter forces constant framerate, dropping/duplicating as needed
+    // fps filter forces constant framerate, dropping/duplicating as needed.
+    // Prefix with hwdownload when CUDA/etc. decoded so the downstream
+    // software filters (vstack/crop/transpose/scale) see CPU frames.
     const fpsLabel = `[fps_${i}]`;
-    filters.push(`[${i}:v]fps=${probe.fps}${fpsLabel}`);
+    filters.push(
+      `[${i}:v]${hwaccelInputFilterPrefix(config.hwaccel)}fps=${probe.fps}${fpsLabel}`
+    );
 
     const rots = rotationFilters(cam.rotation);
     if (rots.length > 0) {
@@ -425,8 +429,12 @@ export function buildExtraCompositePipeline(
 
   for (let i = 0; i < resolved.length; i++) {
     const { ref, cam, probe } = resolved[i]!;
+    // hwdownload prefix is a no-op when hwaccel=none; it brings CUDA
+    // frames back to CPU yuv420p for the software filter chain otherwise.
     const fpsLabel = `[xc_fps_${i}]`;
-    filters.push(`[${i}:v]fps=${probe.fps}${fpsLabel}`);
+    filters.push(
+      `[${i}:v]${hwaccelInputFilterPrefix(config.hwaccel)}fps=${probe.fps}${fpsLabel}`
+    );
     let prev = fpsLabel;
 
     // Rotation: input ref override > camera default
@@ -519,19 +527,35 @@ export function buildExtraCompositePipeline(
 }
 
 function hwaccelInputArgs(hwaccel: string): string[] {
-  // Use hw accel for decode, but output to CPU-accessible pixel format.
-  // FFmpeg 7.x QSV defaults hwaccel_output_format to qsv (GPU surfaces)
-  // which breaks CPU-based filters (vstack, transpose, crop).
-  // We explicitly request yuv420p output to force the download.
+  // STRICT: we ask for the hw-native output format (cuda / vaapi / qsv).
+  // If the hwaccel can't initialize at runtime, ffmpeg exits with an
+  // error instead of silently falling back to CPU decode. The filter
+  // chain handles the GPU→CPU transfer via hwaccelInputFilterPrefix().
   switch (hwaccel) {
     case "vaapi":
-      return ["-hwaccel", "vaapi", "-hwaccel_output_format", "yuv420p"];
+      return ["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"];
     case "qsv":
-      return ["-hwaccel", "qsv", "-hwaccel_output_format", "yuv420p"];
+      return ["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"];
     case "nvenc":
-      return ["-hwaccel", "cuda", "-hwaccel_output_format", "yuv420p"];
+      return ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"];
     default:
       return [];
+  }
+}
+
+/**
+ * Filter chain prefix to bring hw frames back to CPU yuv420p so the
+ * downstream software filters (vstack/crop/scale/transpose) keep working.
+ * Returns "" for hwaccel: none so the chain compiles untouched.
+ */
+function hwaccelInputFilterPrefix(hwaccel: string): string {
+  switch (hwaccel) {
+    case "vaapi":
+    case "qsv":
+    case "nvenc":
+      return "hwdownload,format=yuv420p,";
+    default:
+      return "";
   }
 }
 
