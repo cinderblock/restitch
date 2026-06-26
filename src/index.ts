@@ -15,6 +15,7 @@ import { launchManaged, type ManagedProcess } from "./process.ts";
 import { detectHwAccel, suggestEncoder } from "./hwaccel.ts";
 import { startDashboard } from "./dashboard.ts";
 import { startTranscription } from "./transcribe.ts";
+import { startWatchdog, type WatchedProcess } from "./watchdog.ts";
 
 const { values } = parseArgs({
   args: Bun.argv.slice(2),
@@ -141,11 +142,17 @@ async function main() {
   };
 
   // Main FFmpeg: composite + sub-streams
+  const watched: WatchedProcess[] = [];
   const ffmpegProc = launchManaged("ffmpeg", () => ({
     cmd: fullCmd,
     onStderr: stderrFilter("ffmpeg"),
   }));
   processes.push(ffmpegProc);
+  watched.push({
+    name: "ffmpeg",
+    paths: pipeline.outputs.map((o) => o.name),
+    process: ffmpegProc,
+  });
 
   // One FFmpeg per extra composite — independent restart, independent CPU/GPU
   for (const e of extraPipelines) {
@@ -154,12 +161,22 @@ async function main() {
       onStderr: stderrFilter(`ffmpeg-${e.name}`),
     }));
     processes.push(proc);
+    watched.push({
+      name: `ffmpeg-${e.name}`,
+      paths: e.pipeline.outputs.map((o) => o.name),
+      process: proc,
+    });
   }
 
   // Transcription stack (whisper-server + audio fusion pump). Spawns its
   // own supervised subprocesses into `processes`. Returns the ring+stats
   // synchronously; the audio pump attaches once whisper warms up.
   const transcription = startTranscription(config, processes);
+
+  // Watchdog: restart any ffmpeg whose mediamtx output path stops
+  // receiving bytes. Catches stuck-but-alive ffmpegs that the supervisor
+  // can't see (it only restarts on process exit).
+  const watchdog = startWatchdog(watched);
 
   // Dashboard HTTP server (proxies mediamtx API + exposes /api/system +
   // /api/transcriptions + /api/transcription-stats from the in-process
@@ -176,6 +193,7 @@ async function main() {
   // Handle shutdown
   const shutdown = () => {
     console.log("\nShutting down...");
+    watchdog.stop();
     for (const p of processes) {
       p.stop();
     }

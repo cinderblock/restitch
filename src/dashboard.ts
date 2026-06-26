@@ -165,11 +165,137 @@ const streamUrls = name => ({
   hls: 'http://' + HOST + ':8890/' + name + '/',
 });
 
+// navigator.clipboard requires a secure context (HTTPS or localhost). The
+// dashboard runs over plain HTTP on the LAN so writeText fails on most
+// browsers/clients. Fall back to a temporary textarea + execCommand('copy')
+// which still works in non-secure contexts on all major browsers.
+function copyToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text);
+  }
+  return new Promise((resolve, reject) => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '0';
+    ta.style.left = '0';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      const ok = document.execCommand('copy');
+      ok ? resolve() : reject(new Error('execCommand returned false'));
+    } catch (e) { reject(e); }
+    finally { document.body.removeChild(ta); }
+  });
+}
+
+// Map: path name -> { tr, cells: { state, rx, tx, bitrate, readers } }
+// We hold a live reference to each row's "volatile" cells so each tick only
+// rewrites the parts that actually change. The static cells (name, source,
+// tracks, action links) are created once and left alone — that lets the
+// browser keep focus/hover on the copy-rtsp link across polls.
+const pathRowState = new Map();
+const EMPTY_PATHS_ROW_ID = 'paths-empty';
+
+function buildActionsHTML(name) {
+  const urls = streamUrls(name);
+  return '<span class="actions">'
+    + '<a href="' + urls.webrtc + '" target="_blank" rel="noopener" title="' + urls.webrtc + '">webrtc</a>'
+    + '<span class="sep">·</span>'
+    + '<a href="' + urls.hls + '" target="_blank" rel="noopener" title="' + urls.hls + '">hls</a>'
+    + '<span class="sep">·</span>'
+    + '<a href="' + urls.rtsp + '" class="copy-rtsp" data-url="' + urls.rtsp + '" title="' + urls.rtsp + ' — click to copy, right-click for the browser&#39;s copy-link-address option">copy rtsp</a>'
+    + '</span>';
+}
+
+function createPathRow(p) {
+  const tr = document.createElement('tr');
+  const nameTd     = document.createElement('td');
+  const stateTd    = document.createElement('td');
+  const sourceTd   = document.createElement('td');
+  const tracksTd   = document.createElement('td');
+  const rxTd       = document.createElement('td');
+  const txTd       = document.createElement('td');
+  const bitrateTd  = document.createElement('td');
+  const readersTd  = document.createElement('td');
+  const actionsTd  = document.createElement('td');
+  rxTd.className = 'num';
+  txTd.className = 'num';
+  bitrateTd.className = 'num';
+  readersTd.className = 'num';
+  tracksTd.style.cssText = 'color: var(--muted); font-size: 12px;';
+  nameTd.innerHTML = '<code>' + p.name + '</code>';
+  actionsTd.innerHTML = buildActionsHTML(p.name);
+  tr.append(nameTd, stateTd, sourceTd, tracksTd, rxTd, txTd, bitrateTd, readersTd, actionsTd);
+  return { tr, cells: { state: stateTd, source: sourceTd, tracks: tracksTd, rx: rxTd, tx: txTd, bitrate: bitrateTd, readers: readersTd } };
+}
+
+function setIfChanged(el, html) {
+  if (el.innerHTML !== html) el.innerHTML = html;
+}
+
+function updatePathsTable(enrichedPaths) {
+  const tbody = document.getElementById('paths');
+  // Wipe the empty-state placeholder if it's there
+  const placeholder = document.getElementById(EMPTY_PATHS_ROW_ID);
+  if (placeholder) placeholder.remove();
+
+  const seen = new Set();
+  for (const p of enrichedPaths) {
+    seen.add(p.name);
+    let entry = pathRowState.get(p.name);
+    if (!entry) {
+      entry = createPathRow(p);
+      pathRowState.set(p.name, entry);
+    }
+    const c = entry.cells;
+    const stateHtml = p.ready
+      ? '<span class="pill good">ready</span>'
+      : '<span class="pill bad">down</span>';
+    const sourceHtml = p.source
+      ? '<span class="pill warn">' + p.source.type + '</span>'
+      : '<span class="pill muted">publisher</span>';
+    setIfChanged(c.state, stateHtml);
+    setIfChanged(c.source, sourceHtml);
+    setIfChanged(c.tracks, (p.tracks || []).join(', ') || '—');
+    setIfChanged(c.rx, fmtBytes(p.bytesReceived));
+    setIfChanged(c.tx, fmtBytes(p.bytesSent));
+    setIfChanged(c.bitrate, fmtBps(p._bps || 0));
+    setIfChanged(c.readers, String((p.readers || []).length));
+  }
+
+  for (const [name, entry] of pathRowState) {
+    if (!seen.has(name)) {
+      entry.tr.remove();
+      pathRowState.delete(name);
+    }
+  }
+
+  // Reorder rows in place to match the sorted order; insertBefore is a no-op
+  // when the node is already in the right position.
+  for (let i = 0; i < enrichedPaths.length; i++) {
+    const entry = pathRowState.get(enrichedPaths[i].name);
+    if (tbody.children[i] !== entry.tr) {
+      tbody.insertBefore(entry.tr, tbody.children[i] || null);
+    }
+  }
+
+  if (enrichedPaths.length === 0) {
+    const tr = document.createElement('tr');
+    tr.id = EMPTY_PATHS_ROW_ID;
+    tr.innerHTML = '<td colspan="9" class="empty">no paths configured</td>';
+    tbody.appendChild(tr);
+  }
+}
+
 document.addEventListener('click', e => {
   const btn = e.target.closest('.copy-rtsp');
   if (!btn) return;
+  e.preventDefault(); // it's an <a> so the click would otherwise navigate
   const url = btn.dataset.url;
-  navigator.clipboard.writeText(url).then(() => {
+  copyToClipboard(url).then(() => {
     const orig = btn.textContent;
     btn.textContent = 'copied!';
     btn.classList.add('copied');
@@ -179,7 +305,7 @@ document.addEventListener('click', e => {
     }, 1200);
   }).catch(() => {
     btn.textContent = 'copy failed';
-    setTimeout(() => { btn.textContent = 'copy rtsp'; }, 1200);
+    setTimeout(() => { btn.textContent = 'copy rtsp'; }, 1500);
   });
 });
 
@@ -308,9 +434,11 @@ const sort = {
   paths: loadSort('restitch.sort.paths', { key: 'name', dir: 1 }),
   sessions: loadSort('restitch.sort.sessions', { key: 'bytes', dir: -1 }),
 };
+// Composites (no raw/ prefix) sort before raw cameras when sorting by name.
+// Within each group, natural ordering so bay-1 < bay-2 < bay-10.
 const pathKey = (p, key) => {
   switch (key) {
-    case 'name': return p.name;
+    case 'name': return (p.name.startsWith('raw/') ? '1' : '0') + p.name;
     case 'state': return p.ready ? 1 : 0;
     case 'source': return p.source ? p.source.type : 'publisher';
     case 'tracks': return (p.tracks || []).length;
@@ -331,7 +459,13 @@ const sessionKey = (g, key) => {
     default: return 0;
   }
 };
-const cmp = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+// localeCompare with numeric=true handles bay-10 > bay-2 correctly.
+const cmp = (a, b) => {
+  if (typeof a === 'string' && typeof b === 'string') {
+    return a.localeCompare(b, undefined, { numeric: true });
+  }
+  return a < b ? -1 : a > b ? 1 : 0;
+};
 
 function updateSortIndicators() {
   for (const th of document.querySelectorAll('th.sortable')) {
@@ -397,45 +531,15 @@ async function tick() {
     }
     document.getElementById('system').innerHTML = html;
 
-    // Paths — enrich with computed bps, then sort.
+    // Paths — enrich with computed bps, then sort, then update the table
+    // incrementally so hover/focus on the copy-rtsp link survives each tick.
     const enrichedPaths = (paths.items || []).map(p => {
       const prevP = prev.get(p.name);
       const bps = prevP && dt > 0 ? Math.max(0, (p.bytesSent - prevP.bytesSent) / dt) : 0;
       return Object.assign({}, p, { _bps: bps });
     });
     enrichedPaths.sort((a, b) => cmp(pathKey(a, sort.paths.key), pathKey(b, sort.paths.key)) * sort.paths.dir);
-    const pathRows = enrichedPaths.map(p => {
-      const bps = p._bps;
-      const readerCount = (p.readers || []).length;
-      const urls = streamUrls(p.name);
-      const actions = '<span class="actions">'
-        + '<a href="' + urls.webrtc + '" target="_blank" rel="noopener" title="' + urls.webrtc + '">webrtc</a>'
-        + '<span class="sep">·</span>'
-        + '<a href="' + urls.hls + '" target="_blank" rel="noopener" title="' + urls.hls + '">hls</a>'
-        + '<span class="sep">·</span>'
-        + '<button type="button" class="copy-rtsp" data-url="' + urls.rtsp + '" title="' + urls.rtsp + '">copy rtsp</button>'
-        + '</span>';
-      const ready = p.ready
-        ? '<span class="pill good">ready</span>'
-        : '<span class="pill bad">down</span>';
-      const sourceLabel = p.source
-        ? '<span class="pill warn">' + p.source.type + '</span>'
-        : '<span class="pill muted">publisher</span>';
-      const tracks = (p.tracks || []).join(', ') || '—';
-      return '<tr>'
-        + '<td><code>' + p.name + '</code></td>'
-        + '<td>' + ready + '</td>'
-        + '<td>' + sourceLabel + '</td>'
-        + '<td style="color: var(--muted); font-size: 12px;">' + tracks + '</td>'
-        + '<td class="num">' + fmtBytes(p.bytesReceived) + '</td>'
-        + '<td class="num">' + fmtBytes(p.bytesSent) + '</td>'
-        + '<td class="num">' + fmtBps(bps) + '</td>'
-        + '<td class="num">' + readerCount + '</td>'
-        + '<td>' + actions + '</td>'
-        + '</tr>';
-    });
-    document.getElementById('paths').innerHTML = pathRows.join('')
-      || '<tr><td colspan="9" class="empty">no paths configured</td></tr>';
+    updatePathsTable(enrichedPaths);
 
     // Sessions
     const all = [];

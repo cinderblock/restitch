@@ -187,6 +187,10 @@ export function buildPipeline(
       // video packets along the way. That corrupts the encoded output enough
       // to keep WebRTC clients stuck waiting for a clean keyframe.
       "-allowed_media_types", "video",
+      // Exit if no RTSP data for 30s. Without this the compositor will
+      // keep running with the last frame from a stalled input forever,
+      // and the supervisor never gets a chance to restart it.
+      "-rw_timeout", "30000000",
       "-rtsp_transport", "tcp",
       "-i", sourceUrl
     );
@@ -397,6 +401,10 @@ export function buildExtraCompositePipeline(
       "4096",
       "-allowed_media_types",
       "video",
+      // Exit if no RTSP data for 30s so the supervisor restarts us
+      // instead of running forever with one input frozen.
+      "-rw_timeout",
+      "30000000",
       "-rtsp_transport",
       "tcp",
       "-i",

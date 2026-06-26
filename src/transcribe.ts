@@ -486,6 +486,10 @@ function startCombinedPump(
     cmd.push(
       "-use_wallclock_as_timestamps",
       "1",
+      // Exit if no RTSP data for 30s so the supervisor restarts the
+      // pump instead of running forever with one input frozen.
+      "-rw_timeout",
+      "30000000",
       "-rtsp_transport",
       "tcp",
       "-allowed_media_types",
