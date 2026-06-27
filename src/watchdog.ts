@@ -18,6 +18,11 @@ export interface WatchedProcess {
   paths: string[];
   /** The supervisor entry for the ffmpeg. */
   process: ManagedProcess;
+  /** If set, restart this process every N ms regardless of byte flow.
+   *  Workaround for the doorbell+vstack slow-leak where the encoded
+   *  output keeps publishing but one input branch silently freezes,
+   *  which the byte-rate check can't detect (output bytes keep growing). */
+  periodicRestartMs?: number;
 }
 
 interface PathState {
@@ -51,6 +56,8 @@ export function startWatchdog(
   const state = new Map<string, PathState>();
   // Wall-clock of last manual restart per process index (debounces).
   const restartedAt = new Map<number, number>();
+  // First-seen timestamp per process for the periodic-restart cadence.
+  const watchStartedAt = new Map<number, number>();
 
   const tick = async () => {
     let paths: { items?: { name: string; bytesReceived?: number; ready?: boolean }[] };
@@ -79,6 +86,28 @@ export function startWatchdog(
       const w = watched[i]!;
       const since = restartedAt.get(i);
       if (since !== undefined && now - since < graceMs) continue;
+
+      // Periodic restart workaround (per-process opt-in)
+      if (w.periodicRestartMs) {
+        const baseline = restartedAt.get(i) ?? watchStartedAt.get(i);
+        if (baseline === undefined) {
+          watchStartedAt.set(i, now);
+        } else if (now - baseline >= w.periodicRestartMs) {
+          console.warn(
+            `[watchdog] ${w.name}: periodic restart (every ${Math.round(
+              w.periodicRestartMs / 60000
+            )} min)`
+          );
+          restartedAt.set(i, now);
+          for (const path of w.paths) state.delete(`${i}:${path}`);
+          try {
+            await w.process.restart();
+          } catch (e) {
+            console.error(`[watchdog] ${w.name}: periodic restart failed:`, e);
+          }
+          continue;
+        }
+      }
 
       let allStale = w.paths.length > 0;
       let anyKnown = false;
