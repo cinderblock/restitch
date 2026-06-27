@@ -87,6 +87,14 @@ const ExtraCompositeSchema = z.object({
     })
     .optional()
     .describe("Optional scale applied to the final stacked output"),
+  codec: z
+    .string()
+    .optional()
+    .describe(
+      "Override the global encoder codec for this composite (e.g. " +
+        "'h264_nvenc' instead of the default hevc_nvenc — useful when " +
+        "the output needs to play in stricter clients like VLC over RTSP)"
+    ),
   inputs: z.array(InputRefSchema).min(1),
 });
 

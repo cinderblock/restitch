@@ -518,7 +518,9 @@ export function buildExtraCompositePipeline(
   }
 
   const filterComplex = filters.join(";\n");
-  const outputs: PipelineOutput[] = [{ name: extra.name, mapLabel: outLbl }];
+  const outputs: PipelineOutput[] = [
+    { name: extra.name, mapLabel: outLbl, codecOverride: extra.codec },
+  ];
   return { inputArgs, filterComplex, outputs };
 }
 
