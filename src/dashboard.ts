@@ -346,18 +346,38 @@ function positionSnap(e) {
   snapTip.style.left = x + 'px';
   snapTip.style.top = y + 'px';
 }
+let snapCurrentPath = null;
 document.addEventListener('mouseover', e => {
   const name = e.target.closest('.stream-name');
   if (!name) return;
   clearTimeout(snapHideTimer);
   const path = name.dataset.path;
+  if (path === snapCurrentPath && snapImg.complete && snapImg.naturalWidth) {
+    // Same camera, image already loaded — just reposition, keep showing it.
+    snapImg.style.display = 'block';
+    snapTip.style.display = 'block';
+    positionSnap(e);
+    return;
+  }
+  snapCurrentPath = path;
+  // Blank the previous camera's frame immediately so it never shows for
+  // the wrong stream while the new one loads.
+  snapImg.removeAttribute('src');
+  snapImg.style.display = 'none';
   snapCapEl.textContent = path + ' — loading…';
-  // Cache-bust per 8s window so we get a reasonably fresh frame without
-  // hammering the encoder on every pixel move.
+  // Cache-bust per pre-warm window so the browser reuses the warmed frame.
+  const reqPath = path;
+  snapImg.onload = () => {
+    if (snapCurrentPath !== reqPath) return;
+    snapImg.style.display = 'block';
+    snapCapEl.textContent = path;
+  };
+  snapImg.onerror = () => {
+    if (snapCurrentPath !== reqPath) return;
+    snapCapEl.textContent = path + ' — no frame';
+  };
   snapImg.src = 'api/snapshot/' + path.split('/').map(encodeURIComponent).join('/')
-    + '?t=' + Math.floor(Date.now() / 8000);
-  snapImg.onload = () => { snapCapEl.textContent = path; };
-  snapImg.onerror = () => { snapCapEl.textContent = path + ' — no frame'; };
+    + '?t=' + Math.floor(Date.now() / 60000);
   snapTip.style.display = 'block';
   positionSnap(e);
 });
@@ -888,14 +908,19 @@ interface SnapEntry {
   jpeg: Uint8Array;
   ts: number;
 }
-const SNAP_TTL_MS = 8000;
+// Snapshots are pre-warmed every PREWARM_MS in the background so a hover
+// serves from cache instantly. TTL is a bit longer than the pre-warm
+// interval so on-demand requests between pre-warms still hit the cache.
+const SNAP_TTL_MS = 75_000;
+const PREWARM_MS = 60_000;
 const snapCache = new Map<string, SnapEntry>();
 const snapInflight = new Map<string, Promise<Uint8Array | null>>();
 
 async function grabSnapshot(
   ffmpegPath: string,
   baseUrl: string,
-  path: string
+  path: string,
+  force = false
 ): Promise<Uint8Array | null> {
   // Validate path: only word chars, dashes, and single slashes (raw/bay-1).
   if (!/^[\w-]+(\/[\w-]+)*$/.test(path)) return null;
@@ -903,7 +928,7 @@ async function grabSnapshot(
   const cached = snapCache.get(path);
   // Date.now() is fine here — this is a server-side cache, not a workflow.
   const now = Date.now();
-  if (cached && now - cached.ts < SNAP_TTL_MS) return cached.jpeg;
+  if (!force && cached && now - cached.ts < SNAP_TTL_MS) return cached.jpeg;
 
   let inflight = snapInflight.get(path);
   if (!inflight) {
@@ -944,6 +969,29 @@ export function startDashboard(
 ): Server {
   const apiBase = dashboard.mediamtx_api_url.replace(/\/$/, "");
   const { hostname, port } = parseAddress(dashboard.address);
+
+  // Background snapshot pre-warm: every PREWARM_MS, refresh a cached frame
+  // for each ready path so hovers in the dashboard load instantly. Serial
+  // (each grab awaits the previous) so we never run >1 snapshot ffmpeg at
+  // a time. Best-effort — failures are ignored.
+  if (media) {
+    const m = media;
+    const prewarm = async () => {
+      try {
+        const r = await fetch(`${apiBase}/v3/paths/list`);
+        if (!r.ok) return;
+        const j = (await r.json()) as { items?: { name: string; ready?: boolean }[] };
+        for (const p of j.items ?? []) {
+          if (!p.ready) continue;
+          await grabSnapshot(m.ffmpegPath, m.baseUrl, p.name, true);
+        }
+      } catch {
+        // ignore
+      }
+    };
+    setTimeout(prewarm, 5000);
+    setInterval(prewarm, PREWARM_MS);
+  }
 
   const server = Bun.serve({
     hostname,

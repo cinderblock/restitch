@@ -177,13 +177,17 @@ export function buildPipeline(
   // mediamtx holds the single connection per camera and fans out — that keeps
   // the upstream NVR's client count low (1 per camera, regardless of how many
   // consumers there are: this compositor, HA, browsers, ...).
-  // Wall clock timestamps ensure all inputs share the same time base,
-  // which is critical for vstack to produce output frames.
+  //
+  // NOTE: deliberately NO -use_wallclock_as_timestamps. It stamps each frame
+  // with its RTSP arrival time; with NVDEC decode (which delivers frames in
+  // bursts) the per-input arrival cadences differ enough that the fps filter
+  // collapses inputs to ~2fps and vstack pairs stale frames. We instead
+  // regenerate frame-index PTS after each fps filter (setpts=N/fps/TB below)
+  // so all inputs ride an identical synthetic grid that can't desync.
   for (const cam of cameras) {
     const sourceUrl = `${config.output.base_url}/${rawStreamName(cam)}`;
     inputArgs.push(
       ...hwaccelInputArgs(config.hwaccel),
-      "-use_wallclock_as_timestamps", "1",
       "-thread_queue_size", "4096",
       // Cameras advertise 3 tracks (MPEG-4 Audio, Opus, H264). We only encode
       // video — pulling the audio tracks too floods FFmpeg's RTP demuxer with
@@ -212,9 +216,14 @@ export function buildPipeline(
       );
     }
 
-    // fps filter forces constant framerate, dropping/duplicating as needed
+    // fps=N forces CFR; setpts=N/fps/TB then regenerates each frame's PTS
+    // from its frame index, decoupling this input's timeline from RTSP
+    // arrival jitter and NVDEC burst delivery. With every input on the same
+    // synthetic grid, vstack stays in sync. (Same fix as extra composites.)
     const fpsLabel = `[fps_${i}]`;
-    filters.push(`[${i}:v]fps=${probe.fps}${fpsLabel}`);
+    filters.push(
+      `[${i}:v]fps=${probe.fps},setpts=N/${probe.fps}/TB${fpsLabel}`
+    );
 
     const rots = rotationFilters(cam.rotation);
     if (rots.length > 0) {
