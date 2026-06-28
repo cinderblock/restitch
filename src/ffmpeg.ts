@@ -395,12 +395,20 @@ export function buildExtraCompositePipeline(
   });
 
   // --- Inputs ---
+  // NOTE: deliberately NO -use_wallclock_as_timestamps here (unlike the
+  // main compositor). The extra composites stack DIFFERENT camera models
+  // (e.g. doorbell + foyer) whose RTSP arrival latency/jitter differ.
+  // Wallclock timestamps desync those inputs and the fps filter then
+  // collapses the higher-latency input to ~1fps (measured: 13 unique
+  // frames vs 173 without wallclock over 15s). We instead regenerate
+  // frame-index PTS after the fps filter (see setpts below) so both
+  // inputs ride an identical synthetic 30fps grid and vstack can't
+  // desync. The main compositor keeps wallclock because its 5 inputs are
+  // identical cameras that stay in lockstep.
   for (const { cam } of resolved) {
     const sourceUrl = `${config.output.base_url}/${rawStreamName(cam)}`;
     inputArgs.push(
       ...hwaccelInputArgs(config.hwaccel),
-      "-use_wallclock_as_timestamps",
-      "1",
       "-thread_queue_size",
       "4096",
       "-allowed_media_types",
@@ -429,8 +437,15 @@ export function buildExtraCompositePipeline(
 
   for (let i = 0; i < resolved.length; i++) {
     const { ref, cam, probe } = resolved[i]!;
+    // fps=N forces CFR; setpts=N/fps/TB then regenerates each frame's PTS
+    // purely from its frame index, decoupling this input's timeline from
+    // RTSP arrival time and from any source-PTS jumps on reconnect. With
+    // every input on the same synthetic grid, vstack stays perfectly in
+    // sync regardless of per-camera latency differences.
     const fpsLabel = `[xc_fps_${i}]`;
-    filters.push(`[${i}:v]fps=${probe.fps}${fpsLabel}`);
+    filters.push(
+      `[${i}:v]fps=${probe.fps},setpts=N/${probe.fps}/TB${fpsLabel}`
+    );
     let prev = fpsLabel;
 
     // Rotation: input ref override > camera default
