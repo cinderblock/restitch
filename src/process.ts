@@ -27,6 +27,12 @@ export function launchManaged(
   const maxDelayMs = opts.maxDelayMs ?? 60_000;
   let restartCount = 0;
   let stopped = false;
+  // Set by restart() so the exit handler doesn't ALSO schedule a respawn —
+  // otherwise an intentional restart spawns two processes (the one restart()
+  // creates + the one the exit handler creates), which then fight over the
+  // mediamtx publish path ("closing existing publisher" → Broken pipe →
+  // crash loop).
+  let intentionalRestart = false;
   let proc: Subprocess;
 
   function spawn(): Subprocess {
@@ -81,6 +87,12 @@ export function launchManaged(
     // Watch for exit and auto-restart with exponential backoff
     child.exited.then((code) => {
       if (stopped) return;
+      // An intentional restart() already spawned the replacement — don't
+      // double-spawn. Clear the flag and bail.
+      if (intentionalRestart) {
+        intentionalRestart = false;
+        return;
+      }
       restartCount++;
       const delay = Math.min(baseDelayMs * 2 ** (restartCount - 1), maxDelayMs);
       console.warn(
@@ -104,6 +116,10 @@ export function launchManaged(
       return proc;
     },
     async restart() {
+      if (stopped) return;
+      // Tell the exit handler not to auto-respawn; we'll spawn the one
+      // replacement ourselves once the old process is gone.
+      intentionalRestart = true;
       proc.kill();
       await proc.exited;
       restartCount = 0;

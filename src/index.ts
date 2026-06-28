@@ -174,11 +174,10 @@ async function main() {
       name: `ffmpeg-${e.name}`,
       paths: e.pipeline.outputs.map((o) => o.name),
       process: proc,
-      // Workaround for the doorbell/foyer vstack slow-leak: bytesReceived
-      // on the OUTPUT keeps growing (so the byte-rate check stays
-      // satisfied) while one input branch silently freezes. Kick every
-      // 30 min to recover.
-      periodicRestartMs: 30 * 60 * 1000,
+      // No periodicRestartMs: the doorbell/foyer vstack slow-leak this used
+      // to work around is fixed at the source (setpts frame-index PTS, see
+      // buildExtraCompositePipeline). The byte-stall watchdog below remains
+      // as the general safety net.
     });
   }
 
