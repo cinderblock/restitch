@@ -50,7 +50,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends \
         ca-certificates curl xz-utils tar jq unzip \
-        libgomp1 && \
+        libgomp1 \
+        iproute2 procps && \
     rm -rf /var/lib/apt/lists/*
 
 # FFmpeg with NVENC/NVDEC support. BtbN's static GPL build bundles all the

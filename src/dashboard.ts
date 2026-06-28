@@ -49,16 +49,35 @@ const HTML = `<!DOCTYPE html>
   header .updated { color: var(--muted); font-size: 12px; }
   code { font: 13px/1 "JetBrains Mono", Consolas, "Courier New", monospace; color: var(--accent); }
   .empty { color: var(--muted); text-align: center; padding: 12px; font-style: italic; }
-  .actions a, .actions button {
-    color: var(--accent); background: none; border: none; padding: 2px 4px; cursor: pointer;
-    font: inherit; text-decoration: none; font-size: 11px;
+  /* Streams: name cell holds clickable name + inline open links */
+  .name-cell { display: flex; align-items: baseline; gap: 10px; }
+  .stream-name {
+    font: 13px/1 "JetBrains Mono", Consolas, "Courier New", monospace;
+    color: var(--accent); cursor: pointer; text-decoration: none;
   }
-  .actions a:hover, .actions button:hover { text-decoration: underline; }
-  .actions .sep { color: var(--border); margin: 0 2px; }
-  .actions .copied { color: var(--good); }
+  .stream-name:hover { text-decoration: underline; }
+  .stream-name.copied { color: var(--good); }
+  .name-links { font-size: 11px; white-space: nowrap; }
+  .name-links a { color: var(--muted); text-decoration: none; }
+  .name-links a:hover { color: var(--accent); text-decoration: underline; }
+  .name-links .sep { color: var(--border); margin: 0 2px; }
+  /* Bandwidth mini bar chart */
+  .bw-wrap { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+  .bw-track { flex: 0 0 90px; height: 8px; background: #1f2128; border-radius: 2px; overflow: hidden; }
+  .bw-fill { height: 100%; background: var(--accent); border-radius: 2px; transition: width 0.4s; }
+  .bw-val { flex: 0 0 auto; min-width: 70px; text-align: right; }
+  /* Hover snapshot tooltip */
+  #snapTip {
+    position: fixed; z-index: 1000; pointer-events: none; display: none;
+    border: 1px solid var(--border); border-radius: 4px; background: #000;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.6); padding: 2px;
+  }
+  #snapTip img { display: block; max-width: 320px; border-radius: 2px; }
+  #snapTip .cap { font-size: 10px; color: var(--muted); padding: 2px 4px; text-align: center; }
 </style>
 </head>
 <body>
+<div id="snapTip"><img alt=""><div class="cap"></div></div>
 <header>
   <h1>restitch <span class="sub">— sentinel</span></h1>
   <div class="updated" id="updated">connecting…</div>
@@ -94,9 +113,8 @@ const HTML = `<!DOCTYPE html>
       <th class="sortable" data-table="paths" data-key="tracks">Tracks<span class="arrow"></span></th>
       <th class="sortable num" data-table="paths" data-key="rx">RX<span class="arrow"></span></th>
       <th class="sortable num" data-table="paths" data-key="tx">TX<span class="arrow"></span></th>
-      <th class="sortable num" data-table="paths" data-key="bitrate">Bitrate<span class="arrow"></span></th>
+      <th class="sortable num" data-table="paths" data-key="bitrate">Bandwidth<span class="arrow"></span></th>
       <th class="sortable num" data-table="paths" data-key="readers">Readers<span class="arrow"></span></th>
-      <th>Open</th>
     </tr></thead>
     <tbody id="paths"></tbody>
   </table>
@@ -191,45 +209,50 @@ function copyToClipboard(text) {
   });
 }
 
-// Map: path name -> { tr, cells: { state, rx, tx, bitrate, readers } }
-// We hold a live reference to each row's "volatile" cells so each tick only
-// rewrites the parts that actually change. The static cells (name, source,
-// tracks, action links) are created once and left alone — that lets the
-// browser keep focus/hover on the copy-rtsp link across polls.
+// Map: path name -> { tr, cells }. We hold live references to each row's
+// volatile cells so each tick rewrites only what changed. Static cells
+// (name + open links) are created once so hover/click state survives polls.
 const pathRowState = new Map();
 const EMPTY_PATHS_ROW_ID = 'paths-empty';
 
-function buildActionsHTML(name) {
-  const urls = streamUrls(name);
-  return '<span class="actions">'
-    + '<a href="' + urls.webrtc + '" target="_blank" rel="noopener" title="' + urls.webrtc + '">webrtc</a>'
-    + '<span class="sep">·</span>'
-    + '<a href="' + urls.hls + '" target="_blank" rel="noopener" title="' + urls.hls + '">hls</a>'
-    + '<span class="sep">·</span>'
-    + '<a href="' + urls.rtsp + '" class="copy-rtsp" data-url="' + urls.rtsp + '" title="' + urls.rtsp + ' — click to copy, right-click for the browser&#39;s copy-link-address option">copy rtsp</a>'
-    + '</span>';
-}
-
 function createPathRow(p) {
+  const urls = streamUrls(p.name);
   const tr = document.createElement('tr');
-  const nameTd     = document.createElement('td');
-  const stateTd    = document.createElement('td');
-  const sourceTd   = document.createElement('td');
-  const tracksTd   = document.createElement('td');
-  const rxTd       = document.createElement('td');
-  const txTd       = document.createElement('td');
-  const bitrateTd  = document.createElement('td');
-  const readersTd  = document.createElement('td');
-  const actionsTd  = document.createElement('td');
+
+  const nameTd = document.createElement('td');
+  nameTd.innerHTML =
+    '<div class="name-cell">'
+    + '<a class="stream-name" data-rtsp="' + urls.rtsp + '" data-path="' + p.name + '" '
+    + 'href="' + urls.rtsp + '" title="click to copy ' + urls.rtsp + ' · hover for a snapshot">' + p.name + '</a>'
+    + '<span class="name-links">'
+    +   '<a href="' + urls.webrtc + '" target="_blank" rel="noopener" title="' + urls.webrtc + '">webrtc</a>'
+    +   '<span class="sep">·</span>'
+    +   '<a href="' + urls.hls + '" target="_blank" rel="noopener" title="' + urls.hls + '">hls</a>'
+    + '</span>'
+    + '</div>';
+
+  const stateTd   = document.createElement('td');
+  const sourceTd  = document.createElement('td');
+  const tracksTd  = document.createElement('td');
+  const rxTd      = document.createElement('td');
+  const txTd      = document.createElement('td');
+  const bwTd      = document.createElement('td');
+  const readersTd = document.createElement('td');
   rxTd.className = 'num';
   txTd.className = 'num';
-  bitrateTd.className = 'num';
+  bwTd.className = 'num';
   readersTd.className = 'num';
   tracksTd.style.cssText = 'color: var(--muted); font-size: 12px;';
-  nameTd.innerHTML = '<code>' + p.name + '</code>';
-  actionsTd.innerHTML = buildActionsHTML(p.name);
-  tr.append(nameTd, stateTd, sourceTd, tracksTd, rxTd, txTd, bitrateTd, readersTd, actionsTd);
-  return { tr, cells: { state: stateTd, source: sourceTd, tracks: tracksTd, rx: rxTd, tx: txTd, bitrate: bitrateTd, readers: readersTd } };
+  bwTd.innerHTML = '<div class="bw-wrap"><div class="bw-track"><div class="bw-fill"></div></div><span class="bw-val">0</span></div>';
+
+  tr.append(nameTd, stateTd, sourceTd, tracksTd, rxTd, txTd, bwTd, readersTd);
+  return {
+    tr,
+    cells: {
+      state: stateTd, source: sourceTd, tracks: tracksTd, rx: rxTd, tx: txTd, readers: readersTd,
+      bwFill: bwTd.querySelector('.bw-fill'), bwVal: bwTd.querySelector('.bw-val'),
+    },
+  };
 }
 
 function setIfChanged(el, html) {
@@ -238,9 +261,11 @@ function setIfChanged(el, html) {
 
 function updatePathsTable(enrichedPaths) {
   const tbody = document.getElementById('paths');
-  // Wipe the empty-state placeholder if it's there
   const placeholder = document.getElementById(EMPTY_PATHS_ROW_ID);
   if (placeholder) placeholder.remove();
+
+  // Max bandwidth across rows for the relative bar chart.
+  const maxBps = Math.max(1, ...enrichedPaths.map(p => p._bps || 0));
 
   const seen = new Set();
   for (const p of enrichedPaths) {
@@ -262,8 +287,10 @@ function updatePathsTable(enrichedPaths) {
     setIfChanged(c.tracks, (p.tracks || []).join(', ') || '—');
     setIfChanged(c.rx, fmtBytes(p.bytesReceived));
     setIfChanged(c.tx, fmtBytes(p.bytesSent));
-    setIfChanged(c.bitrate, fmtBps(p._bps || 0));
     setIfChanged(c.readers, String((p.readers || []).length));
+    const pct = ((p._bps || 0) / maxBps * 100).toFixed(1) + '%';
+    if (c.bwFill.style.width !== pct) c.bwFill.style.width = pct;
+    setIfChanged(c.bwVal, fmtBps(p._bps || 0));
   }
 
   for (const [name, entry] of pathRowState) {
@@ -273,8 +300,6 @@ function updatePathsTable(enrichedPaths) {
     }
   }
 
-  // Reorder rows in place to match the sorted order; insertBefore is a no-op
-  // when the node is already in the right position.
   for (let i = 0; i < enrichedPaths.length; i++) {
     const entry = pathRowState.get(enrichedPaths[i].name);
     if (tbody.children[i] !== entry.tr) {
@@ -285,28 +310,63 @@ function updatePathsTable(enrichedPaths) {
   if (enrichedPaths.length === 0) {
     const tr = document.createElement('tr');
     tr.id = EMPTY_PATHS_ROW_ID;
-    tr.innerHTML = '<td colspan="9" class="empty">no paths configured</td>';
+    tr.innerHTML = '<td colspan="8" class="empty">no paths configured</td>';
     tbody.appendChild(tr);
   }
 }
 
+// Click a stream name → copy its RTSP URL.
 document.addEventListener('click', e => {
-  const btn = e.target.closest('.copy-rtsp');
-  if (!btn) return;
-  e.preventDefault(); // it's an <a> so the click would otherwise navigate
-  const url = btn.dataset.url;
-  copyToClipboard(url).then(() => {
-    const orig = btn.textContent;
-    btn.textContent = 'copied!';
-    btn.classList.add('copied');
-    setTimeout(() => {
-      btn.textContent = orig;
-      btn.classList.remove('copied');
-    }, 1200);
+  const name = e.target.closest('.stream-name');
+  if (!name) return;
+  e.preventDefault();
+  copyToClipboard(name.dataset.rtsp).then(() => {
+    const orig = name.textContent;
+    name.textContent = 'copied!';
+    name.classList.add('copied');
+    setTimeout(() => { name.textContent = orig; name.classList.remove('copied'); }, 1000);
   }).catch(() => {
-    btn.textContent = 'copy failed';
-    setTimeout(() => { btn.textContent = 'copy rtsp'; }, 1500);
+    const orig = name.textContent;
+    name.textContent = 'copy failed';
+    setTimeout(() => { name.textContent = orig; }, 1200);
   });
+});
+
+// Hover a stream name → show a recent snapshot near the cursor.
+const snapTip = document.getElementById('snapTip');
+const snapImg = snapTip.querySelector('img');
+const snapCapEl = snapTip.querySelector('.cap');
+let snapHideTimer = null;
+function positionSnap(e) {
+  const pad = 14;
+  let x = e.clientX + pad, y = e.clientY + pad;
+  const w = snapTip.offsetWidth || 324, h = snapTip.offsetHeight || 200;
+  if (x + w > window.innerWidth) x = e.clientX - w - pad;
+  if (y + h > window.innerHeight) y = e.clientY - h - pad;
+  snapTip.style.left = x + 'px';
+  snapTip.style.top = y + 'px';
+}
+document.addEventListener('mouseover', e => {
+  const name = e.target.closest('.stream-name');
+  if (!name) return;
+  clearTimeout(snapHideTimer);
+  const path = name.dataset.path;
+  snapCapEl.textContent = path + ' — loading…';
+  // Cache-bust per 8s window so we get a reasonably fresh frame without
+  // hammering the encoder on every pixel move.
+  snapImg.src = 'api/snapshot/' + path.split('/').map(encodeURIComponent).join('/')
+    + '?t=' + Math.floor(Date.now() / 8000);
+  snapImg.onload = () => { snapCapEl.textContent = path; };
+  snapImg.onerror = () => { snapCapEl.textContent = path + ' — no frame'; };
+  snapTip.style.display = 'block';
+  positionSnap(e);
+});
+document.addEventListener('mousemove', e => {
+  if (snapTip.style.display === 'block' && e.target.closest('.stream-name')) positionSnap(e);
+});
+document.addEventListener('mouseout', e => {
+  if (!e.target.closest('.stream-name')) return;
+  snapHideTimer = setTimeout(() => { snapTip.style.display = 'none'; }, 120);
 });
 
 function renderTimeline(transcriptItems, paths) {
@@ -532,7 +592,7 @@ async function tick() {
     document.getElementById('system').innerHTML = html;
 
     // Paths — enrich with computed bps, then sort, then update the table
-    // incrementally so hover/focus on the copy-rtsp link survives each tick.
+    // incrementally so hover/click state on the name survives each tick.
     const enrichedPaths = (paths.items || []).map(p => {
       const prevP = prev.get(p.name);
       const bps = prevP && dt > 0 ? Math.max(0, (p.bytesSent - prevP.bytesSent) / dt) : 0;
@@ -735,30 +795,37 @@ async function proxyJson(url: string): Promise<Response> {
  * remote address (which from the OS view is some other process's local
  * address) into a human-readable executable name.
  *
- * Calls `sudo ss` non-interactively. cameron has NOPASSWD on sentinel, so
- * this never blocks; on a host without that, the call fails silently and
- * the dashboard falls back to showing the raw address.
+ * Runs `ss -tnpH`. In the container we are root so no sudo is needed and
+ * all child PIDs (ffmpeg/mediamtx/whisper) are visible in our PID
+ * namespace. We try plain `ss` first and fall back to `sudo -n ss` for a
+ * non-root host runner. If neither works, returns empty and the dashboard
+ * shows raw addresses.
  */
+async function runSs(cmd: string[]): Promise<string | null> {
+  try {
+    const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe" });
+    const out = await new Response(proc.stdout).text();
+    if ((await proc.exited) !== 0) return null;
+    return out;
+  } catch {
+    return null;
+  }
+}
+
 async function readPeers(): Promise<Record<string, { command: string; pid: number }>> {
   const peers: Record<string, { command: string; pid: number }> = {};
-  try {
-    const proc = Bun.spawn(["sudo", "-n", "ss", "-tnpH"], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const out = await new Response(proc.stdout).text();
-    if ((await proc.exited) !== 0) return peers;
-    for (const line of out.split("\n")) {
-      // ESTAB 0 0 <local> <peer> users:(("name",pid=NNN,fd=NNN))
-      const m = line.match(
-        /^\s*ESTAB\s+\d+\s+\d+\s+(\S+)\s+\S+\s+users:\(\("([^"]+)",pid=(\d+)/
-      );
-      if (!m) continue;
-      const [, local, command, pidStr] = m;
-      peers[local!] = { command: command!, pid: Number(pidStr) };
-    }
-  } catch {
-    // sudo / ss unavailable — return what we have (empty).
+  // Root-in-container path first, then sudo fallback for a non-root host.
+  const out =
+    (await runSs(["ss", "-tnpH"])) ?? (await runSs(["sudo", "-n", "ss", "-tnpH"]));
+  if (!out) return peers;
+  for (const line of out.split("\n")) {
+    // ESTAB 0 0 <local> <peer> users:(("name",pid=NNN,fd=NNN))
+    const m = line.match(
+      /^\s*ESTAB\s+\d+\s+\d+\s+(\S+)\s+\S+\s+users:\(\("([^"]+)",pid=(\d+)/
+    );
+    if (!m) continue;
+    const [, local, command, pidStr] = m;
+    peers[local!] = { command: command!, pid: Number(pidStr) };
   }
   return peers;
 }
@@ -816,9 +883,64 @@ async function readSystemInfo(): Promise<unknown> {
   return result;
 }
 
+// --- Snapshot cache: one recent JPEG per path, refreshed lazily on hover ---
+interface SnapEntry {
+  jpeg: Uint8Array;
+  ts: number;
+}
+const SNAP_TTL_MS = 8000;
+const snapCache = new Map<string, SnapEntry>();
+const snapInflight = new Map<string, Promise<Uint8Array | null>>();
+
+async function grabSnapshot(
+  ffmpegPath: string,
+  baseUrl: string,
+  path: string
+): Promise<Uint8Array | null> {
+  // Validate path: only word chars, dashes, and single slashes (raw/bay-1).
+  if (!/^[\w-]+(\/[\w-]+)*$/.test(path)) return null;
+
+  const cached = snapCache.get(path);
+  // Date.now() is fine here — this is a server-side cache, not a workflow.
+  const now = Date.now();
+  if (cached && now - cached.ts < SNAP_TTL_MS) return cached.jpeg;
+
+  let inflight = snapInflight.get(path);
+  if (!inflight) {
+    inflight = (async () => {
+      const url = `${baseUrl}/${path}`;
+      const proc = Bun.spawn(
+        [
+          ffmpegPath,
+          "-nostdin",
+          "-loglevel", "error",
+          "-rtsp_transport", "tcp",
+          "-allowed_media_types", "video",
+          "-timeout", "10000000",
+          "-i", url,
+          "-frames:v", "1",
+          "-vf", "scale=320:-1",
+          "-f", "mjpeg",
+          "-",
+        ],
+        { stdout: "pipe", stderr: "pipe" }
+      );
+      const buf = new Uint8Array(await new Response(proc.stdout).arrayBuffer());
+      const code = await proc.exited;
+      if (code !== 0 || buf.length === 0) return null;
+      snapCache.set(path, { jpeg: buf, ts: Date.now() });
+      return buf;
+    })();
+    snapInflight.set(path, inflight);
+    inflight.finally(() => snapInflight.delete(path));
+  }
+  return inflight;
+}
+
 export function startDashboard(
   dashboard: Dashboard,
-  transcription?: { ring: RingBuffer; stats: LiveStats }
+  transcription?: { ring: RingBuffer; stats: LiveStats },
+  media?: { ffmpegPath: string; baseUrl: string }
 ): Server {
   const apiBase = dashboard.mediamtx_api_url.replace(/\/$/, "");
   const { hostname, port } = parseAddress(dashboard.address);
@@ -828,6 +950,23 @@ export function startDashboard(
     port,
     async fetch(req) {
       const url = new URL(req.url);
+
+      // Snapshot: /api/snapshot/<path> (path may contain a slash)
+      if (url.pathname.startsWith("/api/snapshot/")) {
+        if (!media) return new Response("snapshots disabled", { status: 503 });
+        const path = decodeURIComponent(
+          url.pathname.slice("/api/snapshot/".length)
+        );
+        const jpeg = await grabSnapshot(media.ffmpegPath, media.baseUrl, path);
+        if (!jpeg) return new Response("no frame", { status: 502 });
+        return new Response(jpeg, {
+          headers: {
+            "content-type": "image/jpeg",
+            "cache-control": "no-cache",
+          },
+        });
+      }
+
       switch (url.pathname) {
         case "/":
         case "/index.html":

@@ -196,7 +196,10 @@ async function main() {
   // /api/transcriptions + /api/transcription-stats from the in-process
   // ring buffer)
   const dashServer = config.dashboard.enabled
-    ? startDashboard(config.dashboard, transcription)
+    ? startDashboard(config.dashboard, transcription, {
+        ffmpegPath: config.ffmpeg_path,
+        baseUrl: config.output.base_url,
+      })
     : null;
   if (dashServer) {
     console.log(
