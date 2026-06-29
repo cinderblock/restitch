@@ -231,13 +231,21 @@ export function buildPipeline(
       );
     }
 
-    // fps=N forces CFR; setpts=N/fps/TB then regenerates each frame's PTS
-    // from its frame index, decoupling this input's timeline from RTSP
-    // arrival jitter and NVDEC burst delivery. With every input on the same
-    // synthetic grid, vstack stays in sync. (Same fix as extra composites.)
+    // fps=N forces CFR (smoothing out bursty/jittery arrival), then
+    // setpts re-stamps each frame with REAL elapsed wall-clock time
+    // (RTCTIME-RTCSTART). Two reasons over frame-index PTS (N/fps/TB):
+    //   1. Real-time stamps self-heal — a dropped/stalled input doesn't
+    //      permanently shift its frame mapping, so cross-input skew can't
+    //      accumulate over hours.
+    //   2. Stamping AFTER fps (which already smoothed the arrival bursts)
+    //      avoids the 1fps collapse that demux-side -use_wallclock_as_-
+    //      timestamps caused.
+    // Combined with -fflags nobuffer on the inputs (jump to live, skip the
+    // stale buffered GOP) all inputs reference near-identical start points,
+    // keeping the composite internally in sync.
     const fpsLabel = `[fps_${i}]`;
     filters.push(
-      `[${i}:v]fps=${probe.fps},setpts=N/${probe.fps}/TB${fpsLabel}`
+      `[${i}:v]fps=${probe.fps},setpts=(RTCTIME-RTCSTART)/(TB*1000000)${fpsLabel}`
     );
 
     const rots = rotationFilters(cam.rotation);
@@ -468,14 +476,13 @@ export function buildExtraCompositePipeline(
 
   for (let i = 0; i < resolved.length; i++) {
     const { ref, cam, probe } = resolved[i]!;
-    // fps=N forces CFR; setpts=N/fps/TB then regenerates each frame's PTS
-    // purely from its frame index, decoupling this input's timeline from
-    // RTSP arrival time and from any source-PTS jumps on reconnect. With
-    // every input on the same synthetic grid, vstack stays perfectly in
-    // sync regardless of per-camera latency differences.
+    // Real-time PTS after fps — see buildPipeline for the full rationale.
+    // fps smooths bursty arrival; setpts=(RTCTIME-RTCSTART) stamps real
+    // wall-clock time so the stacked regions pair by the same moment and
+    // skew can't accumulate. Paired with -fflags nobuffer on the inputs.
     const fpsLabel = `[xc_fps_${i}]`;
     filters.push(
-      `[${i}:v]fps=${probe.fps},setpts=N/${probe.fps}/TB${fpsLabel}`
+      `[${i}:v]fps=${probe.fps},setpts=(RTCTIME-RTCSTART)/(TB*1000000)${fpsLabel}`
     );
     let prev = fpsLabel;
 
