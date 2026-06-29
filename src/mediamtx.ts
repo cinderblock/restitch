@@ -52,7 +52,12 @@ export function generateMediaMTXConfig(
     // RTSP output sessions must survive this startup delay.
     readTimeout: "5m",
     writeTimeout: "5m",
-    writeQueueSize: 16384,
+    // mediamtx's default per-reader send-queue depth. We previously set
+    // this to 16384 (32x) which let a reader fall up to ~3 minutes behind
+    // before mediamtx dropped anything — that backlog is exactly where the
+    // slowly-growing latency pooled. 512 caps worst-case buffering to a
+    // few seconds and forces a drop-to-live instead of endless accumulation.
+    writeQueueSize: 512,
 
     // RTSP server
     rtsp: true,

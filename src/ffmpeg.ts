@@ -188,6 +188,12 @@ export function buildPipeline(
     const sourceUrl = `${config.output.base_url}/${rawStreamName(cam)}`;
     inputArgs.push(
       ...hwaccelInputArgs(config.hwaccel),
+      // Low-latency input: don't pre-buffer the demuxer, decode with low
+      // delay. Keeps the compositor reading at the live edge so latency
+      // doesn't slowly accumulate (setpts makes the pipeline latency-blind,
+      // so the input must not hoard frames).
+      "-fflags", "nobuffer",
+      "-flags", "low_delay",
       "-thread_queue_size", "4096",
       // Cameras advertise 3 tracks (MPEG-4 Audio, Opus, H264). We only encode
       // video — pulling the audio tracks too floods FFmpeg's RTP demuxer with
@@ -418,6 +424,13 @@ export function buildExtraCompositePipeline(
     const sourceUrl = `${config.output.base_url}/${rawStreamName(cam)}`;
     inputArgs.push(
       ...hwaccelInputArgs(config.hwaccel),
+      // Low-latency input (same rationale as the main compositor): read at
+      // the live edge so latency doesn't accumulate behind the latency-blind
+      // setpts timeline.
+      "-fflags",
+      "nobuffer",
+      "-flags",
+      "low_delay",
       "-thread_queue_size",
       "4096",
       "-allowed_media_types",
