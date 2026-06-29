@@ -120,6 +120,14 @@ const EncoderSchema = z.object({
   maxrate: z.string().optional().describe("Max bitrate, e.g. '20M'"),
   bufsize: z.string().optional().describe("Buffer size, e.g. '40M'"),
   pixel_format: z.string().default("yuv420p"),
+  keyframe_interval_seconds: z
+    .number()
+    .positive()
+    .default(1)
+    .describe(
+      "Seconds between keyframes (GOP length). Lower = lower latency / faster " +
+        "stream start, at the cost of more bitrate. 1s is a good low-latency default."
+    ),
   extra_args: z.array(z.string()).default([]).describe("Additional FFmpeg encoder args"),
 });
 

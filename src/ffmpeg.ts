@@ -93,17 +93,26 @@ function encoderArgs(encoder: Encoder, streamName: string, codecOverride?: strin
     args.push("-b:v", "0");
     args.push("-preset", mapNvencPreset(encoder.preset));
     if (codec.includes("264")) {
+      // Low-latency H.264: no B-frames (no reorder delay), no encoder
+      // lookahead, and -delay 0 so NVENC emits each frame immediately
+      // instead of holding a reorder/output buffer.
       args.push("-tune", "ll");
       args.push("-bf", "0");
+      args.push("-rc-lookahead", "0");
+      args.push("-delay", "0");
     } else {
+      // HEVC `full` is the quality master — keep B-frames + multipass.
+      // This trades latency for quality; watch the H.264 sub-streams if
+      // you need low latency.
       args.push("-tune", "hq");
       args.push("-multipass", "fullres");
     }
-    // Force a 2-second GOP (60 frames @ 30fps). WebRTC and HLS clients
-    // can only start decoding from a keyframe — without this, NVENC was
-    // producing P-only streams that left browsers stuck on the spinner.
-    args.push("-g", "60");
-    args.push("-keyint_min", "60");
+    // GOP / keyframe interval. Shorter = lower latency + faster stream
+    // start (players can only begin decoding at a keyframe), at the cost
+    // of bitrate. Default 1s; was 2s. Assumes 30fps source.
+    const gop = Math.max(1, Math.round(encoder.keyframe_interval_seconds * 30));
+    args.push("-g", String(gop));
+    args.push("-keyint_min", String(gop));
     args.push("-pix_fmt", encoder.pixel_format);
     // Force limited (TV) range output. Without this NVENC inherits the
     // full-range flag from UniFi's H.264 VUI, encodes as yuvj420p, and
