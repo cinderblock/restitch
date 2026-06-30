@@ -184,10 +184,25 @@ export interface Pipeline {
  * cameraProbes: map from camera name to probed dimensions. Required so we can
  * compute post-rotation sizes and composite layout without hardcoding.
  */
+/**
+ * Shared PTS baseline (microseconds since the Unix epoch) for the real-time
+ * setpts expressions. All inputs of a vstack reference the SAME baseline so a
+ * frame captured at a given real instant gets the same PTS on every input —
+ * that's what keeps the stacked cameras internally synced regardless of which
+ * input delivered its first frame first (RTCSTART, which we used before, is
+ * per-input and leaves a startup skew of up to one camera GOP). Using a recent
+ * baseline rather than 0 / the absolute epoch keeps the PTS small enough that
+ * the muxer doesn't choke.
+ */
+function ptsBaselineMicros(): number {
+  return Date.now() * 1000;
+}
+
 export function buildPipeline(
   config: Config,
   cameraProbes: Map<string, ProbeResult>
 ): Pipeline {
+  const baseline = ptsBaselineMicros();
   // Only cameras with composite !== false enter the stack. Restream-only
   // cameras (composite: false) are still served by mediamtx for direct clients
   // but skipped here — they have no order/rotation that matters to the stack.
@@ -262,7 +277,7 @@ export function buildPipeline(
     // keeping the composite internally in sync.
     const fpsLabel = `[fps_${i}]`;
     filters.push(
-      `[${i}:v]fps=${probe.fps},setpts=(RTCTIME-RTCSTART)/(TB*1000000)${fpsLabel}`
+      `[${i}:v]fps=${probe.fps},setpts=(RTCTIME-${baseline})/(TB*1000000)${fpsLabel}`
     );
 
     const rots = rotationFilters(cam.rotation);
@@ -426,6 +441,7 @@ export function buildExtraCompositePipeline(
   extra: ExtraComposite,
   cameraProbes: Map<string, ProbeResult>
 ): Pipeline {
+  const baseline = ptsBaselineMicros();
   const cameraByName = new Map<string, Camera>(
     config.cameras.map((c) => [c.name, c])
   );
@@ -505,7 +521,7 @@ export function buildExtraCompositePipeline(
     // skew can't accumulate. Paired with -fflags nobuffer on the inputs.
     const fpsLabel = `[xc_fps_${i}]`;
     filters.push(
-      `[${i}:v]fps=${probe.fps},setpts=(RTCTIME-RTCSTART)/(TB*1000000)${fpsLabel}`
+      `[${i}:v]fps=${probe.fps},setpts=(RTCTIME-${baseline})/(TB*1000000)${fpsLabel}`
     );
     let prev = fpsLabel;
 
