@@ -26,8 +26,13 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,video
     volumes:
       # Config is owned by the jackson ops repo; this deploy never writes it.
-      # Mounted read-only so the container can't drift the source of truth.
-      - /opt/restitch/config.yaml:/etc/restitch/config.yaml:ro
+      # Mount the DIRECTORY (not the file) read-only: jackson delivers the
+      # config by replacing /opt/restitch/config.yaml (new inode), and a
+      # single-file bind mount would keep showing the old inode after a
+      # `docker restart` — the container would silently run stale config.
+      # A directory mount re-resolves the path on restart, so config edits
+      # actually take effect. The app reads /etc/restitch/config.yaml.
+      - /opt/restitch:/etc/restitch:ro
       # Models are big (~1.5 GB); the entrypoint pulls them on first start
       # if the volume is empty, then they persist across container/image
       # restarts on this volume.
