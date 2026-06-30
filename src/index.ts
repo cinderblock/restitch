@@ -80,12 +80,19 @@ async function main() {
   // Build the main FFmpeg pipeline (Bay 1-5 composite + sub-streams)
   const pipeline = buildPipeline(config, cameraProbes);
 
-  // Build a separate pipeline per extra composite
-  const extraPipelines: { name: string; pipeline: Pipeline; cmd: string[] }[] =
-    config.extra_composites.map((extra) => {
-      const p = buildExtraCompositePipeline(config, extra, cameraProbes);
-      return { name: extra.name, pipeline: p, cmd: buildCommand(config, p) };
-    });
+  // Build a separate pipeline per extra composite. We keep the `extra` config
+  // around so the launch factory can REBUILD the command on every (re)spawn —
+  // see the note on the ffmpeg launch below for why a fresh build per spawn
+  // matters (the setpts wall-clock baseline must be recomputed each restart).
+  const extraPipelines: {
+    name: string;
+    extra: (typeof config.extra_composites)[number];
+    pipeline: Pipeline;
+    cmd: string[];
+  }[] = config.extra_composites.map((extra) => {
+    const p = buildExtraCompositePipeline(config, extra, cameraProbes);
+    return { name: extra.name, extra, pipeline: p, cmd: buildCommand(config, p) };
+  });
 
   console.log("\n--- Filter Complex (main) ---");
   console.log(pipeline.filterComplex);
@@ -154,10 +161,19 @@ async function main() {
     console.error(`[${prefix}] ${line}`);
   };
 
-  // Main FFmpeg: composite + sub-streams
+  // Main FFmpeg: composite + sub-streams.
+  //
+  // REBUILD the command on every (re)spawn rather than reusing `fullCmd`. The
+  // setpts expressions embed a wall-clock baseline (ptsBaselineMicros, captured
+  // when buildPipeline runs). If we baked the baseline once at startup and the
+  // supervisor restarted ffmpeg minutes/hours later, the first frame's PTS would
+  // be (now − stale_baseline) = a large value; combined with CFR output that
+  // makes ffmpeg duplicate-fill the entire gap before emitting a real frame, so
+  // sub-streams took 9–14 min to start publishing after a restart. Recomputing
+  // the baseline per spawn keeps PTS ~0 and the stream live immediately.
   const watched: WatchedProcess[] = [];
   const ffmpegProc = launchManaged("ffmpeg", () => ({
-    cmd: fullCmd,
+    cmd: buildCommand(config, buildPipeline(config, cameraProbes)),
     onStderr: stderrFilter("ffmpeg"),
   }));
   processes.push(ffmpegProc);
@@ -169,8 +185,10 @@ async function main() {
 
   // One FFmpeg per extra composite — independent restart, independent CPU/GPU
   for (const e of extraPipelines) {
+    // Rebuild per spawn for a fresh setpts baseline — same reason as the main
+    // compositor above.
     const proc = launchManaged(`ffmpeg-${e.name}`, () => ({
-      cmd: e.cmd,
+      cmd: buildCommand(config, buildExtraCompositePipeline(config, e.extra, cameraProbes)),
       onStderr: stderrFilter(`ffmpeg-${e.name}`),
     }));
     processes.push(proc);
