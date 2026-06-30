@@ -55,6 +55,18 @@ const SubStreamSchema = z.object({
     .optional()
     .describe("Optional output scale. Omit to keep native crop resolution"),
   codec: z.string().optional().describe("Override the global encoder codec for this sub-stream"),
+  maxrate: z
+    .string()
+    .optional()
+    .describe(
+      "Cap this sub-stream's bitrate (e.g. '10M'). Bounds keyframe size so " +
+        "large high-res composites don't produce multi-MB keyframes that " +
+        "overflow client/RTSP buffers (VLC fails to play, snapshots glitch)."
+    ),
+  bufsize: z
+    .string()
+    .optional()
+    .describe("VBV buffer for this sub-stream (e.g. '10M'). Smaller = smoother keyframes. Defaults to maxrate when maxrate is set."),
 });
 
 const HwAccelSchema = z
@@ -95,6 +107,8 @@ const ExtraCompositeSchema = z.object({
         "'h264_nvenc' instead of the default hevc_nvenc — useful when " +
         "the output needs to play in stricter clients like VLC over RTSP)"
     ),
+  maxrate: z.string().optional().describe("Cap this composite's bitrate (e.g. '10M'); bounds keyframe size for VLC/RTSP."),
+  bufsize: z.string().optional().describe("VBV buffer for this composite; defaults to maxrate when maxrate is set."),
   inputs: z.array(InputRefSchema).min(1),
 });
 

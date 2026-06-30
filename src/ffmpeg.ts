@@ -77,7 +77,13 @@ function mapNvencPreset(preset: string): string {
   return map[preset] ?? "p4";
 }
 
-function encoderArgs(encoder: Encoder, streamName: string, codecOverride?: string): string[] {
+function encoderArgs(
+  encoder: Encoder,
+  streamName: string,
+  codecOverride?: string,
+  maxrateOverride?: string,
+  bufsizeOverride?: string
+): string[] {
   const codec = codecOverride ?? encoder.codec;
   const args: string[] = [];
 
@@ -132,11 +138,19 @@ function encoderArgs(encoder: Encoder, streamName: string, codecOverride?: strin
     args.push("-pix_fmt", encoder.pixel_format);
   }
 
-  if (encoder.maxrate) {
-    args.push("-maxrate", encoder.maxrate);
+  // Per-output bitrate cap takes precedence over the global encoder setting.
+  // Capping converts NVENC's unlimited-bitrate CQ mode into capped VBR,
+  // which bounds keyframe size — large high-res composites otherwise emit
+  // multi-MB keyframes that overflow RTSP/client buffers (VLC won't play,
+  // snapshots glitch). bufsize defaults to maxrate (≈1s VBV) for smooth
+  // keyframes when only maxrate is given.
+  const maxrate = maxrateOverride ?? encoder.maxrate;
+  const bufsize = bufsizeOverride ?? encoder.bufsize ?? (maxrateOverride ? maxrateOverride : undefined);
+  if (maxrate) {
+    args.push("-maxrate", maxrate);
   }
-  if (encoder.bufsize) {
-    args.push("-bufsize", encoder.bufsize);
+  if (bufsize) {
+    args.push("-bufsize", bufsize);
   }
 
   args.push(...encoder.extra_args);
@@ -154,6 +168,8 @@ export interface PipelineOutput {
   name: string;
   mapLabel: string;
   codecOverride?: string;
+  maxrateOverride?: string;
+  bufsizeOverride?: string;
 }
 
 export interface Pipeline {
@@ -382,7 +398,13 @@ export function buildPipeline(
     }
 
     filters.push(`${cropFilter}${cropLabel}`);
-    outputs.push({ name: sub.name, mapLabel: cropLabel, codecOverride: sub.codec });
+    outputs.push({
+      name: sub.name,
+      mapLabel: cropLabel,
+      codecOverride: sub.codec,
+      maxrateOverride: sub.maxrate,
+      bufsizeOverride: sub.bufsize,
+    });
   }
 
   const filterComplex = filters.join(";\n");
@@ -573,7 +595,13 @@ export function buildExtraCompositePipeline(
 
   const filterComplex = filters.join(";\n");
   const outputs: PipelineOutput[] = [
-    { name: extra.name, mapLabel: outLbl, codecOverride: extra.codec },
+    {
+      name: extra.name,
+      mapLabel: outLbl,
+      codecOverride: extra.codec,
+      maxrateOverride: extra.maxrate,
+      bufsizeOverride: extra.bufsize,
+    },
   ];
   return { inputArgs, filterComplex, outputs };
 }
@@ -664,7 +692,15 @@ export function buildCommand(config: Config, pipeline: Pipeline): string[] {
   // Outputs
   for (const out of pipeline.outputs) {
     cmd.push("-map", out.mapLabel);
-    cmd.push(...encoderArgs(config.encoder, out.name, out.codecOverride));
+    cmd.push(
+      ...encoderArgs(
+        config.encoder,
+        out.name,
+        out.codecOverride,
+        out.maxrateOverride,
+        out.bufsizeOverride
+      )
+    );
     cmd.push("-an"); // no audio
     if (config.output.format === "rtsp") {
       cmd.push("-rtsp_transport", "tcp");
