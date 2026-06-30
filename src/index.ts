@@ -1,5 +1,5 @@
 import { parseArgs } from "util";
-import { resolve, dirname } from "path";
+import { resolve } from "path";
 import YAML from "yaml";
 import { ConfigSchema, type Config } from "./config.ts";
 import {
@@ -117,13 +117,17 @@ async function main() {
     return;
   }
 
-  // Write mediamtx config and launch it
+  // Write mediamtx config and launch it.
+  // NOTE: write the generated mediamtx config to a WRITABLE runtime dir, not
+  // next to config.yaml — in the container the config dir is mounted
+  // read-only (it's owned by the jackson ops repo), so writing there fails
+  // with EROFS. RESTITCH_RUNTIME_DIR overrides; default /tmp.
   const processes: ManagedProcess[] = [];
-  const configDir = dirname(configPath);
+  const runtimeDir = process.env.RESTITCH_RUNTIME_DIR || "/tmp";
 
   if (!values["no-mediamtx"]) {
     const mtxConfigPath = await writeMediaMTXConfig(
-      configDir,
+      runtimeDir,
       config,
       allOutputs
     );
