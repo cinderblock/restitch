@@ -52,12 +52,16 @@ export function generateMediaMTXConfig(
     // RTSP output sessions must survive this startup delay.
     readTimeout: "5m",
     writeTimeout: "5m",
-    // mediamtx's default per-reader send-queue depth. We previously set
-    // this to 16384 (32x) which let a reader fall up to ~3 minutes behind
-    // before mediamtx dropped anything — that backlog is exactly where the
-    // slowly-growing latency pooled. 512 caps worst-case buffering to a
-    // few seconds and forces a drop-to-live instead of endless accumulation.
-    writeQueueSize: 512,
+    // Per-reader send-queue depth. This MUST be larger than the packet
+    // count of the biggest single keyframe, or mediamtx discards part of
+    // every keyframe ("reader is too slow, discarding N frames") and the
+    // large composite streams come out corrupt (lost slices → smears).
+    // A 7560x2688 HEVC keyframe alone is well over 1000 RTP packets, so
+    // 512 was far too small — it corrupted full/full-low/the-field/john
+    // while only the tiny `entry` keyframes fit. Latency is bounded
+    // separately by -fflags nobuffer on the compositor inputs (they read
+    // at the live edge), so a generous queue here costs nothing.
+    writeQueueSize: 16384,
 
     // RTSP server
     rtsp: true,
