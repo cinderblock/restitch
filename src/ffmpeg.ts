@@ -190,9 +190,10 @@ export function buildPipeline(
   // NOTE: deliberately NO -use_wallclock_as_timestamps. It stamps each frame
   // with its RTSP arrival time; with NVDEC decode (which delivers frames in
   // bursts) the per-input arrival cadences differ enough that the fps filter
-  // collapses inputs to ~2fps and vstack pairs stale frames. We instead
-  // regenerate frame-index PTS after each fps filter (setpts=N/fps/TB below)
-  // so all inputs ride an identical synthetic grid that can't desync.
+  // collapses inputs to ~2fps and vstack pairs stale frames. We instead let
+  // fps smooth the bursts, then re-stamp with REAL elapsed wall-clock time
+  // (setpts=(RTCTIME-RTCSTART) below) so all inputs share a real-time grid:
+  // smooth, internally synced, and self-healing (skew can't accumulate).
   for (const cam of cameras) {
     const sourceUrl = `${config.output.base_url}/${rawStreamName(cam)}`;
     inputArgs.push(
@@ -430,13 +431,13 @@ export function buildExtraCompositePipeline(
   // NOTE: deliberately NO -use_wallclock_as_timestamps here (unlike the
   // main compositor). The extra composites stack DIFFERENT camera models
   // (e.g. doorbell + foyer) whose RTSP arrival latency/jitter differ.
-  // Wallclock timestamps desync those inputs and the fps filter then
-  // collapses the higher-latency input to ~1fps (measured: 13 unique
-  // frames vs 173 without wallclock over 15s). We instead regenerate
-  // frame-index PTS after the fps filter (see setpts below) so both
-  // inputs ride an identical synthetic 30fps grid and vstack can't
-  // desync. The main compositor keeps wallclock because its 5 inputs are
-  // identical cameras that stay in lockstep.
+  // Demux-side -use_wallclock_as_timestamps desyncs those inputs and the
+  // fps filter then collapses the higher-latency input to ~1fps (measured:
+  // 13 unique frames vs 173 without it over 15s). Instead we let fps smooth
+  // the bursts, then re-stamp with real elapsed wall-clock time
+  // (setpts=(RTCTIME-RTCSTART) below) — same approach as the main
+  // compositor — so both inputs share a real-time grid that stays smooth
+  // AND internally synced.
   for (const { cam } of resolved) {
     const sourceUrl = `${config.output.base_url}/${rawStreamName(cam)}`;
     inputArgs.push(
