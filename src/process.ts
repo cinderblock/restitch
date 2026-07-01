@@ -25,6 +25,12 @@ export function launchManaged(
 ): ManagedProcess {
   const baseDelayMs = opts.restartDelayMs ?? 3000;
   const maxDelayMs = opts.maxDelayMs ?? 60_000;
+  // How long to wait for a graceful (SIGTERM) exit before force-killing
+  // (SIGKILL). ffmpeg reading a half-dead RTSP input — or hung tearing down
+  // an NVENC session — can ignore SIGTERM until its own 30s input timeout
+  // fires; without a hard deadline `await proc.exited` in restart() hangs
+  // forever, and overlapping watchdog restarts then leak orphan ffmpegs.
+  const forceKillMs = 5_000;
   let restartCount = 0;
   let stopped = false;
   // Set by restart() so the exit handler doesn't ALSO schedule a respawn —
@@ -33,6 +39,12 @@ export function launchManaged(
   // mediamtx publish path ("closing existing publisher" → Broken pipe →
   // crash loop).
   let intentionalRestart = false;
+  // Guards restart() against re-entry. The watchdog polls on an interval and
+  // can call restart() again while a previous call is still waiting for a
+  // wedged ffmpeg to die; each hung call would spawn its own replacement when
+  // the old process finally exits, leaking orphan compositors that nothing
+  // tracks or kills (→ NVENC session exhaustion, all composites go dark).
+  let restarting = false;
   let proc: Subprocess;
 
   function spawn(): Subprocess {
@@ -116,18 +128,44 @@ export function launchManaged(
       return proc;
     },
     async restart() {
-      if (stopped) return;
-      // Tell the exit handler not to auto-respawn; we'll spawn the one
-      // replacement ourselves once the old process is gone.
-      intentionalRestart = true;
-      proc.kill();
-      await proc.exited;
-      restartCount = 0;
-      proc = spawn();
+      if (stopped || restarting) return;
+      restarting = true;
+      try {
+        // Tell the exit handler not to auto-respawn; we'll spawn the one
+        // replacement ourselves once the old process is gone.
+        intentionalRestart = true;
+        const dying = proc;
+        dying.kill(); // SIGTERM — ask nicely first
+        // ...then force-kill if it doesn't exit promptly, so we never wedge
+        // here waiting on an unresponsive ffmpeg (see forceKillMs above).
+        const sigkill = setTimeout(() => {
+          try {
+            dying.kill(9); // SIGKILL
+          } catch {
+            // already exited
+          }
+        }, forceKillMs);
+        await dying.exited;
+        clearTimeout(sigkill);
+        restartCount = 0;
+        proc = spawn();
+      } finally {
+        restarting = false;
+      }
     },
     stop() {
       stopped = true;
-      proc.kill();
+      const dying = proc;
+      dying.kill();
+      // Force-kill if it lingers, so container shutdown isn't blocked by a
+      // wedged ffmpeg.
+      setTimeout(() => {
+        try {
+          dying.kill(9);
+        } catch {
+          // already exited
+        }
+      }, forceKillMs);
     },
   };
 }

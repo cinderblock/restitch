@@ -153,12 +153,23 @@ export function startWatchdog(
     }
   };
 
-  const handle = setInterval(() => {
-    void tick();
-  }, pollMs);
+  // Non-reentrant: a tick that restarts one or more wedged processes can take
+  // several seconds (SIGTERM → force-kill → respawn each). If the interval
+  // fired again meanwhile, two ticks could each decide the same path is stale
+  // and stack restarts. Skip a tick while the previous one is still running.
+  let ticking = false;
+  const runTick = () => {
+    if (ticking) return;
+    ticking = true;
+    void tick().finally(() => {
+      ticking = false;
+    });
+  };
+
+  const handle = setInterval(runTick, pollMs);
   // Fire once after a short delay so we don't restart everything on a
   // cold start before any process has had a chance to publish.
-  setTimeout(() => void tick(), Math.min(pollMs, 5_000));
+  setTimeout(runTick, Math.min(pollMs, 5_000));
 
   return {
     stop() {

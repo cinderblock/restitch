@@ -78,6 +78,32 @@ fresh baseline removes the only reason CFR ever misbehaved.
 - [ ] Verify on box: DTS warnings gone (~0/sec); clean decode; fast publish after a
       supervisor restart; bay sync still intact.
 
+## FOLLOW-UP BUG (found ~20h after deploy): orphan compositor pile-up
+Symptom: "composite streams are all down." Container up ~20h had **4** main-
+compositor ffmpeg processes alive at once (ages 17h/17h/14.6h/20s, all `Sl`).
+Four compositors × 4 NVENC sessions each exhausted NVENC → none could hold the
+publish → all composites `source=none`.
+
+Root cause (process.ts + watchdog.ts interaction):
+- `restart()` used `proc.kill()` = **SIGTERM only**. A compositor wedged on a
+  half-dead RTSP input ignores SIGTERM until its 30s input timeout, so
+  `await proc.exited` hangs.
+- watchdog `setInterval(() => void tick())` was **not awaited / not re-entrant**;
+  after the 45s grace, a still-stalled path fired `restart()` **again** on the
+  same hung `proc`.
+- When the wedged ffmpeg finally died, EVERY hung `restart()` resumed and each
+  ran `proc = spawn()`; only the last assignment was tracked → the rest became
+  **orphans nothing ever kills**. Repeat over hours → pile-up.
+
+Fix:
+- process.ts: `restart()`/`stop()` now SIGTERM then **SIGKILL after 5s** if not
+  exited (never wedge on `await exited`); `restart()` guarded against re-entry
+  (`restarting` flag).
+- watchdog.ts: tick made **non-reentrant** (skip if a prior tick still running).
+
+Immediate recovery on the box: `docker restart restitch` (cleared the pile-up →
+single clean compositor, all composites back up). Fix deployed so it can't recur.
+
 ## Things not to do
 - Don't chase the "reader is too slow" discards — they're caused by my own slow
   capture connections, not a real defect.
