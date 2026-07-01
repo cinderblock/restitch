@@ -46,25 +46,37 @@ HERRING — it only occurred while *I* (ffprobe/snapshot captures) connected as 
 readers; 0 discards with no external readers. maxrate caps ARE applied (keyframes
 ~745KB), writeQueueSize 16384 is fine.
 
-## FIX (two parts, both implemented in restitch)
-1. **`-fps_mode passthrough` on every output** (`buildCommand` in ffmpeg.ts).
-   Live restreamer semantics: never drop/dup frames to hit a CFR target. This
-   neutralizes BOTH the gap-fill (no duplication possible) AND the 25fps frame
-   drop (no rate conforming). Lowest latency mode. Upstream `fps=N` already made
-   inputs CFR, so output stays smooth 30fps.
-2. **Fresh baseline per (re)spawn** (`index.ts`): build the ffmpeg command INSIDE
+## FIX (two parts)
+1. **Fresh baseline per (re)spawn** (`index.ts`): build the ffmpeg command INSIDE
    the launch factory so each restart recomputes `ptsBaselineMicros()`. Keeps PTS
-   bounded (~0 at spawn), avoids PTS jumps on restart, lowers display latency.
-   Applies to main compositor AND each extra composite.
+   ~0 at spawn → no gap for CFR to fill → outputs publish in seconds after a
+   restart. Applies to main compositor AND each extra composite. THE root-cause fix.
+2. **Clean CFR output**: `-fps_mode cfr -r <fps>` on every output (`buildCommand`),
+   with the composite/camera fps carried on each `PipelineOutput.fps`. The upstream
+   wall-clock setpts (needed for cross-camera sync) leaves slightly non-monotonic
+   per-frame PTS; CFR re-quantizes to an even grid. This both restores the correct
+   rate on the crop/scale sub-streams (no more 25fps fallback / 5-of-30 frame drop)
+   and eliminates the muxer's non-monotonic-DTS warnings. Safe from gap-fill because
+   of fix #1 (fresh baseline → no gap).
+
+### Pivot note (why not passthrough)
+First deploy used `-fps_mode passthrough` (never drop/dup). It WORKED — verified
+clean the-field frame, no decode errors, bays internally synced — but flooded logs
+with ~115 non-monotonic-DTS warnings/sec because it forwarded the jittery wall-clock
+PTS raw. Switched to CFR, which is what the old default silently did for `full`
+(re-quantize the jitter). CFR is the "best" choice: clean logs + clean grid, and
+fresh baseline removes the only reason CFR ever misbehaved.
 
 ## Progress log
 - [x] Diagnosed: sub-streams = main-process H.264 outputs; full=HEVC works; entry=separate works.
 - [x] Confirmed root cause via publish timestamps (stale baseline → CFR gap-fill).
-- [ ] Implement fix #1 (fps_mode passthrough).
-- [ ] Implement fix #2 (fresh baseline per spawn).
-- [ ] Deploy (push → CI → sentinel build/up), monitor CI to completion.
-- [ ] Verify: all 4 main outputs publish within seconds of a restart; no choppiness;
-      bay internal sync intact (the user could never verify this before — blocked).
+- [x] Fix #1 (fresh baseline per spawn) — implemented, deployed, VERIFIED: post-restart
+      all 4 outputs recover in seconds; clean decode; bays synced (frame ts matched).
+- [x] Fix #2 first attempt: `-fps_mode passthrough` — deployed, works but DTS log spam.
+- [x] Fix #2 final: `-fps_mode cfr -r <fps>` — implemented + build-verified locally.
+- [ ] Commit + deploy CFR version, monitor CI to completion.
+- [ ] Verify on box: DTS warnings gone (~0/sec); clean decode; fast publish after a
+      supervisor restart; bay sync still intact.
 
 ## Things not to do
 - Don't chase the "reader is too slow" discards — they're caused by my own slow

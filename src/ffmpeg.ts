@@ -170,6 +170,15 @@ export interface PipelineOutput {
   codecOverride?: string;
   maxrateOverride?: string;
   bufsizeOverride?: string;
+  /**
+   * Target constant frame rate for this output (frames/sec). Emitted as `-r`
+   * so ffmpeg conforms the (wall-clock-stamped, slightly jittery) filter output
+   * to a clean monotonic CFR grid. REQUIRED on any output whose filter chain
+   * runs crop/scale/transpose: those filters drop the framerate metadata, so
+   * without an explicit rate ffmpeg falls back to 25fps and (a) drops ~5 of
+   * every 30 real frames and (b) emits a flood of non-monotonic DTS warnings.
+   */
+  fps?: number;
 }
 
 export interface Pipeline {
@@ -321,8 +330,14 @@ export function buildPipeline(
     compositeLabel = scaleLabel;
   }
 
+  // Composite frame rate: every composite input was forced to its own probe fps
+  // upstream (fps=N), and vstack requires them equal, so the stacked composite
+  // runs at the first composite camera's rate. Carry it onto every output as the
+  // CFR target (see PipelineOutput.fps).
+  const compositeFps = cameraProbes.get(cameras[0]!.name)!.fps;
+
   const outputs: PipelineOutput[] = [
-    { name: config.composite.name, mapLabel: compositeLabel },
+    { name: config.composite.name, mapLabel: compositeLabel, fps: compositeFps },
   ];
 
   // --- Sub-streams (crop from pre-scale composite) ---
@@ -419,6 +434,9 @@ export function buildPipeline(
       codecOverride: sub.codec,
       maxrateOverride: sub.maxrate,
       bufsizeOverride: sub.bufsize,
+      // crop/scale/transpose above strip the framerate metadata — set the CFR
+      // target explicitly so the encoder doesn't fall back to 25fps.
+      fps: compositeFps,
     });
   }
 
@@ -617,6 +635,9 @@ export function buildExtraCompositePipeline(
       codecOverride: extra.codec,
       maxrateOverride: extra.maxrate,
       bufsizeOverride: extra.bufsize,
+      // scale-to-match + post-stack scale strip framerate metadata; pin the CFR
+      // target to the first input's rate (all inputs forced to it upstream).
+      fps: resolved[0]!.probe.fps,
     },
   ];
   return { inputArgs, filterComplex, outputs };
@@ -717,18 +738,17 @@ export function buildCommand(config: Config, pipeline: Pipeline): string[] {
         out.bufsizeOverride
       )
     );
-    // Pass frames straight through at the PTS the filtergraph assigned —
-    // never duplicate/drop to conform to a CFR target. This is critical:
-    // crop/scale strip the framerate metadata from the sub-stream branches
-    // (full-low/the-field/john), so ffmpeg would otherwise (a) fall back to a
-    // 25fps CFR target and DROP ~5 of every 30 real frames (choppy/out-of-sync
-    // playback), and (b) on a restart where the wall-clock setpts baseline is
-    // stale, CFR-fill the multi-minute PTS gap with tens of thousands of
-    // duplicate frames before emitting a single real one — which is why those
-    // outputs took 9–14 min to start publishing. passthrough is also the
-    // lowest-latency mode (no CFR buffering) and the correct semantics for a
-    // live restreamer whose input is already CFR (upstream fps=N).
-    cmd.push("-fps_mode", "passthrough");
+    // Conform to a clean constant-rate grid. The upstream wall-clock setpts
+    // (RTCTIME-baseline, for cross-camera sync) leaves slightly non-monotonic
+    // per-frame PTS; CFR re-quantizes them to an even grid, which both prevents
+    // a flood of non-monotonic-DTS muxer warnings AND restores the correct rate
+    // on the crop/scale sub-streams (which otherwise fall back to 25fps and drop
+    // frames). The multi-minute CFR gap-fill that used to plague restarts is
+    // avoided by recomputing the setpts baseline per spawn (see index.ts), so
+    // the first frame's PTS is ~0 and there is no gap to fill.
+    if (out.fps) {
+      cmd.push("-fps_mode", "cfr", "-r", String(out.fps));
+    }
     cmd.push("-an"); // no audio
     if (config.output.format === "rtsp") {
       cmd.push("-rtsp_transport", "tcp");
