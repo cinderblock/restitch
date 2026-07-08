@@ -74,9 +74,13 @@ fresh baseline removes the only reason CFR ever misbehaved.
       all 4 outputs recover in seconds; clean decode; bays synced (frame ts matched).
 - [x] Fix #2 first attempt: `-fps_mode passthrough` — deployed, works but DTS log spam.
 - [x] Fix #2 final: `-fps_mode cfr -r <fps>` — implemented + build-verified locally.
-- [ ] Commit + deploy CFR version, monitor CI to completion.
-- [ ] Verify on box: DTS warnings gone (~0/sec); clean decode; fast publish after a
-      supervisor restart; bay sync still intact.
+- [x] Commit + deploy CFR version — DTS warnings 0/sec, clean decode, bays synced.
+- [x] Follow-up: diagnosed + fixed orphan compositor pile-up (see section below);
+      recovered box via `docker restart restitch`; deployed force-kill + non-reentrant
+      watchdog fix; verified fresh container = 1 compositor + 1 entry, all composites up.
+- [ ] Monitor over hours: confirm no compositor pile-up recurs (steady 1 process).
+- [ ] Optional: wedge-simulation test (SIGSTOP compositor → watchdog SIGKILLs it →
+      exactly 1 respawn) to prove the fix — deferred (disrupts live streams ~75s).
 
 ## FOLLOW-UP BUG (found ~20h after deploy): orphan compositor pile-up
 Symptom: "composite streams are all down." Container up ~20h had **4** main-
@@ -103,6 +107,45 @@ Fix:
 
 Immediate recovery on the box: `docker restart restitch` (cleared the pile-up →
 single clean compositor, all composites back up). Fix deployed so it can't recur.
+
+## FOLLOW-UP BUG #2: entry composite "broken bottom half" (frozen input branch)
+Symptom: entry composite's bottom half (foyer) stuck ~7h in the past — showed
+03:26 AM night-vision IR while `raw/foyer` was live at 10:45 AM daylight color.
+Top half (doorbell) was live. Not corruption — a **frozen input branch**.
+
+Diagnosis:
+- entry ffmpeg proc age was 17.4h. No decode errors. `raw/foyer` source was
+  live/clean (verified direct capture). Two entry captures minutes apart showed
+  the foyer half's burned-in timestamp identically stuck at `03:26:57`.
+- Mechanism: the entry ffmpeg's foyer RTSP input silently wedged ~03:26 AM
+  (no error, `-timeout 30000000` didn't fire). `fps=30` then **duplicated the
+  last foyer frame** indefinitely to hold 30fps, so vstack + output kept
+  publishing at a healthy byte rate → the byte-rate watchdog is blind to it.
+- This is exactly the failure the removed `periodicRestartMs` workaround covered;
+  it was dropped assuming the setpts fix addressed it — it didn't (different bug).
+- Exact 03:26 trigger unknown (docker logs rotated; only ~17 min retained). No
+  foyer readiness flap in the retained window.
+
+Immediate recovery: `pkill -f xc_stacked` (the entry filtergraph label) → supervisor
+respawned entry → foyer half live again (verified: bottom half now 10:52 AM color,
+synced with top). One entry process.
+
+Proper fix (NOT yet done — needs user decision on tradeoff):
+- (A) re-add periodic restart for extra composites — simple/reliable, but a ~45s
+  blip every N min on a watched stream.
+- (B) content-freshness watchdog: sample each composite, detect a static input
+  region → restart. No blips, more code, false-positive risk on genuinely static
+  night scenes.
+- (C) harden input: add `-rw_timeout` so a stalled *read* (not just connect)
+  errors ffmpeg → supervisor restarts. Cheap; may not catch this case if mediamtx
+  keeps the reader session alive during the source's silent stall.
+  Recommend C (cheap, targeted) + B-lite, or A as a stopgap.
+
+DECISION (user): went with (C) — `-rw_timeout 15000000` (15s I/O read timeout) on
+all compositor RTSP inputs (main 5 + each extra composite's inputs). Implemented in
+buildPipeline + buildExtraCompositePipeline. Caveat acknowledged: may not fire if
+mediamtx keeps the reader session alive during a silent source stall — WATCH whether
+a future freeze self-recovers; if not, escalate to (B) content-freshness detection.
 
 ## Things not to do
 - Don't chase the "reader is too slow" discards — they're caused by my own slow

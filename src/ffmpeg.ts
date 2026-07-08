@@ -255,6 +255,15 @@ export function buildPipeline(
       // keep running with the last frame from a stalled input forever,
       // and the supervisor never gets a chance to restart it.
       "-timeout", "30000000",
+      // rw_timeout is the I/O READ timeout: error out (→ supervisor restart)
+      // if no data is read for 15s. -timeout above is the socket timeout and
+      // did NOT catch a real silent input stall (a camera input wedged for
+      // ~7h while fps=N kept duplicating its last frame, so the composite half
+      // froze but bytes kept flowing). rw_timeout is a lower-level backstop for
+      // that. NOTE: if mediamtx keeps the reader session fed during the source's
+      // stall this still may not fire — revisit with content-freshness detection
+      // if freezes recur. See plans/composite-substream-startup-stall.md.
+      "-rw_timeout", "15000000",
       "-rtsp_transport", "tcp",
       "-i", sourceUrl
     );
@@ -513,6 +522,12 @@ export function buildExtraCompositePipeline(
       // instead of running forever with one input frozen.
       "-timeout",
       "30000000",
+      // I/O read-timeout backstop: this is the exact failure that froze the
+      // entry composite's foyer half for ~7h (input wedged, fps duplicated the
+      // last frame, byte-rate watchdog blind). See the main compositor input
+      // and plans/composite-substream-startup-stall.md for the caveat.
+      "-rw_timeout",
+      "15000000",
       "-rtsp_transport",
       "tcp",
       "-i",
