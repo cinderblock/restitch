@@ -141,11 +141,28 @@ Proper fix (NOT yet done — needs user decision on tradeoff):
   keeps the reader session alive during the source's silent stall.
   Recommend C (cheap, targeted) + B-lite, or A as a stopgap.
 
-DECISION (user): went with (C) — `-rw_timeout 15000000` (15s I/O read timeout) on
-all compositor RTSP inputs (main 5 + each extra composite's inputs). Implemented in
-buildPipeline + buildExtraCompositePipeline. Caveat acknowledged: may not fire if
-mediamtx keeps the reader session alive during a silent source stall — WATCH whether
-a future freeze self-recovers; if not, escalate to (B) content-freshness detection.
+DECISION history:
+- (C) `-rw_timeout` — TRIED, FAILED. Not a valid option for the RTSP demuxer in this
+  BtbN ffmpeg build ("Option rw_timeout not found" → exit 8 → crash loop → all
+  composites down). Reverted (commit 42d7956). Also confirmed the existing `-timeout`
+  (30s socket timeout) can't catch it: mediamtx keeps bytes flowing at the socket
+  level even when frames stop, so NO input-level timeout works. C is a dead end.
+- Freeze recurred (entry ran ~4 days, foyer froze again) → confirmed we need content
+  detection.
+- (B) content-freshness — IMPLEMENTED + validated (this is the fix):
+  * watchdog samples each extra composite's output as a 64x64 gray frame
+    (scale=...:flags=neighbor so per-pixel content, incl. the ticking clock, is
+    preserved), hashes an 8x8 cell grid, tracks per-cell pixel-static duration.
+  * One band per stacked input (entry = 2 vertical bands). A band all-static for
+    ≥150s → that input frozen → restart. The clock overlay guarantees a live band
+    always has ≥1 changing cell, so a merely-quiet camera is NOT flagged.
+  * Pure `evaluateFreshness`/`hashCells`/`cellsInBand` unit-tested: foyer freeze →
+    band1@150s; doorbell freeze → band0@150s; all-live → none; static-scene-with-
+    ticking-clock → none (false-positive case passes).
+  * Fingerprint ffmpeg cmd verified against live streams (4096 bytes) BEFORE deploy
+    — the lesson from the -rw_timeout crash.
+  * Scoped to extra composites only (entry). Main compositor keeps the byte-watchdog
+    (its rotated 5-bay geometry doesn't map to simple bands; not the reported bug).
 
 ## Things not to do
 - Don't chase the "reader is too slow" discards — they're caused by my own slow

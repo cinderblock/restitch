@@ -192,14 +192,23 @@ async function main() {
       onStderr: stderrFilter(`ffmpeg-${e.name}`),
     }));
     processes.push(proc);
+    // Content-freshness geometry: one band per stacked input. A vertical stack
+    // splits into row-bands; a horizontal stack into col-bands; a 90/270°
+    // post-stack rotation swaps the axis (the published frame is what we
+    // sample). This catches the exact failure we keep hitting — an input's RTSP
+    // read silently wedges and the fps filter duplicates its last frame forever,
+    // so bytes keep flowing but that band goes pixel-static.
+    const rot = Number(e.extra.rotation); // "0" | "90" | "180" | "270" enum
+    const quarterTurn = rot === 90 || rot === 270;
+    let freshnessAxis: "rows" | "cols" =
+      e.extra.direction === "vertical" ? "rows" : "cols";
+    if (quarterTurn) freshnessAxis = freshnessAxis === "rows" ? "cols" : "rows";
     watched.push({
       name: `ffmpeg-${e.name}`,
       paths: e.pipeline.outputs.map((o) => o.name),
       process: proc,
-      // No periodicRestartMs: the doorbell/foyer vstack slow-leak this used
-      // to work around is fixed at the source (setpts frame-index PTS, see
-      // buildExtraCompositePipeline). The byte-stall watchdog below remains
-      // as the general safety net.
+      freshnessBands: e.extra.inputs.length,
+      freshnessAxis,
     });
   }
 
@@ -210,8 +219,13 @@ async function main() {
 
   // Watchdog: restart any ffmpeg whose mediamtx output path stops
   // receiving bytes. Catches stuck-but-alive ffmpegs that the supervisor
-  // can't see (it only restarts on process exit).
-  const watchdog = startWatchdog(watched);
+  // can't see (it only restarts on process exit). ffmpegPath/baseUrl enable
+  // the content-freshness check that catches silently-frozen input branches
+  // (byte flow stays healthy, so this samples the actual pixels).
+  const watchdog = startWatchdog(watched, {
+    ffmpegPath: config.ffmpeg_path,
+    baseUrl: config.output.base_url,
+  });
 
   // Dashboard HTTP server (proxies mediamtx API + exposes /api/system +
   // /api/transcriptions + /api/transcription-stats from the in-process
