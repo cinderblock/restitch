@@ -163,6 +163,10 @@ DECISION history:
     — the lesson from the -rw_timeout crash.
   * Scoped to extra composites only (entry). Main compositor keeps the byte-watchdog
     (its rotated 5-bay geometry doesn't map to simple bands; not the reported bug).
+  * DEPLOYED (commit 0929f3c) + VERIFIED: healthy startup, and a ~4-min production
+    soak showed NO false-positive restarts of entry (age grew 97→327s uninterrupted).
+    Real-world freeze auto-recovery will prove out the next time a foyer wedge occurs
+    (should now self-heal in ~150-200s instead of hours/days). STATUS: fix complete.
 
 ## Things not to do
 - Don't chase the "reader is too slow" discards — they're caused by my own slow
