@@ -11,7 +11,7 @@ import {
   type Pipeline,
 } from "./ffmpeg.ts";
 import { probeAllCameras } from "./probe.ts";
-import { writeMediaMTXConfig } from "./mediamtx.ts";
+import { writeMediaMTXConfig, rawStreamName } from "./mediamtx.ts";
 import { launchManaged, type ManagedProcess } from "./process.ts";
 import { detectHwAccel, suggestEncoder } from "./hwaccel.ts";
 import { startDashboard } from "./dashboard.ts";
@@ -177,10 +177,17 @@ async function main() {
     onStderr: stderrFilter("ffmpeg"),
   }));
   processes.push(ffmpegProc);
+  // Raw input paths the main compositor reads (the composite cameras). If any
+  // of these sources reconnects, the watchdog restarts the compositor before a
+  // wedged read can silently freeze that bay.
+  const cameraByName = new Map(config.cameras.map((c) => [c.name, c]));
   watched.push({
     name: "ffmpeg",
     paths: pipeline.outputs.map((o) => o.name),
     process: ffmpegProc,
+    inputPaths: config.cameras
+      .filter((c) => c.composite !== false)
+      .map((c) => rawStreamName(c)),
   });
 
   // One FFmpeg per extra composite — independent restart, independent CPU/GPU
@@ -192,23 +199,16 @@ async function main() {
       onStderr: stderrFilter(`ffmpeg-${e.name}`),
     }));
     processes.push(proc);
-    // Content-freshness geometry: one band per stacked input. A vertical stack
-    // splits into row-bands; a horizontal stack into col-bands; a 90/270°
-    // post-stack rotation swaps the axis (the published frame is what we
-    // sample). This catches the exact failure we keep hitting — an input's RTSP
-    // read silently wedges and the fps filter duplicates its last frame forever,
-    // so bytes keep flowing but that band goes pixel-static.
-    const rot = Number(e.extra.rotation); // "0" | "90" | "180" | "270" enum
-    const quarterTurn = rot === 90 || rot === 270;
-    let freshnessAxis: "rows" | "cols" =
-      e.extra.direction === "vertical" ? "rows" : "cols";
-    if (quarterTurn) freshnessAxis = freshnessAxis === "rows" ? "cols" : "rows";
     watched.push({
       name: `ffmpeg-${e.name}`,
       paths: e.pipeline.outputs.map((o) => o.name),
       process: proc,
-      freshnessBands: e.extra.inputs.length,
-      freshnessAxis,
+      // Restart this composite when one of its input sources reconnects — that
+      // reconnect is what wedges the read and freezes a half (e.g. foyer).
+      inputPaths: e.extra.inputs.flatMap((ref) => {
+        const cam = cameraByName.get(ref.name);
+        return cam ? [rawStreamName(cam)] : [];
+      }),
     });
   }
 
@@ -217,15 +217,10 @@ async function main() {
   // synchronously; the audio pump attaches once whisper warms up.
   const transcription = startTranscription(config, processes);
 
-  // Watchdog: restart any ffmpeg whose mediamtx output path stops
-  // receiving bytes. Catches stuck-but-alive ffmpegs that the supervisor
-  // can't see (it only restarts on process exit). ffmpegPath/baseUrl enable
-  // the content-freshness check that catches silently-frozen input branches
-  // (byte flow stays healthy, so this samples the actual pixels).
-  const watchdog = startWatchdog(watched, {
-    ffmpegPath: config.ffmpeg_path,
-    baseUrl: config.output.base_url,
-  });
+  // Watchdog: restart any ffmpeg whose mediamtx output path stops receiving
+  // bytes, OR whose input source reconnects (which wedges the read and freezes
+  // a composite half). Catches stuck-but-alive ffmpegs the supervisor can't see.
+  const watchdog = startWatchdog(watched);
 
   // Dashboard HTTP server (proxies mediamtx API + exposes /api/system +
   // /api/transcriptions + /api/transcription-stats from the in-process

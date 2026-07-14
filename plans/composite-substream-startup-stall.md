@@ -168,7 +168,35 @@ DECISION history:
     Real-world freeze auto-recovery will prove out the next time a foyer wedge occurs
     (should now self-heal in ~150-200s instead of hours/days). STATUS: fix complete.
 
+## FOLLOW-UP #3: the freeze is triggered by SOURCE RECONNECT (real fix)
+The content-freshness check (#2 above) NEVER fired in 46h despite a frozen foyer.
+Diagnosis on the live frozen stream revealed two things:
+
+1. TIMEZONE ERROR (mine): I briefly told the user raw/foyer was "7h stale". It was
+   NOT — the box runs on UTC, the cameras burn Pacific (PDT = UTC-7). raw/foyer
+   showing "12:08 PM" Pacific = current. raw/foyer is live and fine.
+2. The entry foyer was FROZEN at 07:56:35 AM Pacific = 14:56 UTC, which EXACTLY
+   matched raw/foyer's mediamtx `readyTime` (14:56:41 UTC). i.e. the foyer camera's
+   source dropped + reconnected at 07:56, and the entry ffmpeg's read of raw/foyer
+   wedged on that event (fps kept duplicating the last pre-reconnect frame).
+
+Why content-freshness missed it: the vstack seam (doorbell above, live) bleeds into
+the top cell-row of the foyer band, so the band never read as 100% pixel-static.
+The clock overlay sits at that same seam, so it can't be cleanly separated — the
+grid approach is fundamentally confounded here. Abandoned.
+
+REAL FIX (implemented, replaces the freshness check): watch each composite's INPUT
+mediamtx paths' `readyTime` (exposed by /v3/paths/list). When it changes, the source
+reconnected → restart that composite to re-establish a clean read. Reliable signal,
+no content analysis, no false positives, targets the actual trigger. Applied to the
+main compositor (raw/bay-1..5) and each extra composite (entry: raw/doorbell,
+raw/foyer). Reconnect logic + inputPaths derivation unit-verified before deploy.
+
 ## Things not to do
+- Don't try to content-detect a frozen vstack half via a coarse grid — the seam
+  bleed + clock-at-seam confound it (proven). Use the source-reconnect signal.
+- Don't compare camera burned-in timestamps to the box clock without accounting for
+  the box being UTC and cameras being Pacific (7h offset looks like a 7h "lag").
 - Don't chase the "reader is too slow" discards — they're caused by my own slow
   capture connections, not a real defect.
 - Don't lower writeQueueSize (512 caused real corruption earlier; 16384 is correct).
