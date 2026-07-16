@@ -75,16 +75,34 @@ const HwAccelSchema = z
 
 const StackDirectionSchema = z.enum(["vertical", "horizontal"]).default("vertical");
 
-const InputRefSchema = z.object({
-  name: z.string().describe("Camera name (must exist in top-level cameras list)"),
-  rotation: RotationSchema.optional().describe(
-    "Rotation override for this composite; falls back to the camera's own rotation"
-  ),
-  crop: CropSchema.optional().describe(
-    "Crop applied to this input BEFORE stacking. Percentages resolve against " +
-      "the source camera's post-rotation dimensions."
-  ),
-});
+const InputRefSchema = z
+  .object({
+    name: z
+      .string()
+      .optional()
+      .describe("Camera name (must exist in top-level cameras list)"),
+    stream: z
+      .string()
+      .optional()
+      .describe(
+        "Reference an already-produced stream (the main composite or a " +
+          "sub_stream name, e.g. 'the-field') instead of a camera. Reuses the " +
+          "encoded stream — much cheaper than re-decoding its source cameras."
+      ),
+    rotation: RotationSchema.optional().describe(
+      "Rotation override for this input; falls back to the camera's own " +
+        "rotation (cameras) or 0 (streams)"
+    ),
+    crop: CropSchema.optional().describe(
+      "Crop applied to this input BEFORE stacking (after this input's " +
+        "rotation). Percentages resolve against the source's post-rotation " +
+        "dimensions."
+    ),
+  })
+  .refine((r) => (r.name !== undefined) !== (r.stream !== undefined), {
+    message:
+      "Specify exactly one of 'name' (camera) or 'stream' (produced stream)",
+  });
 
 const ExtraCompositeSchema = z.object({
   name: z.string().describe("Output stream name (rtsp://host:8554/<name>)"),

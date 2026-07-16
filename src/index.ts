@@ -205,8 +205,11 @@ async function main() {
       process: proc,
       // Restart this composite when one of its input sources reconnects — that
       // reconnect is what wedges the read and freezes a half (e.g. foyer).
+      // Camera refs watch raw/<slug>; stream refs watch the produced stream's
+      // own path (so e.g. all-field restarts right after the main compositor).
       inputPaths: e.extra.inputs.flatMap((ref) => {
-        const cam = cameraByName.get(ref.name);
+        if (ref.stream !== undefined) return [ref.stream];
+        const cam = cameraByName.get(ref.name!);
         return cam ? [rawStreamName(cam)] : [];
       }),
     });

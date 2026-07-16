@@ -383,27 +383,8 @@ export function buildPipeline(
     subStreamSource = "split";
   }
 
-  // Compute composite dimensions (post-rotation, pre-scale) for percentage resolution
-  const firstCam = cameras[0]!;
-  const firstProbe = cameraProbes.get(firstCam.name)!;
-  const camRotated = rotatedDimensions(firstProbe.width, firstProbe.height, firstCam.rotation);
-  let compositeW: number, compositeH: number;
-  if (config.composite.direction === "vertical") {
-    compositeW = camRotated.width;
-    compositeH = cameras.reduce((sum, cam) => {
-      const p = cameraProbes.get(cam.name)!;
-      const r = rotatedDimensions(p.width, p.height, cam.rotation);
-      return sum + r.height;
-    }, 0);
-  } else {
-    compositeH = camRotated.height;
-    compositeW = cameras.reduce((sum, cam) => {
-      const p = cameraProbes.get(cam.name)!;
-      const r = rotatedDimensions(p.width, p.height, cam.rotation);
-      return sum + r.width;
-    }, 0);
-  }
-  const compRotated = rotatedDimensions(compositeW, compositeH, config.composite.rotation);
+  // Composite dimensions (post-rotation, pre-scale) for percentage resolution
+  const compRotated = mainCompositeDims(config, cameraProbes);
 
   for (let i = 0; i < config.sub_streams.length; i++) {
     const sub = config.sub_streams[i]!;
@@ -446,10 +427,72 @@ export function buildPipeline(
 }
 
 /**
+ * Dimensions of the main composite frame (post-rotation, PRE-scale) — the
+ * space sub_stream crop percentages resolve against.
+ */
+function mainCompositeDims(
+  config: Config,
+  cameraProbes: Map<string, ProbeResult>
+): { width: number; height: number } {
+  const cameras = config.cameras
+    .filter((c) => c.composite !== false)
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  const firstCam = cameras[0]!;
+  const firstProbe = cameraProbes.get(firstCam.name)!;
+  const camRotated = rotatedDimensions(
+    firstProbe.width,
+    firstProbe.height,
+    firstCam.rotation
+  );
+  let compositeW: number, compositeH: number;
+  if (config.composite.direction === "vertical") {
+    compositeW = camRotated.width;
+    compositeH = cameras.reduce((sum, cam) => {
+      const p = cameraProbes.get(cam.name)!;
+      const r = rotatedDimensions(p.width, p.height, cam.rotation);
+      return sum + r.height;
+    }, 0);
+  } else {
+    compositeH = camRotated.height;
+    compositeW = cameras.reduce((sum, cam) => {
+      const p = cameraProbes.get(cam.name)!;
+      const r = rotatedDimensions(p.width, p.height, cam.rotation);
+      return sum + r.width;
+    }, 0);
+  }
+  return rotatedDimensions(compositeW, compositeH, config.composite.rotation);
+}
+
+/**
+ * Output dimensions of a produced stream (the main composite or a sub_stream),
+ * derived from config + camera probes, so extra composites can reference one
+ * as an input without probing it live (it may not be publishing yet at build
+ * time — the extra composite and the main compositor start concurrently).
+ */
+function producedStreamDims(
+  config: Config,
+  cameraProbes: Map<string, ProbeResult>,
+  streamName: string
+): { width: number; height: number } | null {
+  const comp = mainCompositeDims(config, cameraProbes);
+  if (streamName === config.composite.name) {
+    return config.composite.scale ?? comp;
+  }
+  const sub = config.sub_streams.find((s) => s.name === streamName);
+  if (!sub) return null;
+  if (sub.scale) return { width: sub.scale.width, height: sub.scale.height };
+  const w = resolveDimension(sub.width, comp.width);
+  const h = resolveDimension(sub.height, comp.height);
+  return rotatedDimensions(w, h, sub.rotation);
+}
+
+/**
  * Build an FFmpeg pipeline for a single "extra" composite — a vstack or hstack
- * of an arbitrary subset of cameras, with optional per-input crop and
+ * of an arbitrary subset of inputs, with optional per-input crop and
  * post-stack rotation/scale. Produces a single output stream named
- * extra.name. Inputs are pulled from local mediamtx raw paths.
+ * extra.name. Inputs are cameras (pulled from local mediamtx raw paths) or
+ * already-produced streams (`stream:` refs, pulled from their own mediamtx
+ * path — reuses the encoded stream instead of re-decoding its sources).
  *
  * Inputs are auto-scaled to the FIRST input's stacking-axis dimension so
  * vstack/hstack doesn't reject mismatched widths/heights.
@@ -466,21 +509,55 @@ export function buildExtraCompositePipeline(
   const filters: string[] = [];
   const inputArgs: string[] = [];
 
-  // Resolve inputs against the top-level cameras list
+  // Produced streams are CFR at the composite rate (see PipelineOutput.fps);
+  // used as the fps for `stream:` inputs.
+  const compositeCams = config.cameras.filter((c) => c.composite !== false);
+  const compositeFps = compositeCams[0]
+    ? (cameraProbes.get(compositeCams[0].name)?.fps ?? 30)
+    : 30;
+
+  // Resolve each input to a mediamtx path + dimensions + rate. Cameras pull
+  // from raw/<slug> with probed dims; `stream:` refs pull the produced stream's
+  // own path with dims derived from config (it may not be publishing yet —
+  // this ffmpeg and the main compositor start concurrently).
   const resolved = extra.inputs.map((ref) => {
-    const cam = cameraByName.get(ref.name);
+    if (ref.stream !== undefined) {
+      const dims = producedStreamDims(config, cameraProbes, ref.stream);
+      if (!dims) {
+        throw new Error(
+          `extra_composite "${extra.name}" references unknown stream ` +
+            `"${ref.stream}" (must be the main composite or a sub_stream name)`
+        );
+      }
+      return {
+        ref,
+        path: ref.stream,
+        width: dims.width,
+        height: dims.height,
+        fps: compositeFps,
+        rotation: ref.rotation ?? ("0" as const),
+      };
+    }
+    const cam = cameraByName.get(ref.name!);
     if (!cam) {
       throw new Error(
         `extra_composite "${extra.name}" references unknown camera "${ref.name}"`
       );
     }
-    const probe = cameraProbes.get(ref.name);
+    const probe = cameraProbes.get(ref.name!);
     if (!probe) {
       throw new Error(
         `extra_composite "${extra.name}": no probe result for "${ref.name}"`
       );
     }
-    return { ref, cam, probe };
+    return {
+      ref,
+      path: rawStreamName(cam),
+      width: probe.width,
+      height: probe.height,
+      fps: probe.fps,
+      rotation: ref.rotation ?? cam.rotation,
+    };
   });
 
   // --- Inputs ---
@@ -494,8 +571,8 @@ export function buildExtraCompositePipeline(
   // (setpts=(RTCTIME-RTCSTART) below) — same approach as the main
   // compositor — so both inputs share a real-time grid that stays smooth
   // AND internally synced.
-  for (const { cam } of resolved) {
-    const sourceUrl = `${config.output.base_url}/${rawStreamName(cam)}`;
+  for (const { path } of resolved) {
+    const sourceUrl = `${config.output.base_url}/${path}`;
     inputArgs.push(
       ...hwaccelInputArgs(config.hwaccel),
       // Low-latency input (same rationale as the main compositor): read at
@@ -532,26 +609,26 @@ export function buildExtraCompositePipeline(
   const perInput: Resolved[] = [];
 
   for (let i = 0; i < resolved.length; i++) {
-    const { ref, cam, probe } = resolved[i]!;
+    const { ref, rotation } = resolved[i]!;
+    const input = resolved[i]!;
     // Real-time PTS after fps — see buildPipeline for the full rationale.
     // fps smooths bursty arrival; setpts=(RTCTIME-RTCSTART) stamps real
     // wall-clock time so the stacked regions pair by the same moment and
     // skew can't accumulate. Paired with -fflags nobuffer on the inputs.
     const fpsLabel = `[xc_fps_${i}]`;
     filters.push(
-      `[${i}:v]fps=${probe.fps},setpts=(RTCTIME-${baseline})/(TB*1000000)${fpsLabel}`
+      `[${i}:v]fps=${input.fps},setpts=(RTCTIME-${baseline})/(TB*1000000)${fpsLabel}`
     );
     let prev = fpsLabel;
 
-    // Rotation: input ref override > camera default
-    const rotation = ref.rotation ?? cam.rotation;
+    // Rotation: input ref override > camera default (0 for stream refs)
     const rots = rotationFilters(rotation);
     for (let r = 0; r < rots.length; r++) {
       const lbl = `[xc_rot_${i}_${r}]`;
       filters.push(`${prev}${rots[r]}${lbl}`);
       prev = lbl;
     }
-    const rotated = rotatedDimensions(probe.width, probe.height, rotation);
+    const rotated = rotatedDimensions(input.width, input.height, rotation);
     let w = rotated.width;
     let h = rotated.height;
 
@@ -637,7 +714,7 @@ export function buildExtraCompositePipeline(
       bufsizeOverride: extra.bufsize,
       // scale-to-match + post-stack scale strip framerate metadata; pin the CFR
       // target to the first input's rate (all inputs forced to it upstream).
-      fps: resolved[0]!.probe.fps,
+      fps: resolved[0]!.fps,
     },
   ];
   return { inputArgs, filterComplex, outputs };
