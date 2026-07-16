@@ -571,10 +571,17 @@ export function buildExtraCompositePipeline(
   // (setpts=(RTCTIME-RTCSTART) below) — same approach as the main
   // compositor — so both inputs share a real-time grid that stays smooth
   // AND internally synced.
-  for (const { path } of resolved) {
+  for (const { path, ref } of resolved) {
     const sourceUrl = `${config.output.base_url}/${path}`;
     inputArgs.push(
-      ...hwaccelInputArgs(config.hwaccel),
+      // Produced-stream (`stream:`) inputs decode on CPU, cameras on NVDEC.
+      // Adding stream inputs' NVDEC sessions starved the main compositor's
+      // 5-bay lockstep decode (its bay reads fell behind realtime → mediamtx
+      // "reader too slow" discards → gap-ridden input → filtergraph wedged
+      // permanently; observed live the moment all-field connected). The box
+      // has cores to spare — two software decodes are cheap; the main
+      // compositor's NVDEC budget is not.
+      ...(ref.stream !== undefined ? [] : hwaccelInputArgs(config.hwaccel)),
       // Low-latency input (same rationale as the main compositor): read at
       // the live edge so latency doesn't accumulate behind the latency-blind
       // setpts timeline.

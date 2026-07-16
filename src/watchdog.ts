@@ -165,33 +165,36 @@ export function startWatchdog(
         }
       }
 
-      let allStale = w.paths.length > 0;
-      let anyKnown = false;
+      // ANY output path stalled for stallMs triggers a restart — not all.
+      // The main compositor wedged with `full` still flowing while its three
+      // sub-stream outputs were dead for 30+ minutes; requiring ALL paths
+      // stale kept this watchdog blind to it. A publisher pushes bytes to a
+      // path regardless of readers, so a per-path stall is always a real
+      // publisher-side failure, never "nobody is watching".
       const stalledPaths: string[] = [];
       for (const path of w.paths) {
         const cur = byName.get(path);
-        if (!cur) continue;
-        anyKnown = true;
+        // Skip paths that have never received a byte: our output paths are
+        // statically declared in mediamtx, so they exist at 0 bytes before the
+        // publisher connects — treating that as a stall would false-restart
+        // slow-starting pipelines. Stall detection begins at first byte.
+        if (!cur || cur.bytesReceived === 0) continue;
         const key = `${i}:${path}`;
         let s = state.get(key);
         if (!s) {
           s = { lastBytes: cur.bytesReceived, lastChangeAt: now };
           state.set(key, s);
-          allStale = false;
           continue;
         }
         if (cur.bytesReceived !== s.lastBytes) {
           s.lastBytes = cur.bytesReceived;
           s.lastChangeAt = now;
-          allStale = false;
-        } else if (now - s.lastChangeAt < stallMs) {
-          allStale = false;
-        } else {
+        } else if (now - s.lastChangeAt >= stallMs) {
           stalledPaths.push(path);
         }
       }
 
-      if (anyKnown && allStale) {
+      if (stalledPaths.length > 0) {
         console.warn(
           `[watchdog] ${w.name}: no bytes on ${stalledPaths.join(", ")} for ${Math.round(
             stallMs / 1000
