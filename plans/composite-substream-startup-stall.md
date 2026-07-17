@@ -320,6 +320,37 @@ IMPLEMENTATION STEPS:
 3. Startup capability check (hard error).
 4. Deploy, verify latency (~1-2s), sync, quality, soak; revert bilinear config.
 
+## SHIPPED (2026-07-17/18): full-GPU pipeline LIVE
+All six streams run the GPU-resident pipeline in production:
+- NVDEC (cuda frames, shared device ctx) -> setparams color retag -> fps/setpts
+  -> transpose_npp rotation sandwiches -> overlay_cuda canvas assembly (crops =
+  negative offsets) -> scale_npp (lanczos) -> NVENC. ensureHwaccelWorks
+  smoke-tests the full GPU filter set at startup and refuses to run otherwise
+  (fired once in production when the probe itself was stale — worked as designed).
+- Custom ffmpeg n7.1.5 build (Dockerfile ffmpeg-builder stage): nonfree+libnpp+
+  cuda-nvcc sm_89; replaces BtbN download (also pins the version).
+- Verified live: all 6 streams exact dimensions, 3-way timestamp sync to the
+  SECOND (bays + field-centered all 02:44:44), ~3s end-to-end latency, 0
+  discards, GPU dec ~60%/enc ~58%, biggest ffmpeg at ~10-20% CPU (was 800%+).
+- Rehearsal throughput with -f null: main 5.08x realtime, entry 1.73x, af 2.83x.
+
+Hard-won build/graph rules (do not relearn):
+- overlay_cuda: nv12 only. transpose_npp: yuv420p only (sandwich with
+  scale_npp format conversions).
+- Mixed camera color metadata (pc/bt709 vs tv/smpte170m) makes FFmpeg 7.x
+  auto-insert a SOFTWARE converter that cannot touch CUDA frames -> retag all
+  branches AND canvases with setparams (metadata-only, matches old behavior).
+- Raw NVDEC output cannot feed overlay_cuda directly -> normalize through
+  scale_npp first.
+- scale_npp with identical dims+format is PASSTHROUGH -> canvas-pool padded
+  frames (32-align) reach NVENC and encode as green bars. Every output chain
+  must END in a filter doing real work; overlay-final outputs get
+  scale_npp=w=W:h=H:format=yuv420p (real conversion, exact fresh pool).
+- -hwaccel_device cu required so NVDEC shares the filter device context.
+KNOWN COSMETIC NIT: ~1-2px green hairline on right/bottom edges of
+canvas-assembled outputs (all-field; likely chroma-edge of the final
+conversion or canvas bleed). Not visible at viewing scale; fix someday.
+
 ## Things not to do
 - Don't try to content-detect a frozen vstack half via a coarse grid — the seam
   bleed + clock-at-seam confound it (proven). Use the source-reconnect signal.
