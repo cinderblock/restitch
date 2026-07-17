@@ -858,8 +858,11 @@ export async function ensureHwaccelWorks(config: Config): Promise<void> {
     "-f", "lavfi",
     "-i", "testsrc=duration=0.5:size=320x240:rate=10",
     "-filter_complex",
-    "[0:v]format=nv12,hwupload_cuda,scale_cuda=480:640:interp_algo=lanczos[cv];" +
-      "[1:v]format=nv12,hwupload_cuda,transpose_npp=dir=clock[rot];" +
+    // Mirrors the production recipe exactly: color retag, nv12 working format,
+    // transpose_npp sandwiched in scale_npp format conversions (it rejects
+    // nv12), canvas via scale_npp, negative-offset overlay crop.
+    `[0:v]format=nv12,${GPU_COLOR_RETAG},hwupload_cuda,scale_npp=w=480:h=640:format=nv12:interp_algo=lanczos[cv];` +
+      `[1:v]format=nv12,${GPU_COLOR_RETAG},hwupload_cuda,scale_npp=format=yuv420p,transpose_npp=dir=clock,scale_npp=format=nv12[rot];` +
       "[cv][rot]overlay_cuda=x=-8:y=16[out]",
     "-map", "[out]",
     "-frames:v", "3",
