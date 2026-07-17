@@ -43,6 +43,51 @@ RUN git clone --depth 1 --branch "${WHISPER_REF}" \
     cmake --build build -j --config Release --target whisper-server whisper-cli
 
 
+# --- builder: FFmpeg with CUDA filters + NPP (GPU transpose/scale) ---
+# The stock BtbN GPL build has scale_cuda/overlay_cuda but no GPU rotation:
+# transpose_npp needs NPP, which is nonfree and so absent from redistributable
+# builds. We compile our own — NVDEC/NVENC via ffnvcodec, CUDA filter kernels
+# via nvcc, NPP for transpose/scale — so the whole pixel path stays on the GPU
+# (user policy: GPU or error, never CPU fallback). nonfree is fine here: this
+# image is built and consumed locally on sentinel only (pull_policy: never),
+# never pushed to a registry.
+FROM nvidia/cuda:12.9.2-devel-ubuntu24.04 AS ffmpeg-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends \
+        build-essential git ca-certificates pkg-config yasm nasm && \
+    rm -rf /var/lib/apt/lists/*
+
+# ffnvcodec: dlopen-based NVENC/NVDEC headers (no libcuda link needed at
+# build time). n13.x needs driver >= 570; sentinel runs 595.
+ARG FFNVCODEC_REF=n13.0.19.0
+RUN git clone --depth 1 --branch "${FFNVCODEC_REF}" \
+        https://github.com/FFmpeg/nv-codec-headers.git /opt/nv-codec-headers && \
+    make -C /opt/nv-codec-headers install
+
+# Pinned source build (the BtbN download tracked 'latest', so the binary could
+# silently drift between image rebuilds — this pins it for good).
+ARG FFMPEG_REF=n7.1.5
+RUN git clone --depth 1 --branch "${FFMPEG_REF}" \
+        https://github.com/FFmpeg/FFmpeg.git /opt/ffmpeg-src
+# --nvccflags: ffmpeg's default nvcc gencode targets archs CUDA 12 dropped;
+# sm_89 = Ada (RTX 4090).
+RUN cd /opt/ffmpeg-src && \
+    ./configure \
+        --prefix=/opt/ffmpeg \
+        --disable-doc \
+        --disable-ffplay \
+        --enable-nonfree \
+        --enable-cuda-nvcc \
+        --enable-libnpp \
+        --nvccflags="-gencode arch=compute_89,code=sm_89 -O2" \
+        --extra-cflags=-I/usr/local/cuda/include \
+        --extra-ldflags=-L/usr/local/cuda/lib64 && \
+    make -j"$(nproc)" && \
+    make install
+
+
 # --- runtime ---
 FROM nvidia/cuda:12.9.2-runtime-ubuntu24.04
 
@@ -54,14 +99,11 @@ RUN apt-get update -qq && \
         iproute2 procps && \
     rm -rf /var/lib/apt/lists/*
 
-# FFmpeg with NVENC/NVDEC support. BtbN's static GPL build bundles all the
-# codecs we need (matches the existing native install script).
-ARG FFMPEG_BUILD=ffmpeg-n7.1-latest-linux64-gpl-7.1
-RUN curl -fsSL "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/${FFMPEG_BUILD}.tar.xz" \
-    | tar -xJ -C /tmp && \
-    install -m 0755 "/tmp/${FFMPEG_BUILD}/bin/ffmpeg"  /usr/local/bin/ffmpeg && \
-    install -m 0755 "/tmp/${FFMPEG_BUILD}/bin/ffprobe" /usr/local/bin/ffprobe && \
-    rm -rf "/tmp/${FFMPEG_BUILD}"
+# FFmpeg from our own CUDA+NPP build (see ffmpeg-builder above). The binary
+# static-links its libav* and dynamically links libnpp*/cudart, which the
+# nvidia/cuda runtime image ships.
+COPY --from=ffmpeg-builder /opt/ffmpeg/bin/ffmpeg  /usr/local/bin/ffmpeg
+COPY --from=ffmpeg-builder /opt/ffmpeg/bin/ffprobe /usr/local/bin/ffprobe
 
 # mediamtx (RTSP/WebRTC/HLS + control API). Version pinned via ARG so the
 # build script can override from versions.json.

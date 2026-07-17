@@ -38,6 +38,81 @@ function rotationFilters(rotation: string): string[] {
   }
 }
 
+// --- GPU filtergraph primitives -------------------------------------------
+// The whole pixel path runs on the GPU in CUDA frames (user policy: GPU or
+// error). Empirically validated format rules for this ffmpeg build (NPP):
+//   * overlay_cuda accepts nv12 ONLY  → the graph's working format is nv12
+//   * transpose_npp accepts yuv420p ONLY → rotations are sandwiched between
+//     GPU-side scale_npp format conversions (nv12→yuv420p→rotate→nv12)
+//   * scale_npp handles both formats and does scaling + format conversion
+// Structural building blocks:
+//   * canvas: a color source (16x16, uploaded once per frame — trivially
+//     small) scaled up ON the GPU to the target size; stacking = chained
+//     overlay_cuda placements onto it
+//   * crop: overlay the source at NEGATIVE offsets onto an output-sized
+//     canvas; out-of-canvas pixels clip away (no crop filter exists in CUDA)
+
+/**
+ * Uniform color metadata retag for every branch that meets overlay_cuda.
+ * FFmpeg 7.x negotiates colorspace/range per filter link; the cameras disagree
+ * (bays/foyer: yuvj420p pc + bt709, doorbell: tv + smpte170m/bt470bg), and on
+ * a mismatch ffmpeg auto-inserts a SOFTWARE converter — which cannot touch
+ * CUDA frames, killing the whole graph ("Impossible to convert between the
+ * formats..."). setparams is metadata-only (no pixel math), which matches the
+ * old CPU pipeline's behavior: it never colorspace-converted either, it just
+ * tagged the output tv and composited the bytes as-is.
+ */
+const GPU_COLOR_RETAG =
+  "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709";
+
+/** Map config scale_flags (swscale names) to NPP interpolation algorithms. */
+function gpuInterp(scaleFlags: string): string {
+  const map: Record<string, string> = {
+    lanczos: "lanczos",
+    bilinear: "linear",
+    fast_bilinear: "linear",
+    bicubic: "cubic",
+    area: "super",
+    neighbor: "nn",
+  };
+  return map[scaleFlags] ?? "lanczos";
+}
+
+/** GPU rotation: nv12 in → nv12 out via the transpose_npp yuv420p sandwich. */
+function gpuRotationChain(rotation: string): string[] {
+  const dirs: Record<string, string[]> = {
+    "90": ["clock"],
+    "180": ["clock", "clock"],
+    "270": ["cclock"],
+  };
+  const t = dirs[rotation];
+  if (!t) return [];
+  return [
+    "scale_npp=format=yuv420p",
+    ...t.map((d) => `transpose_npp=dir=${d}`),
+    "scale_npp=format=nv12",
+  ];
+}
+
+/**
+ * Emit a GPU canvas source: a black nv12 frame of the given size living on
+ * the CUDA device, stamped with the same wallclock setpts expression as the
+ * camera inputs so overlay_cuda pairs frames on one timeline.
+ */
+function gpuCanvas(
+  label: string,
+  width: number,
+  height: number,
+  fps: number,
+  baseline: number
+): string {
+  return (
+    `color=black:size=16x16:rate=${fps},format=nv12,${GPU_COLOR_RETAG},` +
+    `setpts=(RTCTIME-${baseline})/(TB*1000000),` +
+    `hwupload_cuda,scale_npp=w=${width}:h=${height}:format=nv12${label}`
+  );
+}
+
 /**
  * Resolve a dimension value that may be a pixel count or a percentage string.
  * Percentages are resolved against the given reference size and rounded to
@@ -125,7 +200,10 @@ function encoderArgs(
     const gop = Math.max(1, Math.round(encoder.keyframe_interval_seconds * 30));
     args.push("-g", String(gop));
     args.push("-keyint_min", String(gop));
-    args.push("-pix_fmt", encoder.pixel_format);
+    // NOTE: no -pix_fmt here. The filtergraph hands NVENC CUDA frames whose
+    // underlying format is nv12 (the GPU graph's working format); forcing
+    // encoder.pixel_format would make ffmpeg try to insert a software format
+    // conversion, which cannot touch GPU frames and breaks the graph.
     // Force limited (TV) range output. Without this NVENC inherits the
     // full-range flag from UniFi's H.264 VUI, encodes as yuvj420p, and
     // strict players (VLC's H.264 path) refuse to load the result.
@@ -266,9 +344,18 @@ export function buildPipeline(
     );
   }
 
-  // --- Per-camera fps normalization + rotation ---
-  // Force all inputs to the same constant framerate so vstack can align them.
-  const rotatedLabels: string[] = [];
+  // Composite frame rate: every input is forced to its probe rate upstream,
+  // so the composite runs at the first camera's rate.
+  const compositeFps = cameraProbes.get(cameras[0]!.name)!.fps;
+  const interp = gpuInterp(config.encoder.scale_flags);
+
+  // --- Per-camera fps normalization + GPU rotation ---
+  // fps=N paces bursty arrival; setpts re-stamps with REAL elapsed wall-clock
+  // time so all inputs (and the canvas) share one timeline — that's what keeps
+  // the stacked cameras internally synced and self-healing. Rotation happens
+  // on the GPU (transpose_npp sandwich, see gpuRotationChain).
+  const readyLabels: string[] = [];
+  const readyDims: { width: number; height: number }[] = [];
   for (let i = 0; i < cameras.length; i++) {
     const cam = cameras[i]!;
     const probe = cameraProbes.get(cam.name);
@@ -277,152 +364,115 @@ export function buildPipeline(
         `No probe result for camera "${cam.name}". Run probe first.`
       );
     }
-
-    // fps=N forces CFR (smoothing out bursty/jittery arrival), then
-    // setpts re-stamps each frame with REAL elapsed wall-clock time
-    // (RTCTIME-RTCSTART). Two reasons over frame-index PTS (N/fps/TB):
-    //   1. Real-time stamps self-heal — a dropped/stalled input doesn't
-    //      permanently shift its frame mapping, so cross-input skew can't
-    //      accumulate over hours.
-    //   2. Stamping AFTER fps (which already smoothed the arrival bursts)
-    //      avoids the 1fps collapse that demux-side -use_wallclock_as_-
-    //      timestamps caused.
-    // Combined with -fflags nobuffer on the inputs (jump to live, skip the
-    // stale buffered GOP) all inputs reference near-identical start points,
-    // keeping the composite internally in sync.
-    const fpsLabel = `[fps_${i}]`;
-    filters.push(
-      `[${i}:v]fps=${probe.fps},setpts=(RTCTIME-${baseline})/(TB*1000000)${fpsLabel}`
-    );
-
-    const rots = rotationFilters(cam.rotation);
-    if (rots.length > 0) {
-      let prev = fpsLabel;
-      for (let r = 0; r < rots.length; r++) {
-        const label = `[rot_${i}_${r}]`;
-        filters.push(`${prev}${rots[r]}${label}`);
-        prev = label;
-      }
-      rotatedLabels.push(prev);
-    } else {
-      rotatedLabels.push(fpsLabel);
-    }
+    // Every branch must pass through an NPP filter before meeting
+    // overlay_cuda: raw NVDEC output feeding overlay directly fails format
+    // negotiation (ffmpeg tries to auto-insert a software scaler, which
+    // cannot touch GPU frames). The rotation sandwich already ends in
+    // scale_npp=format=nv12; unrotated branches get an explicit normalizer.
+    const rot = gpuRotationChain(cam.rotation);
+    const chain = [
+      GPU_COLOR_RETAG,
+      `fps=${probe.fps}`,
+      `setpts=(RTCTIME-${baseline})/(TB*1000000)`,
+      ...(rot.length > 0 ? rot : ["scale_npp=format=nv12"]),
+    ];
+    filters.push(`[${i}:v]${chain.join(",")}[in_${i}]`);
+    readyLabels.push(`[in_${i}]`);
+    readyDims.push(rotatedDimensions(probe.width, probe.height, cam.rotation));
   }
 
-  // --- Stack ---
-  const stackInputs = rotatedLabels.join("");
-  const stackFilter =
-    config.composite.direction === "vertical" ? "vstack" : "hstack";
-  const stackLabel = "[stacked]";
-  filters.push(
-    `${stackInputs}${stackFilter}=inputs=${cameras.length}${stackLabel}`
-  );
-
-  // --- Composite rotation ---
-  let compositeLabel = stackLabel;
-  const compRots = rotationFilters(config.composite.rotation);
-  for (let r = 0; r < compRots.length; r++) {
-    const label = `[comp_rot_${r}]`;
-    filters.push(`${compositeLabel}${compRots[r]}${label}`);
-    compositeLabel = label;
+  // --- Stack: GPU canvas + chained overlay_cuda placements ---
+  const vertical = config.composite.direction === "vertical";
+  const stackW = vertical
+    ? readyDims[0]!.width
+    : readyDims.reduce((s, d) => s + d.width, 0);
+  const stackH = vertical
+    ? readyDims.reduce((s, d) => s + d.height, 0)
+    : readyDims[0]!.height;
+  filters.push(gpuCanvas("[stack_cv]", stackW, stackH, compositeFps, baseline));
+  let prev = "[stack_cv]";
+  let off = 0;
+  for (let i = 0; i < cameras.length; i++) {
+    const label = i === cameras.length - 1 ? "[stacked]" : `[st_${i}]`;
+    const x = vertical ? 0 : off;
+    const y = vertical ? off : 0;
+    filters.push(`${prev}${readyLabels[i]}overlay_cuda=x=${x}:y=${y}${label}`);
+    off += vertical ? readyDims[i]!.height : readyDims[i]!.width;
+    prev = label;
   }
 
-  // --- Composite scale (optional) ---
-  if (config.composite.scale) {
-    const scaleLabel = "[comp_scaled]";
-    filters.push(
-      `${compositeLabel}scale=${config.composite.scale.width}:${config.composite.scale.height}:flags=${config.encoder.scale_flags}${scaleLabel}`
-    );
-    compositeLabel = scaleLabel;
-  }
-
-  // Composite frame rate: every composite input was forced to its own probe fps
-  // upstream (fps=N), and vstack requires them equal, so the stacked composite
-  // runs at the first composite camera's rate. Carry it onto every output as the
-  // CFR target (see PipelineOutput.fps).
-  const compositeFps = cameraProbes.get(cameras[0]!.name)!.fps;
-
-  const outputs: PipelineOutput[] = [
-    { name: config.composite.name, mapLabel: compositeLabel, fps: compositeFps },
-  ];
-
-  // --- Sub-streams (crop from pre-scale composite) ---
-  // Sub-streams crop from the stacked+rotated composite BEFORE any composite scale,
-  // so they get native resolution crops. We branch off from the post-rotation label.
-  const preScaleLabel =
-    compRots.length > 0
-      ? `[comp_rot_${compRots.length - 1}]`
-      : stackLabel;
-
-  // If we have sub-streams AND a composite scale, we need to split the pre-scale
-  // output so it can feed both the scaler and the crop filters.
-  let subStreamSource = preScaleLabel;
-  if (config.sub_streams.length > 0 && config.composite.scale) {
-    // Rebuild: remove the scale filter we just added and replace with split
-    const scaleFilter = filters.pop()!; // remove scale
-    const splitCount = config.sub_streams.length + 1;
-    const splitOutputs = Array.from(
-      { length: splitCount },
-      (_, i) => `[split_${i}]`
-    );
-    filters.push(
-      `${preScaleLabel}split=${splitCount}${splitOutputs.join("")}`
-    );
-    // Re-add scale on split_0
-    const scalePart = scaleFilter
-      .replace(preScaleLabel, "[split_0]");
-    filters.push(scalePart);
-    // Update composite output to use scaled
-    outputs[0]!.mapLabel = "[comp_scaled]";
-    subStreamSource = "split"; // marker
-  } else if (config.sub_streams.length > 0 && !config.composite.scale) {
-    // Need to split the composite for sub-streams + main output
-    const splitCount = config.sub_streams.length + 1;
-    const splitOutputs = Array.from(
-      { length: splitCount },
-      (_, i) => `[split_${i}]`
-    );
-    filters.push(
-      `${compositeLabel}split=${splitCount}${splitOutputs.join("")}`
-    );
-    outputs[0]!.mapLabel = "[split_0]";
-    subStreamSource = "split";
+  // --- Composite rotation (GPU) ---
+  let compositeLabel = "[stacked]";
+  const compRotChain = gpuRotationChain(config.composite.rotation);
+  if (compRotChain.length > 0) {
+    filters.push(`${compositeLabel}${compRotChain.join(",")}[comp_rot]`);
+    compositeLabel = "[comp_rot]";
   }
 
   // Composite dimensions (post-rotation, pre-scale) for percentage resolution
   const compRotated = mainCompositeDims(config, cameraProbes);
 
+  const outputs: PipelineOutput[] = [
+    { name: config.composite.name, mapLabel: compositeLabel, fps: compositeFps },
+  ];
+
+  // --- Split the (pre-scale) composite for the main output + sub-streams ---
+  const splitCount = config.sub_streams.length + 1;
+  if (splitCount > 1 || config.composite.scale) {
+    const splitOutputs = Array.from(
+      { length: splitCount },
+      (_, i) => `[split_${i}]`
+    );
+    filters.push(`${compositeLabel}split=${splitCount}${splitOutputs.join("")}`);
+    outputs[0]!.mapLabel = "[split_0]";
+    if (config.composite.scale) {
+      filters.push(
+        `[split_0]scale_npp=w=${config.composite.scale.width}:h=${config.composite.scale.height}:` +
+          `interp_algo=${interp}:format=nv12[comp_scaled]`
+      );
+      outputs[0]!.mapLabel = "[comp_scaled]";
+    }
+  }
+
+  // --- Sub-streams: GPU crop (negative overlay) + rotation + scale ---
   for (let i = 0; i < config.sub_streams.length; i++) {
     const sub = config.sub_streams[i]!;
-    const srcLabel =
-      subStreamSource === "split"
-        ? `[split_${i + 1}]`
-        : compositeLabel;
-    const cropLabel = `[sub_${i}]`;
     const cropX = resolveDimension(sub.x, compRotated.width);
     const cropY = resolveDimension(sub.y, compRotated.height);
     const cropW = resolveDimension(sub.width, compRotated.width);
     const cropH = resolveDimension(sub.height, compRotated.height);
-    const subRotFilters = rotationFilters(sub.rotation);
-    let cropFilter = `${srcLabel}crop=${cropW}:${cropH}:${cropX}:${cropY}`;
 
-    if (subRotFilters.length > 0) {
-      cropFilter += `,${subRotFilters.join(",")}`;
-    }
+    // Crop = place the composite at negative offsets on a crop-sized canvas;
+    // everything outside the canvas clips away.
+    filters.push(gpuCanvas(`[sub_cv_${i}]`, cropW, cropH, compositeFps, baseline));
+    let cur = `[sub_crop_${i}]`;
+    filters.push(
+      `[sub_cv_${i}][split_${i + 1}]overlay_cuda=x=${-cropX}:y=${-cropY}${cur}`
+    );
 
+    const post: string[] = [...gpuRotationChain(sub.rotation)];
     if (sub.scale) {
-      cropFilter += `,scale=${sub.scale.width}:${sub.scale.height}:flags=${config.encoder.scale_flags}`;
+      post.push(
+        `scale_npp=w=${sub.scale.width}:h=${sub.scale.height}:interp_algo=${interp}:format=nv12`
+      );
+    }
+    const outLabel = `[sub_${i}]`;
+    if (post.length > 0) {
+      filters.push(`${cur}${post.join(",")}${outLabel}`);
+      cur = outLabel;
+    } else {
+      // No rotation/scale: the crop label IS the output label.
+      cur = `[sub_crop_${i}]`;
     }
 
-    filters.push(`${cropFilter}${cropLabel}`);
     outputs.push({
       name: sub.name,
-      mapLabel: cropLabel,
+      mapLabel: cur,
       codecOverride: sub.codec,
       maxrateOverride: sub.maxrate,
       bufsizeOverride: sub.bufsize,
-      // crop/scale/transpose above strip the framerate metadata — set the CFR
-      // target explicitly so the encoder doesn't fall back to 25fps.
+      // Filters strip framerate metadata — carry the rate for -fps_mode vfr
+      // gating on the output (see buildCommand).
       fps: compositeFps,
     });
   }
@@ -577,17 +627,14 @@ export function buildExtraCompositePipeline(
   // (setpts=(RTCTIME-RTCSTART) below) — same approach as the main
   // compositor — so both inputs share a real-time grid that stays smooth
   // AND internally synced.
-  for (const { path, ref } of resolved) {
+  for (const { path } of resolved) {
     const sourceUrl = `${config.output.base_url}/${path}`;
     inputArgs.push(
-      // Produced-stream (`stream:`) inputs decode on CPU, cameras on NVDEC.
-      // Adding stream inputs' NVDEC sessions starved the main compositor's
-      // 5-bay lockstep decode (its bay reads fell behind realtime → mediamtx
-      // "reader too slow" discards → gap-ridden input → filtergraph wedged
-      // permanently; observed live the moment all-field connected). The box
-      // has cores to spare — two software decodes are cheap; the main
-      // compositor's NVDEC budget is not.
-      ...(ref.stream !== undefined ? [] : hwaccelInputArgs(config.hwaccel)),
+      // ALL inputs decode on the GPU — including produced-stream (`stream:`)
+      // refs. (An earlier CPU-decode exception here was misattributed blame:
+      // the compositor wedge it tried to avoid was actually the NVENC budget
+      // overrun + CFR dup spiral, both since fixed. User policy: GPU or error.)
+      ...hwaccelInputArgs(config.hwaccel),
       // Low-latency input (same rationale as the main compositor): read at
       // the live edge so latency doesn't accumulate behind the latency-blind
       // setpts timeline.
@@ -610,10 +657,10 @@ export function buildExtraCompositePipeline(
     );
   }
 
-  // --- Per-input fps / rotation / crop / scale ---
-  // For each input we want: fps norm → rotate → crop → (later) scale-to-first
-  // First pass compute post-rotation, post-crop dimensions for each input so
-  // we can auto-scale them all to match in the stacking axis.
+  // --- Per-input fps / GPU rotation / GPU crop, then scale-to-match ---
+  // GPU graph (see buildPipeline): rotation = transpose_npp sandwich; crop =
+  // negative-offset overlay_cuda onto a crop-sized canvas; scaling = scale_npp.
+  const interp = gpuInterp(config.encoder.scale_flags);
   type Resolved = {
     label: string; // output label for this input after fps+rotate+crop
     width: number;
@@ -625,35 +672,39 @@ export function buildExtraCompositePipeline(
     const { ref, rotation } = resolved[i]!;
     const input = resolved[i]!;
     // Real-time PTS after fps — see buildPipeline for the full rationale.
-    // fps smooths bursty arrival; setpts=(RTCTIME-RTCSTART) stamps real
-    // wall-clock time so the stacked regions pair by the same moment and
-    // skew can't accumulate. Paired with -fflags nobuffer on the inputs.
-    const fpsLabel = `[xc_fps_${i}]`;
-    filters.push(
-      `[${i}:v]fps=${input.fps},setpts=(RTCTIME-${baseline})/(TB*1000000)${fpsLabel}`
-    );
-    let prev = fpsLabel;
+    // Unrotated branches get the scale_npp format normalizer (see
+    // buildPipeline: raw NVDEC → overlay_cuda fails format negotiation).
+    const rot = gpuRotationChain(rotation);
+    const chain = [
+      GPU_COLOR_RETAG,
+      `fps=${input.fps}`,
+      `setpts=(RTCTIME-${baseline})/(TB*1000000)`,
+      ...(rot.length > 0 ? rot : ["scale_npp=format=nv12"]),
+    ];
+    let prev = `[xc_in_${i}]`;
+    filters.push(`[${i}:v]${chain.join(",")}${prev}`);
 
-    // Rotation: input ref override > camera default (0 for stream refs)
-    const rots = rotationFilters(rotation);
-    for (let r = 0; r < rots.length; r++) {
-      const lbl = `[xc_rot_${i}_${r}]`;
-      filters.push(`${prev}${rots[r]}${lbl}`);
-      prev = lbl;
-    }
     const rotated = rotatedDimensions(input.width, input.height, rotation);
     let w = rotated.width;
     let h = rotated.height;
 
-    // Optional crop (percentages resolve against post-rotation dimensions)
+    // Optional crop (percentages resolve against post-rotation dimensions):
+    // place at negative offsets on a crop-sized GPU canvas.
     if (ref.crop) {
       const cx = resolveDimension(ref.crop.x, w);
       const cy = resolveDimension(ref.crop.y, h);
       const cw = resolveDimension(ref.crop.width, w);
       const ch = resolveDimension(ref.crop.height, h);
-      const cropLbl = `[xc_crop_${i}]`;
-      filters.push(`${prev}crop=${cw}:${ch}:${cx}:${cy}${cropLbl}`);
-      prev = cropLbl;
+      filters.push(gpuCanvas(`[xc_ccv_${i}]`, cw, ch, input.fps, baseline));
+      filters.push(
+        `[xc_ccv_${i}]${prev}overlay_cuda=x=${-cx}:y=${-cy}[xc_crop_${i}]`
+      );
+      // Re-normalize after the crop overlay: an overlay_cuda output feeding
+      // another overlay's second pad fails format negotiation; routing it
+      // through scale_npp pins the link to nv12.
+      const normLbl = `[xc_cn_${i}]`;
+      filters.push(`[xc_crop_${i}]scale_npp=format=nv12${normLbl}`);
+      prev = normLbl;
       w = cw;
       h = ch;
     }
@@ -661,60 +712,71 @@ export function buildExtraCompositePipeline(
     perInput.push({ label: prev, width: w, height: h });
   }
 
-  // --- Auto-scale to first input's stacking-axis dimension ---
+  // --- Scale mismatched inputs to the first input's stacking-axis dimension ---
   const referenceWidth = perInput[0]!.width;
   const referenceHeight = perInput[0]!.height;
-  const stackLabels: string[] = [];
+  const stackPieces: { label: string; width: number; height: number }[] = [];
 
   for (let i = 0; i < perInput.length; i++) {
     const r = perInput[i]!;
-    let lbl = r.label;
-    let needScale = false;
-    let targetW = r.width;
-    let targetH = r.height;
-    if (extra.direction === "vertical" && r.width !== referenceWidth) {
-      needScale = true;
-      targetW = referenceWidth;
-      // Preserve aspect ratio (-2 = compute even integer)
-      targetH = -2;
-    } else if (extra.direction === "horizontal" && r.height !== referenceHeight) {
-      needScale = true;
-      targetH = referenceHeight;
-      targetW = -2;
-    }
-    if (needScale) {
-      const scaleLbl = `[xc_scale_${i}]`;
+    let { label, width, height } = r;
+    // scale_npp has no -2 auto-dimension; compute the even aspect-preserving
+    // size explicitly.
+    if (extra.direction === "vertical" && width !== referenceWidth) {
+      const target = Math.round((height * referenceWidth) / width / 2) * 2;
       filters.push(
-        `${lbl}scale=${targetW}:${targetH}:flags=${config.encoder.scale_flags}${scaleLbl}`
+        `${label}scale_npp=w=${referenceWidth}:h=${target}:interp_algo=${interp}:format=nv12[xc_scale_${i}]`
       );
-      lbl = scaleLbl;
+      label = `[xc_scale_${i}]`;
+      width = referenceWidth;
+      height = target;
+    } else if (extra.direction === "horizontal" && height !== referenceHeight) {
+      const target = Math.round((width * referenceHeight) / height / 2) * 2;
+      filters.push(
+        `${label}scale_npp=w=${target}:h=${referenceHeight}:interp_algo=${interp}:format=nv12[xc_scale_${i}]`
+      );
+      label = `[xc_scale_${i}]`;
+      width = target;
+      height = referenceHeight;
     }
-    stackLabels.push(lbl);
+    stackPieces.push({ label, width, height });
   }
 
-  // --- Stack ---
-  const stackFilter = extra.direction === "vertical" ? "vstack" : "hstack";
-  const stackedLbl = `[xc_stacked]`;
-  filters.push(
-    `${stackLabels.join("")}${stackFilter}=inputs=${perInput.length}${stackedLbl}`
-  );
-
-  // --- Post-stack rotation ---
-  let outLbl = stackedLbl;
-  const postRot = rotationFilters(extra.rotation);
-  for (let r = 0; r < postRot.length; r++) {
-    const lbl = `[xc_post_rot_${r}]`;
-    filters.push(`${outLbl}${postRot[r]}${lbl}`);
-    outLbl = lbl;
-  }
-
-  // --- Optional post-stack scale ---
-  if (extra.scale) {
-    const lbl = `[xc_scaled]`;
+  // --- Stack: GPU canvas + chained overlay_cuda ---
+  const xcVertical = extra.direction === "vertical";
+  const xcW = xcVertical
+    ? stackPieces[0]!.width
+    : stackPieces.reduce((s, p) => s + p.width, 0);
+  const xcH = xcVertical
+    ? stackPieces.reduce((s, p) => s + p.height, 0)
+    : stackPieces[0]!.height;
+  filters.push(gpuCanvas("[xc_cv]", xcW, xcH, resolved[0]!.fps, baseline));
+  let outLbl = "[xc_cv]";
+  let xcOff = 0;
+  for (let i = 0; i < stackPieces.length; i++) {
+    const lbl = `[xc_st_${i}]`;
+    const x = xcVertical ? 0 : xcOff;
+    const y = xcVertical ? xcOff : 0;
     filters.push(
-      `${outLbl}scale=${extra.scale.width}:${extra.scale.height}:flags=${config.encoder.scale_flags}${lbl}`
+      `${outLbl}${stackPieces[i]!.label}overlay_cuda=x=${x}:y=${y}${lbl}`
     );
+    xcOff += xcVertical ? stackPieces[i]!.height : stackPieces[i]!.width;
     outLbl = lbl;
+  }
+
+  // --- Post-stack rotation (GPU) ---
+  const postRot = gpuRotationChain(extra.rotation);
+  if (postRot.length > 0) {
+    filters.push(`${outLbl}${postRot.join(",")}[xc_post_rot]`);
+    outLbl = "[xc_post_rot]";
+  }
+
+  // --- Optional post-stack scale (GPU) ---
+  if (extra.scale) {
+    filters.push(
+      `${outLbl}scale_npp=w=${extra.scale.width}:h=${extra.scale.height}:interp_algo=${interp}:format=nv12[xc_scaled]`
+    );
+    outLbl = "[xc_scaled]";
   }
 
   const filterComplex = filters.join(";\n");
@@ -734,30 +796,29 @@ export function buildExtraCompositePipeline(
 }
 
 function hwaccelInputArgs(hwaccel: string): string[] {
-  // hwaccel_output_format picks the pixel format the hw decoder delivers
-  // to the software filter chain. We use the GPU's NATIVE CPU layout:
+  // GPU-resident decode (user policy: the whole pixel path runs on the GPU;
+  // GPU failure = loud error, never CPU fallback).
   //
-  //   NVDEC → nv12  (interleaved UV plane)
-  //   VAAPI → nv12  (native)
-  //   QSV   → nv12  (native)
+  // nvenc: `-hwaccel_output_format cuda` keeps decoded frames in GPU memory
+  // (underlying format nv12) — no PCIe download. `-hwaccel_device cu` pins the
+  // decoder to the SAME named CUDA context the filters use; without it NVDEC
+  // creates its own context and overlay_cuda/scale_npp refuse to mix frames
+  // across devices ("Error reinitializing filters" on the first real frame).
   //
-  // ffmpeg auto-converts to yuv420p (or whatever -pix_fmt the encoder
-  // wants) right before encode. The vstack/crop/scale/transpose filters
-  // along the way all handle nv12 natively, so we avoid the lossy /
-  // green-frames bug we hit when claiming "yuv420p" while the bytes
-  // were actually nv12.
-  //
-  // Per-frame NVDEC failures (cuvid sometimes rejects odd RTSP packets)
-  // still fall back to software for that frame without breaking the
-  // filter chain. CATASTROPHIC failure (driver missing, container
-  // misconfigured) is surfaced at startup by ensureHwaccelWorks().
+  // Catastrophic GPU failure (driver missing, container misconfigured, filter
+  // set absent) is surfaced at startup by ensureHwaccelWorks() — the process
+  // refuses to run rather than degrade to CPU.
   switch (hwaccel) {
     case "vaapi":
       return ["-hwaccel", "vaapi", "-hwaccel_output_format", "nv12"];
     case "qsv":
       return ["-hwaccel", "qsv", "-hwaccel_output_format", "nv12"];
     case "nvenc":
-      return ["-hwaccel", "cuda", "-hwaccel_output_format", "nv12"];
+      return [
+        "-hwaccel", "cuda",
+        "-hwaccel_device", "cu",
+        "-hwaccel_output_format", "cuda",
+      ];
     default:
       return [];
   }
@@ -775,15 +836,34 @@ export async function ensureHwaccelWorks(config: Config): Promise<void> {
     // For vaapi/qsv we don't have a probe set up; trust the config.
     return;
   }
+  // Fail-fast policy (user directive): the entire pixel path — decode, filter,
+  // scale, rotate, composite, encode — runs on the GPU. If ANY piece is
+  // missing or broken, refuse to start with a clear error. Never fall back to
+  // CPU filtering: a CPU "fallback" that can't keep up degrades silently
+  // (latency creep, frozen composite halves) instead of failing loudly.
+  //
+  // The smoke graph exercises every GPU primitive the pipeline builders emit:
+  //   hwupload_cuda + scale_cuda  (canvas creation + scaling)
+  //   transpose_npp               (rotation — needs our NPP-enabled ffmpeg)
+  //   overlay_cuda                (stacking + negative-offset cropping)
+  //   hevc_nvenc                  (encode from CUDA frames)
   const cmd = [
     config.ffmpeg_path,
     "-loglevel", "error",
     "-hide_banner",
-    "-hwaccel", "cuda",
+    "-init_hw_device", "cuda=smoke",
+    "-filter_hw_device", "smoke",
     "-f", "lavfi",
-    "-i", "testsrc=duration=0.1:size=320x240:rate=10",
-    "-c:v", "hevc_nvenc",
+    "-i", "color=black:size=64x64:rate=10",
+    "-f", "lavfi",
+    "-i", "testsrc=duration=0.5:size=320x240:rate=10",
+    "-filter_complex",
+    "[0:v]format=nv12,hwupload_cuda,scale_cuda=480:640:interp_algo=lanczos[cv];" +
+      "[1:v]format=nv12,hwupload_cuda,transpose_npp=dir=clock[rot];" +
+      "[cv][rot]overlay_cuda=x=-8:y=16[out]",
+    "-map", "[out]",
     "-frames:v", "3",
+    "-c:v", "hevc_nvenc",
     "-f", "null",
     "-",
   ];
@@ -792,10 +872,12 @@ export async function ensureHwaccelWorks(config: Config): Promise<void> {
   const code = await proc.exited;
   if (code !== 0) {
     throw new Error(
-      `hwaccel=${config.hwaccel} requested but CUDA / NVENC probe failed (exit ${code}).\n` +
+      `hwaccel=${config.hwaccel}: GPU pipeline probe FAILED (exit ${code}) — refusing to start.\n` +
+        `The pixel path must run fully on the GPU (decode/scale/rotate/composite/encode).\n` +
+        `A missing piece usually means the ffmpeg build lacks NPP/CUDA filters ` +
+        `(transpose_npp, scale_cuda, overlay_cuda) or the NVIDIA runtime is not mounted.\n` +
         `Probe command: ${cmd.join(" ")}\n` +
-        `stderr:\n${stderr}\n` +
-        `Set hwaccel: none in config.yaml to opt into CPU decode if this is intentional.`
+        `stderr:\n${stderr}`
     );
   }
 }
@@ -809,6 +891,14 @@ export function buildCommand(config: Config, pipeline: Pipeline): string[] {
   // Global options
   cmd.push("-loglevel", config.log_level);
   cmd.push("-y");
+
+  // One named CUDA context shared by the decoders (-hwaccel_device cu) and
+  // the filtergraph (-filter_hw_device cu). Without a shared context,
+  // overlay_cuda/scale_npp reject frames from NVDEC's private context.
+  if (config.hwaccel === "nvenc") {
+    cmd.push("-init_hw_device", "cuda=cu");
+    cmd.push("-filter_hw_device", "cu");
+  }
 
   // Inputs
   cmd.push(...pipeline.inputArgs);
