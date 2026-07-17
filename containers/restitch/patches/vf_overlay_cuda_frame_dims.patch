@@ -1,0 +1,16 @@
+diff --git a/libavfilter/vf_overlay_cuda.c b/libavfilter/vf_overlay_cuda.c
+index a35f6ed..3996a32 100644
+--- a/libavfilter/vf_overlay_cuda.c
++++ b/libavfilter/vf_overlay_cuda.c
+@@ -345,6 +345,11 @@ FF_ENABLE_DEPRECATION_WARNINGS
+ 
+     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+ 
++    /* make_frame_writable may clone from the 32-aligned hw pool; clamp back
++     * to the negotiated link size so downstream sees true dimensions. */
++    input_main->width  = outlink->w;
++    input_main->height = outlink->h;
++
+     return ff_filter_frame(outlink, input_main);
+ }
+ 

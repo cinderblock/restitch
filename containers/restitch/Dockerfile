@@ -71,6 +71,14 @@ RUN git clone --depth 1 --branch "${FFNVCODEC_REF}" \
 ARG FFMPEG_REF=n7.1.5
 RUN git clone --depth 1 --branch "${FFMPEG_REF}" \
         https://github.com/FFmpeg/FFmpeg.git /opt/ffmpeg-src
+# vf_overlay_cuda emits frames cloned from the 32-aligned hw frame pool with
+# the POOL's padded dimensions (e.g. 1216x704 instead of 1200x676). Downstream
+# consumers treat frame dims as truth: NVENC encodes the unwritten padding
+# (green bars) and scale_npp/scale_cuda smear it into the edge columns. The
+# patch clamps the forwarded frame back to the negotiated link size.
+COPY containers/restitch/patches/vf_overlay_cuda_frame_dims.patch /tmp/
+RUN cd /opt/ffmpeg-src && git apply /tmp/vf_overlay_cuda_frame_dims.patch && \
+    grep -q "clamp back" libavfilter/vf_overlay_cuda.c
 # --nvccflags: ffmpeg's default nvcc gencode targets archs CUDA 12 dropped;
 # sm_89 = Ada (RTX 4090).
 RUN cd /opt/ffmpeg-src && \
