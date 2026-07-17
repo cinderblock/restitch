@@ -107,11 +107,17 @@ function encoderArgs(
       args.push("-rc-lookahead", "0");
       args.push("-delay", "0");
     } else {
-      // HEVC `full` is the quality master — keep B-frames + multipass.
-      // This trades latency for quality; watch the H.264 sub-streams if
-      // you need low latency.
+      // HEVC `full` is the quality master — keep -tune hq, but NO multipass
+      // and NO B-frames. At 7560x2688 (the bays stream 2688x1512 since
+      // 2026-07-16; they were 2560x1440) multipass+B-frames costs more NVENC
+      // than realtime allows, and the pipeline's wallclock-setpts + CFR
+      // output turns any sustained deficit into a death spiral: hiccup →
+      // PTS gap → CFR emits duplicate frames → encoder chews extras → bigger
+      // gap → wedge. Reproduced with -f null outputs (mediamtx exonerated);
+      // the 2×h264-only variant sustained 1.05x while the 4-output variant
+      // with multipass hevc crawled at 0.3x and froze.
       args.push("-tune", "hq");
-      args.push("-multipass", "fullres");
+      args.push("-bf", "0");
     }
     // GOP / keyframe interval. Shorter = lower latency + faster stream
     // start (players can only begin decoding at a keyframe), at the cost
