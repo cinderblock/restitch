@@ -254,6 +254,28 @@ KNOWN REMAINING ISSUE — latency creep + bay skew (NOT an outage):
   (c) Longer term: GPU-side filtering (scale_cuda etc.) to buy real headroom.
   (d) Add a latency bound (drop-oldest) so backlog can't accumulate regardless.
 
+## RESOLVED (2026-07-17): throughput deficit fixed with bilinear scaling
+Root of the latency creep / silent input-freezes: the bays' 2560x1440→2688x1512
+bump (CONFIRMED camera-side via direct NVR probe = 2688x1512; nobody changed
+UniFi) pushed the pipeline under realtime. Key diagnosis: NOT hardware-limited —
+the 4090's NVENC/NVDEC sit ~idle (enc 2-6%, dec 20%); the bottleneck is the CPU
+software filtergraph (803% CPU across ~40 threads, none pinned; frames are
+downloaded from the GPU as nv12, then vstack/transpose/lanczos-scale on the CPU,
+then re-uploaded). The lanczos scaler was the marginal cost.
+
+FIX: added `encoder.scale_flags` (default lanczos) and set the live config to
+`bilinear`. Verified: after a fresh restart the-field held ~1s latency over 4+
+min (no creep → pipeline now ≥1.0x realtime at 1512p), all 5 bays synced, 0
+discards, all 6 streams flowing. all-field's two-half skew collapsed from ~45s
+to ~1s. GPU still has headroom (enc 30-56%).
+
+LEVERS STILL AVAILABLE if 1512p headroom ever gets tight again:
+- Real fix for big headroom: GPU-side filtering (scale_cuda/transpose_npp, keep
+  frames in CUDA memory) — the 4090 would crush this. Risk: the green-frame
+  cuda-format issue + vstack has no CUDA filter (needs overlay_cuda).
+- Revert bays to 2560x1440 (UniFi, user's infra).
+- Nice multiples barely matter here (NVENC is idle, not the bottleneck).
+
 ## Things not to do
 - Don't try to content-detect a frozen vstack half via a coarse grid — the seam
   bleed + clock-at-seam confound it (proven). Use the source-reconnect signal.
