@@ -381,6 +381,12 @@ export function buildPipeline(
     // cannot touch GPU frames). The rotation sandwich already ends in
     // scale_npp=format=nv12; unrotated branches get an explicit normalizer.
     const rot = gpuRotationChain(cam.rotation);
+    // fps first (NVDEC delivers frames in bursts; wallclock-stamping before
+    // fps collapses burst-mates), then continuous wallclock setpts for
+    // cross-camera sync. NOTE: grid-quantizing this stamp was tried twice
+    // (output-CFR and round()-in-expression) and both collapse/duplicate on
+    // decode bursts — see plan. Smoothness work must start from live PTS
+    // measurements, not another expression tweak.
     const chain = [
       GPU_COLOR_RETAG,
       `fps=${probe.fps}`,
@@ -703,6 +709,7 @@ export function buildExtraCompositePipeline(
     // Unrotated branches get the scale_npp format normalizer (see
     // buildPipeline: raw NVDEC → overlay_cuda fails format negotiation).
     const rot = gpuRotationChain(rotation);
+    // fps first, then continuous wallclock stamp (see buildPipeline).
     const chain = [
       GPU_COLOR_RETAG,
       `fps=${input.fps}`,
@@ -967,12 +974,14 @@ export function buildCommand(config: Config, pipeline: Pipeline): string[] {
     // upstream fps=N filter already paces each input, so healthy output is
     // ~CFR anyway; vfr just refuses to amplify hiccups.
     if (out.fps) {
-      // CFR for smooth playback: VFR forwarded wallclock-jittered PTS and
-      // players rendered visible micro-judder. CFR's old failure mode (the
-      // duplicate-fill death spiral) required a throughput deficit; the GPU
-      // pipeline runs at ~5x realtime, and the fresh-baseline-per-spawn fix
-      // removes the restart gap CFR used to fill.
-      cmd.push("-fps_mode", "cfr", "-r", String(out.fps));
+      // VFR at the output; smoothness comes from the filtergraph instead:
+      // each input is stamped with wallclock PTS and THEN quantized onto a
+      // uniform 1/fps grid by the fps filter (see the input chains). Output
+      // CFR was tried twice and both times the wallclock jitter made it
+      // manufacture duplicate-frame storms (bitrate x3, sibling outputs
+      // starved) — fps-after-setpts only ever fills to the NEXT real frame,
+      // so it cannot amplify.
+      cmd.push("-fps_mode", "vfr");
     }
     cmd.push("-an"); // no audio
     if (config.output.format === "rtsp") {
