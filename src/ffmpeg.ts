@@ -828,16 +828,19 @@ export function buildCommand(config: Config, pipeline: Pipeline): string[] {
         out.bufsizeOverride
       )
     );
-    // Conform to a clean constant-rate grid. The upstream wall-clock setpts
-    // (RTCTIME-baseline, for cross-camera sync) leaves slightly non-monotonic
-    // per-frame PTS; CFR re-quantizes them to an even grid, which both prevents
-    // a flood of non-monotonic-DTS muxer warnings AND restores the correct rate
-    // on the crop/scale sub-streams (which otherwise fall back to 25fps and drop
-    // frames). The multi-minute CFR gap-fill that used to plague restarts is
-    // avoided by recomputing the setpts baseline per spawn (see index.ts), so
-    // the first frame's PTS is ~0 and there is no gap to fill.
+    // VFR: emit frames at the PTS the filtergraph assigned, dropping any
+    // same/backwards-PTS frames (keeps DTS monotonic without the passthrough
+    // mode's warning spam). Deliberately NOT cfr: CFR gap-fills PTS jumps with
+    // duplicate frames, and with the wallclock setpts upstream that is a
+    // positive feedback loop — any transient deficit creates a PTS gap, CFR
+    // manufactures thousands of dup frames, the encoders fall further behind,
+    // the next gap is bigger, and the pipeline death-spirals into a permanent
+    // wedge (inputs unread, sub-streams at 0 bytes). Observed live once the
+    // bays' resolution bump pushed the encode budget near its limit. The
+    // upstream fps=N filter already paces each input, so healthy output is
+    // ~CFR anyway; vfr just refuses to amplify hiccups.
     if (out.fps) {
-      cmd.push("-fps_mode", "cfr", "-r", String(out.fps));
+      cmd.push("-fps_mode", "vfr");
     }
     cmd.push("-an"); // no audio
     if (config.output.format === "rtsp") {
