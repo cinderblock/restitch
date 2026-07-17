@@ -65,15 +65,22 @@ function rotationFilters(rotation: string): string[] {
 const GPU_COLOR_RETAG =
   "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709";
 
-/** Map config scale_flags (swscale names) to NPP interpolation algorithms. */
+/**
+ * Map config scale_flags (swscale names) to scale_cuda interpolation
+ * algorithms. All RESIZES use scale_cuda: NPP's resize leaves the last
+ * destination rows/columns unwritten on fractional scale factors (pure green
+ * 0/0/0 edges, verified by pixel forensics on full-low), while scale_cuda's
+ * kernel covers the full frame. scale_npp remains only for 1:1 format
+ * conversions, which have no resize edge.
+ */
 function gpuInterp(scaleFlags: string): string {
   const map: Record<string, string> = {
     lanczos: "lanczos",
-    bilinear: "linear",
-    fast_bilinear: "linear",
-    bicubic: "cubic",
-    area: "super",
-    neighbor: "nn",
+    bilinear: "bilinear",
+    fast_bilinear: "bilinear",
+    bicubic: "bicubic",
+    area: "bilinear",
+    neighbor: "nearest",
   };
   return map[scaleFlags] ?? "lanczos";
 }
@@ -109,7 +116,7 @@ function gpuCanvas(
   return (
     `color=black:size=16x16:rate=${fps},format=nv12,${GPU_COLOR_RETAG},` +
     `setpts=(RTCTIME-${baseline})/(TB*1000000),` +
-    `hwupload_cuda,scale_npp=w=${width}:h=${height}:format=nv12${label}`
+    `hwupload_cuda,scale_cuda=w=${width}:h=${height}:format=nv12:interp_algo=nearest${label}`
   );
 }
 
@@ -440,7 +447,7 @@ export function buildPipeline(
     outputs[0]!.mapLabel = "[split_0]";
     if (config.composite.scale) {
       filters.push(
-        `[split_0]scale_npp=w=${config.composite.scale.width}:h=${config.composite.scale.height}:` +
+        `[split_0]scale_cuda=w=${config.composite.scale.width}:h=${config.composite.scale.height}:` +
           `interp_algo=${interp}:format=nv12[comp_scaled]`
       );
       outputs[0]!.mapLabel = "[comp_scaled]";
@@ -466,7 +473,7 @@ export function buildPipeline(
     const post: string[] = [...gpuRotationChain(sub.rotation)];
     if (sub.scale) {
       post.push(
-        `scale_npp=w=${sub.scale.width}:h=${sub.scale.height}:interp_algo=${interp}:format=nv12`
+        `scale_cuda=w=${sub.scale.width}:h=${sub.scale.height}:interp_algo=${interp}:format=nv12`
       );
     }
     // Overlay-final chains inherit the canvas's PADDED surface allocation as
@@ -742,7 +749,7 @@ export function buildExtraCompositePipeline(
     if (extra.direction === "vertical" && width !== referenceWidth) {
       const target = Math.round((height * referenceWidth) / width / 2) * 2;
       filters.push(
-        `${label}scale_npp=w=${referenceWidth}:h=${target}:interp_algo=${interp}:format=nv12[xc_scale_${i}]`
+        `${label}scale_cuda=w=${referenceWidth}:h=${target}:interp_algo=${interp}:format=nv12[xc_scale_${i}]`
       );
       label = `[xc_scale_${i}]`;
       width = referenceWidth;
@@ -750,7 +757,7 @@ export function buildExtraCompositePipeline(
     } else if (extra.direction === "horizontal" && height !== referenceHeight) {
       const target = Math.round((width * referenceHeight) / height / 2) * 2;
       filters.push(
-        `${label}scale_npp=w=${target}:h=${referenceHeight}:interp_algo=${interp}:format=nv12[xc_scale_${i}]`
+        `${label}scale_cuda=w=${target}:h=${referenceHeight}:interp_algo=${interp}:format=nv12[xc_scale_${i}]`
       );
       label = `[xc_scale_${i}]`;
       width = target;
@@ -791,7 +798,7 @@ export function buildExtraCompositePipeline(
   // --- Optional post-stack scale (GPU) ---
   if (extra.scale) {
     filters.push(
-      `${outLbl}scale_npp=w=${extra.scale.width}:h=${extra.scale.height}:interp_algo=${interp}:format=nv12[xc_scaled]`
+      `${outLbl}scale_cuda=w=${extra.scale.width}:h=${extra.scale.height}:interp_algo=${interp}:format=nv12[xc_scaled]`
     );
     outLbl = "[xc_scaled]";
   } else if (postRot.length === 0) {
@@ -884,7 +891,7 @@ export async function ensureHwaccelWorks(config: Config): Promise<void> {
     // Mirrors the production recipe exactly: color retag, nv12 working format,
     // transpose_npp sandwiched in scale_npp format conversions (it rejects
     // nv12), canvas via scale_npp, negative-offset overlay crop.
-    `[0:v]format=nv12,${GPU_COLOR_RETAG},hwupload_cuda,scale_npp=w=480:h=640:format=nv12:interp_algo=lanczos[cv];` +
+    `[0:v]format=nv12,${GPU_COLOR_RETAG},hwupload_cuda,scale_cuda=w=480:h=640:format=nv12:interp_algo=lanczos[cv];` +
       `[1:v]format=nv12,${GPU_COLOR_RETAG},hwupload_cuda,scale_npp=format=yuv420p,transpose_npp=dir=clock,scale_npp=format=nv12[rot];` +
       "[cv][rot]overlay_cuda=x=-8:y=16[out]",
     "-map", "[out]",
