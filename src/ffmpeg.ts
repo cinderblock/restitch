@@ -409,10 +409,12 @@ export function buildPipeline(
     compositeLabel = "[comp_rot]";
   } else {
     // Overlay-final frames carry the canvas's padded allocation as their
-    // dimensions (green bars in the encode); a dimensionless scale_npp
-    // restores the true link dimensions. Rotation sandwiches do this
-    // implicitly.
-    filters.push(`${compositeLabel}scale_npp=format=nv12[comp_norm]`);
+    // dimensions (green bars in the encode); scale_npp with EXPLICIT target
+    // dims restores them (a dimensionless scale_npp keeps the padded frame
+    // dims). Rotation sandwiches change dims explicitly so they're exact.
+    filters.push(
+      `${compositeLabel}scale_npp=w=${stackW}:h=${stackH}:format=nv12[comp_norm]`
+    );
     compositeLabel = "[comp_norm]";
   }
 
@@ -469,7 +471,7 @@ export function buildPipeline(
     // so every output must end in scale_npp (rotation sandwiches and explicit
     // scales already do).
     if (post.length === 0) {
-      post.push("scale_npp=format=nv12");
+      post.push(`scale_npp=w=${cropW}:h=${cropH}:format=nv12`);
     }
     const outLabel = `[sub_${i}]`;
     filters.push(`${cur}${post.join(",")}${outLabel}`);
@@ -788,9 +790,9 @@ export function buildExtraCompositePipeline(
     );
     outLbl = "[xc_scaled]";
   } else if (postRot.length === 0) {
-    // Overlay-final: restore true dimensions (see buildPipeline — the canvas's
-    // padded allocation otherwise encodes as green bars).
-    filters.push(`${outLbl}scale_npp=format=nv12[xc_norm]`);
+    // Overlay-final: restore true dimensions with explicit targets (see
+    // buildPipeline — padded canvas allocation otherwise encodes as green bars).
+    filters.push(`${outLbl}scale_npp=w=${xcW}:h=${xcH}:format=nv12[xc_norm]`);
     outLbl = "[xc_norm]";
   }
 
