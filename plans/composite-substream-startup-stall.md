@@ -192,6 +192,68 @@ no content analysis, no false positives, targets the actual trigger. Applied to 
 main compositor (raw/bay-1..5) and each extra composite (entry: raw/doorbell,
 raw/foyer). Reconnect logic + inputPaths derivation unit-verified before deploy.
 
+## FOLLOW-UP #4 (2026-07-16/17): main compositor wedges — NOT all-field, NOT code
+Symptom: full-low/the-field/john stall to 0 bytes while `full` + `entry` flow;
+~1/s "reader too slow" discards per bay session; main ffmpeg CPU ~20% (waiting);
+NVDEC usage of main = 0% (pmon) while entry decodes fine; encoder churns CFR
+duplicates on `full` ("More than 10000 frames duplicated"). Wedge engages within
+~60-90s of every main start. Restarting main does NOT clear it.
+
+EXONERATED (each with hard evidence):
+- all-field (disabled it; wedge persists) — its connect timing was coincidental.
+- My code: bisect-deployed known-good 40a83bc on the box → still wedges. Old-vs-new
+  buildCommand diff at real probe dims (2688x1512) → byte-identical.
+- ffmpeg binary (same BtbN 20260628 build, cached docker layer).
+- GPU driver state: no NVRM/Xid errors, no leaked contexts, no throttle;
+  kernel module == userspace libs == 595.71.05, no nvidia pkg changes since Jul 8.
+- balls-counter (python running since Jun 30; its 2 host cuvid ffmpegs SIGSTOPed
+  → wedge persists).
+- NVR source flapping (raw/* readyTimes all == container start; reconnect-watchdog
+  fired 0 times).
+- Reconnect/any-stale watchdog changes (wedge reproduces under 40a83bc without them).
+
+KEY INSIGHT on history: July 14-16 "healthy" verifications only ever checked
+`ready=true` (publisher connected), never sustained byte flow. Last PROVEN
+sub-stream flow: July 8 (clean the-field frame captures). The wedge may predate
+today's deploys by days. A morning-of-July-16 the-field grab needed 2 attempts
+(first returned no frames) — sickness likely already present at 10:55 PT.
+
+PIPELINE BISECTION (completed):
+- 5-bay NVDEC decode + fps + vstack → -f null: 1.04x realtime → input side healthy.
+- Exact production command with -f null outputs: WEDGES identically (frame counter
+  frozen, dup≈frames, speed decayed 0.3x) → mediamtx/RTSP publishing exonerated.
+- 2×h264-only variant (no hevc full, no john): sustains 1.05x.
+→ ROOT CAUSE (twofold, environmental + design):
+  1. The bay cameras began streaming 2688x1512 on 2026-07-16 (were 2560x1440
+     since setup — verified via probe logs). full grew to 7560x2688; hevc_nvenc
+     with -tune hq -multipass fullres + B-frames no longer fits the NVENC
+     realtime budget.
+  2. CFR output (-fps_mode cfr) amplifies any deficit: hiccup → wallclock-PTS
+     gap → CFR manufactures thousands of duplicate frames → encoders drown →
+     bigger gap → permanent wedge (inputs unread, mediamtx discards ~1/s/bay,
+     sub-streams 0 bytes, "More than 10000 frames duplicated").
+
+FIXES SHIPPED (2026-07-16/17):
+- 90430b2: hevc full → single-pass, no B-frames (-tune hq -bf 0, no multipass).
+- c608266: all outputs -fps_mode vfr (was cfr) — VFR drops same/backward-PTS
+  frames instead of duplicate-filling gaps; monotonic DTS, no amplification.
+- Result: all 6 streams (incl. re-enabled all-field) flow sustained, 0 discard
+  storms, main CPU at healthy ~700-880%. all-field verified visually correct
+  (flip + right-trim + stack). Reconnect-watchdog observed working live
+  (all-field auto-restarted when the-field republished).
+
+KNOWN REMAINING ISSUE — latency creep + bay skew (NOT an outage):
+- At 2688x1512×5 the pipeline runs slightly under 1.0x, so with VFR the deficit
+  accumulates as LATENCY (~15s after a warm restart, drifting toward ~40-60s)
+  plus a few seconds of cross-bay skew after restarts. Streams stay up/smooth.
+- Options (user decision):
+  (a) Revert bay camera streams to 2560x1440 in UniFi (restores the proven
+      working point; USER must do — UniFi is off-limits to Claude).
+  (b) Cut encode further: drop -tune hq (lookahead) from hevc, or preset p4→p2,
+      or scale full down. One-line restitch changes.
+  (c) Longer term: GPU-side filtering (scale_cuda etc.) to buy real headroom.
+  (d) Add a latency bound (drop-oldest) so backlog can't accumulate regardless.
+
 ## Things not to do
 - Don't try to content-detect a frozen vstack half via a coarse grid — the seam
   bleed + clock-at-seam confound it (proven). Use the source-reconnect signal.
