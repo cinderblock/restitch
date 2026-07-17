@@ -276,6 +276,50 @@ LEVERS STILL AVAILABLE if 1512p headroom ever gets tight again:
 - Revert bays to 2560x1440 (UniFi, user's infra).
 - Nice multiples barely matter here (NVENC is idle, not the bottleneck).
 
+## COMMISSIONED (2026-07-17): full-GPU pipeline — "GPU or error, no CPU fallback"
+User directive (emphatic): pixel work (decode/filter/scale/encode) must run on
+the GPU; if the GPU path fails, ERROR loudly — no CPU fallback, no silent
+quality downgrades (bilinear was explicitly rejected as "paving over").
+Saved as memory gpu-or-error.md.
+
+Historical truth for the record: the CPU filter chain (vstack/transpose/scale
+via swscale after nv12 download) has been the architecture since day one — not a
+recent change. The recent CPU-decode for stream refs + bilinear WERE new and are
+to be reverted as part of this work.
+
+DESIGN (validated by probes on the box, 2026-07-17):
+- Vulkan lane: DEAD in-container. No VK_KHR_video_decode_queue even with
+  caps=all, and the only Vulkan device is llvmpipe (CPU rasterizer!) — the
+  NVIDIA Vulkan ICD isn't present (headless driver). Using it would be secret
+  CPU work. Do not revisit without host driver changes.
+- CUDA lane: VALIDATED.
+  * NVDEC decode -> cuda frames (proven for months).
+  * P8 PASS: GPU canvas = color source 16x16 -> hwupload_cuda -> scale_cuda to
+    canvas size; stack via chained overlay_cuda at offsets -> NVENC.
+  * P9 PASS: overlay_cuda accepts NEGATIVE offsets (clips at canvas bounds) =
+    GPU-side crop emulation: assemble each output directly from (rotated)
+    inputs placed on an output-sized canvas with offsets; out-of-canvas pixels
+    drop. No crop filter needed.
+  * scale_cuda supports interp_algo=lanczos (quality restored, GPU-cheap).
+  * ONLY missing piece: rotation. transpose_npp requires a custom ffmpeg build
+    with --enable-nonfree --enable-libnpp (CUDA SDK in the existing
+    nvidia/cuda devel builder stage; nv-codec-headers; local use only).
+- Geometry note: vstack(bays)+transpose90 == transpose90 each bay + place side
+  by side (hstack order reversed) — one overlay pass builds the final rotated
+  layout directly; 180 rotations = transpose_npp twice (or dir=clock_flip
+  variants).
+- Fail-fast: extend ensureHwaccelWorks to verify transpose_npp / scale_cuda /
+  overlay_cuda exist AND run a smoke graph at startup; refuse to start
+  otherwise. Remove stream-ref CPU decode. Remove scale_flags=bilinear from
+  live config (GPU lanczos instead).
+
+IMPLEMENTATION STEPS:
+1. Dockerfile: ffmpeg source build (pin n7.1.x) in the CUDA devel stage with
+   nonfree+libnpp+nvenc/nvdec+network/rtsp; swap into runtime image.
+2. ffmpeg.ts: GPU graph builder (canvas+overlay assembly per output).
+3. Startup capability check (hard error).
+4. Deploy, verify latency (~1-2s), sync, quality, soak; revert bilinear config.
+
 ## Things not to do
 - Don't try to content-detect a frozen vstack half via a coarse grid — the seam
   bleed + clock-at-seam confound it (proven). Use the source-reconnect signal.
