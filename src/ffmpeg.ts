@@ -413,7 +413,11 @@ export function buildPipeline(
     // dims restores them (a dimensionless scale_npp keeps the padded frame
     // dims). Rotation sandwiches change dims explicitly so they're exact.
     filters.push(
-      `${compositeLabel}scale_npp=w=${stackW}:h=${stackH}:format=nv12[comp_norm]`
+      // format=yuv420p (not nv12): with identical dims AND format scale_npp
+      // passes frames through untouched, so the padded canvas-pool frames
+      // would reach NVENC anyway. A real format conversion forces a fresh,
+      // exactly-sized allocation. NVENC accepts yuv420p CUDA frames.
+      `${compositeLabel}scale_npp=w=${stackW}:h=${stackH}:format=yuv420p[comp_norm]`
     );
     compositeLabel = "[comp_norm]";
   }
@@ -471,7 +475,8 @@ export function buildPipeline(
     // so every output must end in scale_npp (rotation sandwiches and explicit
     // scales already do).
     if (post.length === 0) {
-      post.push(`scale_npp=w=${cropW}:h=${cropH}:format=nv12`);
+      // yuv420p forces a real conversion (see composite normalizer comment).
+      post.push(`scale_npp=w=${cropW}:h=${cropH}:format=yuv420p`);
     }
     const outLabel = `[sub_${i}]`;
     filters.push(`${cur}${post.join(",")}${outLabel}`);
@@ -792,7 +797,8 @@ export function buildExtraCompositePipeline(
   } else if (postRot.length === 0) {
     // Overlay-final: restore true dimensions with explicit targets (see
     // buildPipeline — padded canvas allocation otherwise encodes as green bars).
-    filters.push(`${outLbl}scale_npp=w=${xcW}:h=${xcH}:format=nv12[xc_norm]`);
+    // yuv420p forces a real conversion (see buildPipeline normalizer comment).
+    filters.push(`${outLbl}scale_npp=w=${xcW}:h=${xcH}:format=yuv420p[xc_norm]`);
     outLbl = "[xc_norm]";
   }
 
