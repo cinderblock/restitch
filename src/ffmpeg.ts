@@ -407,6 +407,13 @@ export function buildPipeline(
   if (compRotChain.length > 0) {
     filters.push(`${compositeLabel}${compRotChain.join(",")}[comp_rot]`);
     compositeLabel = "[comp_rot]";
+  } else {
+    // Overlay-final frames carry the canvas's padded allocation as their
+    // dimensions (green bars in the encode); a dimensionless scale_npp
+    // restores the true link dimensions. Rotation sandwiches do this
+    // implicitly.
+    filters.push(`${compositeLabel}scale_npp=format=nv12[comp_norm]`);
+    compositeLabel = "[comp_norm]";
   }
 
   // Composite dimensions (post-rotation, pre-scale) for percentage resolution
@@ -456,14 +463,17 @@ export function buildPipeline(
         `scale_npp=w=${sub.scale.width}:h=${sub.scale.height}:interp_algo=${interp}:format=nv12`
       );
     }
-    const outLabel = `[sub_${i}]`;
-    if (post.length > 0) {
-      filters.push(`${cur}${post.join(",")}${outLabel}`);
-      cur = outLabel;
-    } else {
-      // No rotation/scale: the crop label IS the output label.
-      cur = `[sub_crop_${i}]`;
+    // Overlay-final chains inherit the canvas's PADDED surface allocation as
+    // frame dimensions (e.g. 3686x3290 -> 3712x3296) and the padding encodes
+    // as green bars. A trailing scale_npp re-emits the true link dimensions,
+    // so every output must end in scale_npp (rotation sandwiches and explicit
+    // scales already do).
+    if (post.length === 0) {
+      post.push("scale_npp=format=nv12");
     }
+    const outLabel = `[sub_${i}]`;
+    filters.push(`${cur}${post.join(",")}${outLabel}`);
+    cur = outLabel;
 
     outputs.push({
       name: sub.name,
@@ -777,6 +787,11 @@ export function buildExtraCompositePipeline(
       `${outLbl}scale_npp=w=${extra.scale.width}:h=${extra.scale.height}:interp_algo=${interp}:format=nv12[xc_scaled]`
     );
     outLbl = "[xc_scaled]";
+  } else if (postRot.length === 0) {
+    // Overlay-final: restore true dimensions (see buildPipeline — the canvas's
+    // padded allocation otherwise encodes as green bars).
+    filters.push(`${outLbl}scale_npp=format=nv12[xc_norm]`);
+    outLbl = "[xc_norm]";
   }
 
   const filterComplex = filters.join(";\n");
