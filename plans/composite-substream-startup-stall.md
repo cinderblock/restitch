@@ -347,9 +347,23 @@ Hard-won build/graph rules (do not relearn):
   must END in a filter doing real work; overlay-final outputs get
   scale_npp=w=W:h=H:format=yuv420p (real conversion, exact fresh pool).
 - -hwaccel_device cu required so NVDEC shares the filter device context.
-KNOWN COSMETIC NIT: ~1-2px green hairline on right/bottom edges of
-canvas-assembled outputs (all-field; likely chroma-edge of the final
-conversion or canvas bleed). Not visible at viewing scale; fix someday.
+GREEN-EDGE ARTIFACTS: ROOT-CAUSED AND FIXED (2026-07-18) — two genuine
+FFmpeg bugs, patched in our build (containers/restitch/patches/):
+1. vf_overlay_cuda: forwards its main input frame, but
+   ff_inlink_make_frame_writable clones it from the hw pool whose dims are
+   FFALIGN(w/h,32) — the clone carries padded pool dims (1216x704 for
+   1200x676). Fix: clamp forwarded frame to outlink dims.
+2. vf_transpose_npp: nppscale_scale corrects the recycled stage frame's dims
+   after av_hwframe_get_buffer; npptranspose_filter is MISSING those two
+   lines, so every output after frame 1 carries pool-padded dims.
+Downstream effects of both: NVENC encodes the unwritten padding (green
+bars), and same-dims scale_npp/scale_cuda conversions became secret
+pad-smearing resizes (zero edge columns). Both hunks are upstreamable.
+VERIFIED (edge forensics, all six streams): exact dims everywhere; real
+content on all 4 edges of full-low/the-field/john/entry/all-field.
+Remaining: `full` has a ~1px neutral-gray ring at its extreme border
+(invisible at any scale; likely NPP conversion edge behavior; full-low
+downscaled from the same frames shows pure content).
 
 ## Things not to do
 - Don't try to content-detect a frozen vstack half via a coarse grid — the seam
