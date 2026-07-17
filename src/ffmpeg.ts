@@ -116,7 +116,11 @@ function gpuCanvas(
   return (
     `color=black:size=16x16:rate=${fps},format=nv12,${GPU_COLOR_RETAG},` +
     `setpts=(RTCTIME-${baseline})/(TB*1000000),` +
-    `hwupload_cuda,scale_cuda=w=${width}:h=${height}:format=nv12:interp_algo=nearest${label}`
+    // setsar=1: the color source is square (DAR 1:1) and scale_cuda preserves
+    // DAR by writing a compensating SAR; as the overlay main input, that
+    // square-DAR poison would propagate into every output (players squish
+    // the picture toward a square). Square pixels, declared.
+    `hwupload_cuda,scale_cuda=w=${width}:h=${height}:format=nv12:interp_algo=nearest,setsar=1${label}`
   );
 }
 
@@ -963,7 +967,12 @@ export function buildCommand(config: Config, pipeline: Pipeline): string[] {
     // upstream fps=N filter already paces each input, so healthy output is
     // ~CFR anyway; vfr just refuses to amplify hiccups.
     if (out.fps) {
-      cmd.push("-fps_mode", "vfr");
+      // CFR for smooth playback: VFR forwarded wallclock-jittered PTS and
+      // players rendered visible micro-judder. CFR's old failure mode (the
+      // duplicate-fill death spiral) required a throughput deficit; the GPU
+      // pipeline runs at ~5x realtime, and the fresh-baseline-per-spawn fix
+      // removes the restart gap CFR used to fill.
+      cmd.push("-fps_mode", "cfr", "-r", String(out.fps));
     }
     cmd.push("-an"); // no audio
     if (config.output.format === "rtsp") {
