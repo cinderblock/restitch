@@ -365,6 +365,38 @@ Remaining: `full` has a ~1px neutral-gray ring at its extreme border
 (invisible at any scale; likely NPP conversion edge behavior; full-low
 downscaled from the same frames shows pure content).
 
+## OPEN: playback smoothness (quantified 2026-07-18)
+User reports slightly un-smooth motion. MEASURED on live all-field (packet PTS
+deltas, ms): 70x33 / 21x67 / 5x100 / 3x133 / 1x157 / 2x167 — i.e. ~30% of
+frame intervals are 2-5x gaps. Raw camera reference (raw/bay-1): 118x33 / 1
+outlier — sources are clean 30fps. The composite pipeline drops/skips ~20-25%
+of frames irregularly despite 5x throughput headroom.
+
+PRIME SUSPECT: framesync pairing in the chained overlay_cuda stages — the
+canvas is an independent 6th timeline (its own wallclock setpts) that
+framesync must align against 5 jittery input timelines; mispairings skip
+output ticks. The old CPU vstack synced N inputs in ONE filter (no canvas
+timeline) and did not exhibit this.
+
+FAILED APPROACHES (do not retry blindly):
+- Output -fps_mode cfr: manufactures duplicate storms from wallclock jitter
+  (bitrate x3, sibling outputs starve) — failed twice, in production both times.
+- setpts BEFORE fps: NVDEC burst-mates get identical wallclock stamps -> fps
+  collapses them (150 frames stretched over 79s).
+- Grid-quantized setpts AFTER fps: graph processes frames in batches, so
+  batch-mates quantize to the same slot -> drop=287. Any
+  wallclock-at-processing-time quantization breaks at >1x throughput.
+
+NEXT-SESSION PLAN (measurement-driven):
+1. Offline A/B: single-overlay graph vs 5-chained overlays vs canvas-free
+   variant — measure PTS delta distributions of each to isolate where the
+   gaps enter (canvas timeline? chaining depth? framesync opts?).
+2. Try canvas at higher rate (e.g. rate=2*fps) or framesync ts_sync_mode.
+3. Consider trusting RTSP/RTCP-NTP input PTS for cross-camera alignment
+   (UniFi cams NTP-synced) instead of wallclock setpts — would remove
+   filter-time jitter entirely, but this is the deep water that motivated the
+   wallclock hack; needs careful offline verification of cross-input offsets.
+
 ## Things not to do
 - Don't try to content-detect a frozen vstack half via a coarse grid — the seam
   bleed + clock-at-seam confound it (proven). Use the source-reconnect signal.
