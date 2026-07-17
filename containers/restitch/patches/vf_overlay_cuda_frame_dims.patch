@@ -14,3 +14,19 @@ index a35f6ed..3996a32 100644
      return ff_filter_frame(outlink, input_main);
  }
  
+diff --git a/libavfilter/vf_transpose_npp.c b/libavfilter/vf_transpose_npp.c
+index 1706267..751c7e0 100644
+--- a/libavfilter/vf_transpose_npp.c
++++ b/libavfilter/vf_transpose_npp.c
+@@ -376,6 +376,11 @@ static int npptranspose_filter(AVFilterContext *ctx, AVFrame *out, AVFrame *in)
+     if (ret < 0)
+         return ret;
+ 
++    /* match nppscale_scale: the pool allocates FFALIGN(w,32) frames; without
++     * this the recycled stage frame carries padded dims downstream. */
++    s->tmp_frame->width  = src->width;
++    s->tmp_frame->height = src->height;
++
+     av_frame_move_ref(out, src);
+     av_frame_move_ref(src, s->tmp_frame);
+ 
