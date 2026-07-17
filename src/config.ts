@@ -161,6 +161,15 @@ const EncoderSchema = z.object({
         "stream start, at the cost of more bitrate. 1s is a good low-latency default."
     ),
   extra_args: z.array(z.string()).default([]).describe("Additional FFmpeg encoder args"),
+  scale_flags: z
+    .string()
+    .default("lanczos")
+    .describe(
+      "swscale algorithm for all scale filters (composite + sub-streams + extra " +
+        "composites). 'lanczos' is highest quality but CPU-heavy; 'bilinear' is " +
+        "much cheaper (relevant since scaling runs on the CPU, not the GPU) with " +
+        "minor quality loss on downscales. Others: bicubic, area, neighbor, fast_bilinear."
+    ),
 });
 
 const OutputSchema = z.object({

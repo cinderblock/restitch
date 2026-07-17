@@ -331,7 +331,7 @@ export function buildPipeline(
   if (config.composite.scale) {
     const scaleLabel = "[comp_scaled]";
     filters.push(
-      `${compositeLabel}scale=${config.composite.scale.width}:${config.composite.scale.height}:flags=lanczos${scaleLabel}`
+      `${compositeLabel}scale=${config.composite.scale.width}:${config.composite.scale.height}:flags=${config.encoder.scale_flags}${scaleLabel}`
     );
     compositeLabel = scaleLabel;
   }
@@ -411,7 +411,7 @@ export function buildPipeline(
     }
 
     if (sub.scale) {
-      cropFilter += `,scale=${sub.scale.width}:${sub.scale.height}:flags=lanczos`;
+      cropFilter += `,scale=${sub.scale.width}:${sub.scale.height}:flags=${config.encoder.scale_flags}`;
     }
 
     filters.push(`${cropFilter}${cropLabel}`);
@@ -685,7 +685,7 @@ export function buildExtraCompositePipeline(
     if (needScale) {
       const scaleLbl = `[xc_scale_${i}]`;
       filters.push(
-        `${lbl}scale=${targetW}:${targetH}:flags=lanczos${scaleLbl}`
+        `${lbl}scale=${targetW}:${targetH}:flags=${config.encoder.scale_flags}${scaleLbl}`
       );
       lbl = scaleLbl;
     }
@@ -712,7 +712,7 @@ export function buildExtraCompositePipeline(
   if (extra.scale) {
     const lbl = `[xc_scaled]`;
     filters.push(
-      `${outLbl}scale=${extra.scale.width}:${extra.scale.height}:flags=lanczos${lbl}`
+      `${outLbl}scale=${extra.scale.width}:${extra.scale.height}:flags=${config.encoder.scale_flags}${lbl}`
     );
     outLbl = lbl;
   }
