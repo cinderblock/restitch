@@ -72,7 +72,9 @@ With the default config, streams are available at:
 - `rtsp://host:8554/full` — full composite
 - `rtsp://host:8554/<sub-stream-name>` — cropped sub-regions
 - `http://host:8890/<stream-name>/` — HLS (browser-friendly)
-- `http://host:8889/<stream-name>/` — WebRTC (low latency, H.264 only)
+- `http://host:8889/<stream-name>/` — WebRTC (low latency, H.264 only; media
+  is UDP on port 8189 — for off-LAN viewers, forward that port and list a
+  publicly reachable name in `webrtc.additional_hosts`)
 - `http://host:9000/` — dashboard
 - `http://host:9997/v3/paths/list` — mediamtx control API
 

@@ -69,3 +69,10 @@ ffmpeg_path: ffmpeg
 ffprobe_path: ffprobe
 
 log_level: info           # quiet, error, warning, info, verbose, debug
+
+# WebRTC serving options (mediamtx). Media is UDP (port 8189, muxed) and does
+# NOT traverse HTTP reverse proxies — for off-LAN viewers, forward UDP 8189
+# from the WAN edge to this box and advertise a reachable name here.
+# webrtc:
+#   additional_hosts:
+#     - stream.example.com   # split-horizon: LAN → this box, WAN → edge/DDNS

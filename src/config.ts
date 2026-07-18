@@ -180,6 +180,22 @@ const OutputSchema = z.object({
     .describe("Base URL for the restream server"),
 });
 
+const WebRTCSchema = z.object({
+  additional_hosts: z
+    .array(z.string())
+    .default([])
+    .describe(
+      "Extra hosts/IPs advertised as ICE candidates (mediamtx " +
+        "webrtcAdditionalHosts) alongside the interface addresses. WebRTC " +
+        "media bypasses any HTTP reverse proxy, so off-LAN viewers need a " +
+        "candidate they can actually reach: add a public DNS name here (a " +
+        "DDNS-tracked name keeps working across WAN IP changes) and forward " +
+        "the UDP mux port (8189) from the WAN edge to this box. A " +
+        "split-horizon name that resolves to this box on the LAN and to the " +
+        "WAN edge externally serves both audiences with one entry."
+    ),
+});
+
 const DashboardSchema = z.object({
   enabled: z.boolean().default(true),
   address: z
@@ -302,6 +318,7 @@ export const ConfigSchema = z.object({
     format: "rtsp",
     base_url: "rtsp://localhost:8554",
   }),
+  webrtc: WebRTCSchema.default({ additional_hosts: [] }),
   dashboard: DashboardSchema.default({
     enabled: true,
     address: ":9000",
@@ -342,4 +359,5 @@ export type Crop = z.infer<typeof CropSchema>;
 export type Composite = z.infer<typeof CompositeSchema>;
 export type Encoder = z.infer<typeof EncoderSchema>;
 export type Dashboard = z.infer<typeof DashboardSchema>;
+export type WebRTC = z.infer<typeof WebRTCSchema>;
 export type Transcription = z.infer<typeof TranscriptionSchema>;
