@@ -75,6 +75,14 @@ export function generateMediaMTXConfig(
     // WebRTC (low latency browser viewing)
     webrtc: true,
     webrtcAddress: ":8889",
+    // Single-port UDP mux for all WebRTC media sessions. Pinned explicitly
+    // (matches the mediamtx default) because off-LAN access depends on a WAN
+    // port-forward of exactly this port — a silently changed default would
+    // break it.
+    webrtcLocalUDPAddress: ":8189",
+    ...(config.webrtc.additional_hosts.length > 0
+      ? { webrtcAdditionalHosts: config.webrtc.additional_hosts }
+      : {}),
 
     // Control API — unauthenticated, LAN only. Endpoints under /v3/:
     //   GET /v3/paths/list           paths + reader/source state + bytes
