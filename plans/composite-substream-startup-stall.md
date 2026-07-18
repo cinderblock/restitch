@@ -365,7 +365,7 @@ Remaining: `full` has a ~1px neutral-gray ring at its extreme border
 (invisible at any scale; likely NPP conversion edge behavior; full-low
 downscaled from the same frames shows pure content).
 
-## OPEN: playback smoothness (quantified 2026-07-18)
+## RESOLVED (2026-07-18): playback smoothness — canvas was the jittery framesync master
 User reports slightly un-smooth motion. MEASURED on live all-field (packet PTS
 deltas, ms): 70x33 / 21x67 / 5x100 / 3x133 / 1x157 / 2x167 — i.e. ~30% of
 frame intervals are 2-5x gaps. Raw camera reference (raw/bay-1): 118x33 / 1
@@ -387,15 +387,24 @@ FAILED APPROACHES (do not retry blindly):
   batch-mates quantize to the same slot -> drop=287. Any
   wallclock-at-processing-time quantization breaks at >1x throughput.
 
-NEXT-SESSION PLAN (measurement-driven):
-1. Offline A/B: single-overlay graph vs 5-chained overlays vs canvas-free
-   variant — measure PTS delta distributions of each to isolate where the
-   gaps enter (canvas timeline? chaining depth? framesync opts?).
-2. Try canvas at higher rate (e.g. rate=2*fps) or framesync ts_sync_mode.
-3. Consider trusting RTSP/RTCP-NTP input PTS for cross-camera alignment
-   (UniFi cams NTP-synced) instead of wallclock setpts — would remove
-   filter-time jitter entirely, but this is the deep water that motivated the
-   wallclock hack; needs careful offline verification of cross-input offsets.
+RESOLUTION (A/B-isolated, deployed, live-verified):
+- A/B matrix (offline, production-matched encoder flags — first run was
+  garbage: default NVENC B-frames made mp4 packet order non-monotonic;
+  rerun with -bf 0): canvas-with-wallclock-setpts graphs gap; the SAME graph
+  with the canvas on its NATIVE rate=fps timeline is PERFECT (299/299).
+- Mechanism: framesync (overlay_cuda) uses the main input — the canvas — as
+  the output timeline master. A wallclock-stamped canvas has a jittery
+  master grid, so pairings skip slots (the exact-33ms-multiple gaps).
+  Native canvas = perfect master grid; jittery camera stamps only drive
+  pairing (jitter-tolerant); cross-camera sync unaffected (inputs align
+  mutually via the shared wallclock baseline).
+- Fix: gpuCanvas emits no setpts (native timeline). One change.
+- LIVE VERIFIED: every stream now 299x33ms + exactly the raw cameras' own
+  single hiccup per 10s (bay-1: 298x33 + 1x135) — composites add ZERO gaps.
+  Sync intact (bays + field-centered within 1s), latency ~2s, 0 discards.
+- Startup note: canvas starts at PTS 0, inputs at elapsed-since-baseline →
+  a few seconds of black pre-roll frames on fresh publish; live-edge viewers
+  never see them.
 
 ## Things not to do
 - Don't try to content-detect a frozen vstack half via a coarse grid — the seam
