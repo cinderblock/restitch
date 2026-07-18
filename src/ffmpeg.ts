@@ -103,8 +103,14 @@ function gpuRotationChain(rotation: string): string[] {
 
 /**
  * Emit a GPU canvas source: a black nv12 frame of the given size living on
- * the CUDA device, stamped with the same wallclock setpts expression as the
- * camera inputs so overlay_cuda pairs frames on one timeline.
+ * the CUDA device, on its NATIVE uniform rate=fps timeline — deliberately NOT
+ * wallclock-stamped. Framesync (overlay_cuda) uses the canvas (main input) as
+ * the output timeline master: a native canvas yields a perfect 1/fps output
+ * grid (A/B-measured: 299/299 intervals exact vs ~25% skipped slots with a
+ * wallclock-stamped canvas — the judder the user saw). The jittery wallclock
+ * stamps on the camera inputs only drive frame PAIRING, which tolerates
+ * jitter, and cross-camera sync is unaffected (inputs align mutually through
+ * their shared wallclock baseline).
  */
 function gpuCanvas(
   label: string,
@@ -115,7 +121,6 @@ function gpuCanvas(
 ): string {
   return (
     `color=black:size=16x16:rate=${fps},format=nv12,${GPU_COLOR_RETAG},` +
-    `setpts=(RTCTIME-${baseline})/(TB*1000000),` +
     // setsar=1: the color source is square (DAR 1:1) and scale_cuda preserves
     // DAR by writing a compensating SAR; as the overlay main input, that
     // square-DAR poison would propagate into every output (players squish
