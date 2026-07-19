@@ -83,6 +83,11 @@ export function generateMediaMTXConfig(
     ...(config.webrtc.additional_hosts.length > 0
       ? { webrtcAdditionalHosts: config.webrtc.additional_hosts }
       : {}),
+    ...(config.webrtc.ice_servers.length > 0
+      ? {
+          webrtcICEServers2: config.webrtc.ice_servers.map((url) => ({ url })),
+        }
+      : {}),
 
     // Control API — unauthenticated, LAN only. Endpoints under /v3/:
     //   GET /v3/paths/list           paths + reader/source state + bytes

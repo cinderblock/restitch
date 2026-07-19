@@ -74,5 +74,7 @@ log_level: info           # quiet, error, warning, info, verbose, debug
 # NOT traverse HTTP reverse proxies — for off-LAN viewers, forward UDP 8189
 # from the WAN edge to this box and advertise a reachable name here.
 # webrtc:
+#   ice_servers:
+#     - stun:stun.l.google.com:19302   # srflx (numeric-IP) candidates — needed for Safari/iOS
 #   additional_hosts:
 #     - stream.example.com   # split-horizon: LAN → this box, WAN → edge/DDNS
