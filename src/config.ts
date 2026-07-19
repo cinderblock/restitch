@@ -181,6 +181,18 @@ const OutputSchema = z.object({
 });
 
 const WebRTCSchema = z.object({
+  ice_servers: z
+    .array(z.string())
+    .default([])
+    .describe(
+      "STUN/TURN server URLs (mediamtx webrtcICEServers2), e.g. " +
+        "'stun:stun.l.google.com:19302'. With STUN, the server discovers its " +
+        "WAN address through the UDP mux port and advertises it as a " +
+        "numeric-IP srflx candidate — required for Safari/iOS viewers, which " +
+        "ignore non-mDNS FQDN candidates (additional_hosts alone is not " +
+        "enough for them), and self-tracks a dynamic WAN IP. Also handed to " +
+        "clients via the WHIP/WHEP Link header for their own gathering."
+    ),
   additional_hosts: z
     .array(z.string())
     .default([])
@@ -318,7 +330,7 @@ export const ConfigSchema = z.object({
     format: "rtsp",
     base_url: "rtsp://localhost:8554",
   }),
-  webrtc: WebRTCSchema.default({ additional_hosts: [] }),
+  webrtc: WebRTCSchema.default({ ice_servers: [], additional_hosts: [] }),
   dashboard: DashboardSchema.default({
     enabled: true,
     address: ":9000",
