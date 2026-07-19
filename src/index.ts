@@ -80,16 +80,26 @@ async function main() {
   // Build the main FFmpeg pipeline (Bay 1-5 composite + sub-streams)
   const pipeline = buildPipeline(config, cameraProbes);
 
-  // Build a separate pipeline per extra composite. We keep the `extra` config
+  // Extra composites that reference a produced stream (`stream:` refs) are
+  // built INTO the main pipeline above (buildPipeline inlines them — tapping
+  // pre-encode frames avoids the re-ingest hop whose bursty arrival caused
+  // stale-frame pairing, the all-field top-half rubber-banding). Only
+  // camera-only extras get their own process here. We keep the `extra` config
   // around so the launch factory can REBUILD the command on every (re)spawn —
   // see the note on the ffmpeg launch below for why a fresh build per spawn
   // matters (the setpts wall-clock baseline must be recomputed each restart).
+  const inlinedExtras = config.extra_composites.filter((e) =>
+    e.inputs.some((r) => r.stream !== undefined)
+  );
+  const standaloneExtras = config.extra_composites.filter(
+    (e) => !e.inputs.some((r) => r.stream !== undefined)
+  );
   const extraPipelines: {
     name: string;
     extra: (typeof config.extra_composites)[number];
     pipeline: Pipeline;
     cmd: string[];
-  }[] = config.extra_composites.map((extra) => {
+  }[] = standaloneExtras.map((extra) => {
     const p = buildExtraCompositePipeline(config, extra, cameraProbes);
     return { name: extra.name, extra, pipeline: p, cmd: buildCommand(config, p) };
   });
@@ -185,9 +195,22 @@ async function main() {
     name: "ffmpeg",
     paths: pipeline.outputs.map((o) => o.name),
     process: ffmpegProc,
-    inputPaths: config.cameras
-      .filter((c) => c.composite !== false)
-      .map((c) => rawStreamName(c)),
+    // Composite cameras + the camera inputs of INLINED extra composites
+    // (e.g. Field Centered for all-field) — their source reconnects wedge
+    // this process's reads just like a bay's would. Inlined `stream:` refs
+    // are internal graph taps, not RTSP reads, so they need no watch.
+    inputPaths: [
+      ...config.cameras
+        .filter((c) => c.composite !== false)
+        .map((c) => rawStreamName(c)),
+      ...inlinedExtras.flatMap((e) =>
+        e.inputs.flatMap((ref) => {
+          if (ref.stream !== undefined) return [];
+          const cam = cameraByName.get(ref.name!);
+          return cam ? [rawStreamName(cam)] : [];
+        })
+      ),
+    ],
   });
 
   // One FFmpeg per extra composite — independent restart, independent CPU/GPU

@@ -307,6 +307,201 @@ function ptsBaselineMicros(): number {
   return Date.now() * 1000;
 }
 
+/**
+ * Shared RTSP input argument block, used by every compositor input (main
+ * cameras, inlined-extra cameras, standalone extra composites).
+ */
+function pushRtspInput(
+  inputArgs: string[],
+  config: Config,
+  sourceUrl: string
+): void {
+  inputArgs.push(
+    ...hwaccelInputArgs(config.hwaccel),
+    // Low-latency input: don't pre-buffer the demuxer, decode with low
+    // delay. Keeps the compositor reading at the live edge so latency
+    // doesn't slowly accumulate (setpts makes the pipeline latency-blind,
+    // so the input must not hoard frames).
+    "-fflags", "nobuffer",
+    "-flags", "low_delay",
+    "-thread_queue_size", "4096",
+    // Cameras advertise 3 tracks (MPEG-4 Audio, Opus, H264). We only encode
+    // video — pulling the audio tracks too floods FFmpeg's RTP demuxer with
+    // packets it just discards, producing "bad cseq" warnings and dropping
+    // video packets along the way. That corrupts the encoded output enough
+    // to keep WebRTC clients stuck waiting for a clean keyframe.
+    "-allowed_media_types", "video",
+    // Exit if no RTSP data for 30s. Without this the compositor will
+    // keep running with the last frame from a stalled input forever,
+    // and the supervisor never gets a chance to restart it.
+    "-timeout", "30000000",
+    "-rtsp_transport", "tcp",
+    "-i", sourceUrl
+  );
+}
+
+/**
+ * One input of an extra-composite stack, ready for the shared chain emitter:
+ * `label` must carry nv12 CUDA frames with EXACT dims (no padded pool dims),
+ * pre-rotation. Rotation/crop are applied by emitExtraChain in that order
+ * (crop percentages resolve against post-rotation dimensions).
+ */
+type StackPiece = {
+  label: string;
+  width: number;
+  height: number;
+  rotation: string;
+  crop?: {
+    x: number | string;
+    y: number | string;
+    width: number | string;
+    height: number | string;
+  };
+  fps: number;
+};
+
+/**
+ * Emit the extra-composite stacking chain: per-input GPU rotation + crop,
+ * scale-to-match on the stacking axis, canvas + chained overlay_cuda stack,
+ * then post-stack rotation/scale (or the exact-dims normalizer). Shared by
+ * the standalone extra-composite builder and the inlined path in
+ * buildPipeline; `prefix` keeps graph labels unique per composite.
+ * Returns the final output label + dimensions.
+ */
+function emitExtraChain(
+  filters: string[],
+  extra: ExtraComposite,
+  pieces: StackPiece[],
+  baseline: number,
+  interp: string,
+  prefix: string
+): { label: string; width: number; height: number } {
+  type Sized = { label: string; width: number; height: number };
+  const perInput: Sized[] = [];
+
+  for (let i = 0; i < pieces.length; i++) {
+    const p = pieces[i]!;
+    let cur = p.label;
+    // GPU rotation (transpose_npp sandwich; nv12 in → nv12 out).
+    const rot = gpuRotationChain(p.rotation);
+    let { width: w, height: h } = rotatedDimensions(p.width, p.height, p.rotation);
+    if (rot.length > 0) {
+      const lbl = `[${prefix}_rot_${i}]`;
+      filters.push(`${cur}${rot.join(",")}${lbl}`);
+      cur = lbl;
+    }
+
+    // Optional crop (percentages resolve against post-rotation dimensions):
+    // place at negative offsets on a crop-sized GPU canvas.
+    if (p.crop) {
+      const cx = resolveDimension(p.crop.x, w);
+      const cy = resolveDimension(p.crop.y, h);
+      const cw = resolveDimension(p.crop.width, w);
+      const ch = resolveDimension(p.crop.height, h);
+      filters.push(gpuCanvas(`[${prefix}_ccv_${i}]`, cw, ch, p.fps, baseline));
+      filters.push(
+        `[${prefix}_ccv_${i}]${cur}overlay_cuda=x=${-cx}:y=${-cy}[${prefix}_crop_${i}]`
+      );
+      // Re-normalize after the crop overlay: an overlay_cuda output feeding
+      // another overlay's second pad fails format negotiation; routing it
+      // through scale_npp pins the link to nv12.
+      const normLbl = `[${prefix}_cn_${i}]`;
+      filters.push(`[${prefix}_crop_${i}]scale_npp=format=nv12${normLbl}`);
+      cur = normLbl;
+      w = cw;
+      h = ch;
+    }
+
+    perInput.push({ label: cur, width: w, height: h });
+  }
+
+  // --- Scale mismatched inputs to the first input's stacking-axis dimension ---
+  const referenceWidth = perInput[0]!.width;
+  const referenceHeight = perInput[0]!.height;
+  const stackPieces: Sized[] = [];
+  for (let i = 0; i < perInput.length; i++) {
+    let { label, width, height } = perInput[i]!;
+    // scale_npp has no -2 auto-dimension; compute the even aspect-preserving
+    // size explicitly.
+    if (extra.direction === "vertical" && width !== referenceWidth) {
+      const target = Math.round((height * referenceWidth) / width / 2) * 2;
+      filters.push(
+        `${label}scale_cuda=w=${referenceWidth}:h=${target}:interp_algo=${interp}:format=nv12[${prefix}_scale_${i}]`
+      );
+      label = `[${prefix}_scale_${i}]`;
+      width = referenceWidth;
+      height = target;
+    } else if (extra.direction === "horizontal" && height !== referenceHeight) {
+      const target = Math.round((width * referenceHeight) / height / 2) * 2;
+      filters.push(
+        `${label}scale_cuda=w=${target}:h=${referenceHeight}:interp_algo=${interp}:format=nv12[${prefix}_scale_${i}]`
+      );
+      label = `[${prefix}_scale_${i}]`;
+      width = target;
+      height = referenceHeight;
+    }
+    stackPieces.push({ label, width, height });
+  }
+
+  // --- Stack: GPU canvas + chained overlay_cuda ---
+  const vertical = extra.direction === "vertical";
+  const stackW = vertical
+    ? stackPieces[0]!.width
+    : stackPieces.reduce((s, p) => s + p.width, 0);
+  const stackH = vertical
+    ? stackPieces.reduce((s, p) => s + p.height, 0)
+    : stackPieces[0]!.height;
+  filters.push(
+    gpuCanvas(`[${prefix}_cv]`, stackW, stackH, pieces[0]!.fps, baseline)
+  );
+  let outLbl = `[${prefix}_cv]`;
+  let off = 0;
+  for (let i = 0; i < stackPieces.length; i++) {
+    const lbl = `[${prefix}_st_${i}]`;
+    const x = vertical ? 0 : off;
+    const y = vertical ? off : 0;
+    filters.push(
+      `${outLbl}${stackPieces[i]!.label}overlay_cuda=x=${x}:y=${y}${lbl}`
+    );
+    off += vertical ? stackPieces[i]!.height : stackPieces[i]!.width;
+    outLbl = lbl;
+  }
+
+  // --- Post-stack rotation (GPU) ---
+  let outW = stackW;
+  let outH = stackH;
+  const postRot = gpuRotationChain(extra.rotation);
+  if (postRot.length > 0) {
+    filters.push(`${outLbl}${postRot.join(",")}[${prefix}_post_rot]`);
+    outLbl = `[${prefix}_post_rot]`;
+    ({ width: outW, height: outH } = rotatedDimensions(
+      stackW,
+      stackH,
+      extra.rotation
+    ));
+  }
+
+  // --- Optional post-stack scale (GPU) ---
+  if (extra.scale) {
+    filters.push(
+      `${outLbl}scale_cuda=w=${extra.scale.width}:h=${extra.scale.height}:interp_algo=${interp}:format=nv12[${prefix}_scaled]`
+    );
+    outLbl = `[${prefix}_scaled]`;
+    outW = extra.scale.width;
+    outH = extra.scale.height;
+  } else if (postRot.length === 0) {
+    // Overlay-final: restore true dimensions with explicit targets (padded
+    // canvas allocation otherwise encodes as green bars — see buildPipeline).
+    // yuv420p forces a real conversion (see buildPipeline normalizer comment).
+    filters.push(
+      `${outLbl}scale_npp=w=${outW}:h=${outH}:format=yuv420p[${prefix}_norm]`
+    );
+    outLbl = `[${prefix}_norm]`;
+  }
+
+  return { label: outLbl, width: outW, height: outH };
+}
+
 export function buildPipeline(
   config: Config,
   cameraProbes: Map<string, ProbeResult>
@@ -335,28 +530,10 @@ export function buildPipeline(
   // (setpts=(RTCTIME-RTCSTART) below) so all inputs share a real-time grid:
   // smooth, internally synced, and self-healing (skew can't accumulate).
   for (const cam of cameras) {
-    const sourceUrl = `${config.output.base_url}/${rawStreamName(cam)}`;
-    inputArgs.push(
-      ...hwaccelInputArgs(config.hwaccel),
-      // Low-latency input: don't pre-buffer the demuxer, decode with low
-      // delay. Keeps the compositor reading at the live edge so latency
-      // doesn't slowly accumulate (setpts makes the pipeline latency-blind,
-      // so the input must not hoard frames).
-      "-fflags", "nobuffer",
-      "-flags", "low_delay",
-      "-thread_queue_size", "4096",
-      // Cameras advertise 3 tracks (MPEG-4 Audio, Opus, H264). We only encode
-      // video — pulling the audio tracks too floods FFmpeg's RTP demuxer with
-      // packets it just discards, producing "bad cseq" warnings and dropping
-      // video packets along the way. That corrupts the encoded output enough
-      // to keep WebRTC clients stuck waiting for a clean keyframe.
-      "-allowed_media_types", "video",
-      // Exit if no RTSP data for 30s. Without this the compositor will
-      // keep running with the last frame from a stalled input forever,
-      // and the supervisor never gets a chance to restart it.
-      "-timeout", "30000000",
-      "-rtsp_transport", "tcp",
-      "-i", sourceUrl
+    pushRtspInput(
+      inputArgs,
+      config,
+      `${config.output.base_url}/${rawStreamName(cam)}`
     );
   }
 
@@ -516,6 +693,136 @@ export function buildPipeline(
     });
   }
 
+  // --- Inlined extra composites -------------------------------------------
+  // Extra composites that reference a PRODUCED stream (`stream:` refs) build
+  // INSIDE this graph, tapping the referenced output's pre-encode frames via
+  // split. The previous architecture re-ingested the encoded stream over RTSP
+  // in a separate process; that re-ingest re-stamped frames with their
+  // ARRIVAL wallclock, and NVENC's bursty output pacing (keyframe waves)
+  // made framesync occasionally pair a STALE frame into the referencing
+  // composite (the all-field top-half rubber-banding, 2026-07-19). Tapping
+  // pre-encode frames keeps the referenced branch on this process's exact
+  // canvas-grid timeline — pairing is deterministic — and drops a whole
+  // decode+encode hop of latency plus an NVDEC session. Camera-only extra
+  // composites still run as separate processes (see index.ts).
+  const inlined = config.extra_composites.filter((e) =>
+    e.inputs.some((r) => r.stream !== undefined)
+  );
+  if (inlined.length > 0) {
+    const cameraByName = new Map<string, Camera>(
+      config.cameras.map((c) => [c.name, c])
+    );
+    // Split each referenced output once, with a tap leg per referencing input.
+    const tapsNeeded = new Map<string, number>();
+    for (const ex of inlined)
+      for (const ref of ex.inputs)
+        if (ref.stream !== undefined)
+          tapsNeeded.set(ref.stream, (tapsNeeded.get(ref.stream) ?? 0) + 1);
+    const tapLabels = new Map<string, string[]>();
+    for (const [stream, count] of tapsNeeded) {
+      const out = outputs.find((o) => o.name === stream);
+      if (!out) {
+        throw new Error(
+          `extra_composite references unknown stream "${stream}" ` +
+            `(must be the main composite or a sub_stream name)`
+        );
+      }
+      const oi = outputs.indexOf(out);
+      const labels = Array.from(
+        { length: count },
+        (_, k) => `[tap_${oi}_${k}]`
+      );
+      filters.push(
+        `${out.mapLabel}split=${count + 1}[enc_${oi}]${labels.join("")}`
+      );
+      out.mapLabel = `[enc_${oi}]`;
+      tapLabels.set(stream, labels);
+    }
+
+    let nextInput = cameras.length;
+    for (let ei = 0; ei < inlined.length; ei++) {
+      const extra = inlined[ei]!;
+      const prefix = `ex${ei}`;
+      const pieces: StackPiece[] = [];
+      for (let i = 0; i < extra.inputs.length; i++) {
+        const ref = extra.inputs[i]!;
+        if (ref.stream !== undefined) {
+          const dims = producedStreamDims(config, cameraProbes, ref.stream)!;
+          const tap = tapLabels.get(ref.stream)!.pop()!;
+          // Pin the tap to nv12: unscaled outputs end in the yuv420p
+          // normalizer, and the downstream rotation/crop/overlay chain
+          // expects the graph's nv12 working format. (nv12 taps pass
+          // through untouched — they already carry exact dims.)
+          const lbl = `[${prefix}_tap_${i}]`;
+          filters.push(`${tap}scale_npp=format=nv12${lbl}`);
+          // Deliberately NO fps/setpts re-stamp here: tap frames already
+          // ride this process's canvas-grid timeline, so pairing with the
+          // extra's canvas is exact — that is the point of inlining.
+          pieces.push({
+            label: lbl,
+            width: dims.width,
+            height: dims.height,
+            rotation: ref.rotation ?? "0",
+            crop: ref.crop,
+            fps: compositeFps,
+          });
+        } else {
+          const cam = cameraByName.get(ref.name!);
+          if (!cam) {
+            throw new Error(
+              `extra_composite "${extra.name}" references unknown camera "${ref.name}"`
+            );
+          }
+          const probe = cameraProbes.get(ref.name!);
+          if (!probe) {
+            throw new Error(
+              `extra_composite "${extra.name}": no probe result for "${ref.name}"`
+            );
+          }
+          pushRtspInput(
+            inputArgs,
+            config,
+            `${config.output.base_url}/${rawStreamName(cam)}`
+          );
+          // Same stamped chain as the bay cameras: fps pacing + shared
+          // wallclock baseline, so this input pairs with the extra's canvas
+          // exactly like the bays pair with the stack canvas. Rotation is
+          // applied by emitExtraChain (it must precede the crop).
+          const lbl = `[${prefix}_cam_${i}]`;
+          filters.push(
+            `[${nextInput}:v]${GPU_COLOR_RETAG},fps=${probe.fps},` +
+              `setpts=(RTCTIME-${baseline})/(TB*1000000),scale_npp=format=nv12${lbl}`
+          );
+          nextInput++;
+          pieces.push({
+            label: lbl,
+            width: probe.width,
+            height: probe.height,
+            rotation: ref.rotation ?? cam.rotation,
+            crop: ref.crop,
+            fps: probe.fps,
+          });
+        }
+      }
+      const fin = emitExtraChain(
+        filters,
+        extra,
+        pieces,
+        baseline,
+        interp,
+        prefix
+      );
+      outputs.push({
+        name: extra.name,
+        mapLabel: fin.label,
+        codecOverride: extra.codec,
+        maxrateOverride: extra.maxrate,
+        bufsizeOverride: extra.bufsize,
+        fps: compositeFps,
+      });
+    }
+  }
+
   const filterComplex = filters.join(";\n");
 
   return { inputArgs, filterComplex, outputs };
@@ -582,12 +889,15 @@ function producedStreamDims(
 }
 
 /**
- * Build an FFmpeg pipeline for a single "extra" composite — a vstack or hstack
- * of an arbitrary subset of inputs, with optional per-input crop and
- * post-stack rotation/scale. Produces a single output stream named
- * extra.name. Inputs are cameras (pulled from local mediamtx raw paths) or
- * already-produced streams (`stream:` refs, pulled from their own mediamtx
- * path — reuses the encoded stream instead of re-decoding its sources).
+ * Build an FFmpeg pipeline for a single CAMERA-ONLY "extra" composite — a
+ * vstack or hstack of cameras (pulled from local mediamtx raw paths), with
+ * optional per-input crop and post-stack rotation/scale. Produces a single
+ * output stream named extra.name.
+ *
+ * Composites that reference an already-produced stream (`stream:` refs) are
+ * NOT built here — they inline into the main pipeline (see buildPipeline),
+ * which taps the referenced output's pre-encode frames instead of
+ * re-ingesting the encoded stream.
  *
  * Inputs are auto-scaled to the FIRST input's stacking-axis dimension so
  * vstack/hstack doesn't reject mismatched widths/heights.
@@ -604,34 +914,19 @@ export function buildExtraCompositePipeline(
   const filters: string[] = [];
   const inputArgs: string[] = [];
 
-  // Produced streams are CFR at the composite rate (see PipelineOutput.fps);
-  // used as the fps for `stream:` inputs.
-  const compositeCams = config.cameras.filter((c) => c.composite !== false);
-  const compositeFps = compositeCams[0]
-    ? (cameraProbes.get(compositeCams[0].name)?.fps ?? 30)
-    : 30;
-
   // Resolve each input to a mediamtx path + dimensions + rate. Cameras pull
-  // from raw/<slug> with probed dims; `stream:` refs pull the produced stream's
-  // own path with dims derived from config (it may not be publishing yet —
-  // this ffmpeg and the main compositor start concurrently).
+  // from raw/<slug> with probed dims. `stream:` refs never reach this builder:
+  // composites that reference a produced stream are inlined into the MAIN
+  // pipeline (see buildPipeline), where they tap pre-encode frames instead of
+  // re-ingesting the encoded stream (whose bursty arrival caused stale-frame
+  // pairing — the all-field rubber-banding).
   const resolved = extra.inputs.map((ref) => {
     if (ref.stream !== undefined) {
-      const dims = producedStreamDims(config, cameraProbes, ref.stream);
-      if (!dims) {
-        throw new Error(
-          `extra_composite "${extra.name}" references unknown stream ` +
-            `"${ref.stream}" (must be the main composite or a sub_stream name)`
-        );
-      }
-      return {
-        ref,
-        path: ref.stream,
-        width: dims.width,
-        height: dims.height,
-        fps: compositeFps,
-        rotation: ref.rotation ?? ("0" as const),
-      };
+      throw new Error(
+        `extra_composite "${extra.name}" has a stream ref ("${ref.stream}") — ` +
+          `stream-referencing composites are inlined into the main pipeline, ` +
+          `not built standalone`
+      );
     }
     const cam = cameraByName.get(ref.name!);
     if (!cam) {
@@ -667,169 +962,42 @@ export function buildExtraCompositePipeline(
   // compositor — so both inputs share a real-time grid that stays smooth
   // AND internally synced.
   for (const { path } of resolved) {
-    const sourceUrl = `${config.output.base_url}/${path}`;
-    inputArgs.push(
-      // ALL inputs decode on the GPU — including produced-stream (`stream:`)
-      // refs. (An earlier CPU-decode exception here was misattributed blame:
-      // the compositor wedge it tried to avoid was actually the NVENC budget
-      // overrun + CFR dup spiral, both since fixed. User policy: GPU or error.)
-      ...hwaccelInputArgs(config.hwaccel),
-      // Low-latency input (same rationale as the main compositor): read at
-      // the live edge so latency doesn't accumulate behind the latency-blind
-      // setpts timeline.
-      "-fflags",
-      "nobuffer",
-      "-flags",
-      "low_delay",
-      "-thread_queue_size",
-      "4096",
-      "-allowed_media_types",
-      "video",
-      // Exit if no RTSP data for 30s so the supervisor restarts us
-      // instead of running forever with one input frozen.
-      "-timeout",
-      "30000000",
-      "-rtsp_transport",
-      "tcp",
-      "-i",
-      sourceUrl
-    );
+    pushRtspInput(inputArgs, config, `${config.output.base_url}/${path}`);
   }
 
-  // --- Per-input fps / GPU rotation / GPU crop, then scale-to-match ---
-  // GPU graph (see buildPipeline): rotation = transpose_npp sandwich; crop =
-  // negative-offset overlay_cuda onto a crop-sized canvas; scaling = scale_npp.
+  // --- Per-input fps normalization, then the shared stacking chain ---
+  // Same stamped chain as the main compositor's cameras: fps pacing + the
+  // shared wallclock baseline (see buildPipeline for the full rationale),
+  // ending in the nv12 link normalizer (raw NVDEC → overlay_cuda fails
+  // format negotiation). Rotation and crop are applied by emitExtraChain
+  // (rotation precedes crop; crop percentages resolve against post-rotation
+  // dimensions).
   const interp = gpuInterp(config.encoder.scale_flags);
-  type Resolved = {
-    label: string; // output label for this input after fps+rotate+crop
-    width: number;
-    height: number;
-  };
-  const perInput: Resolved[] = [];
-
+  const pieces: StackPiece[] = [];
   for (let i = 0; i < resolved.length; i++) {
-    const { ref, rotation } = resolved[i]!;
     const input = resolved[i]!;
-    // Real-time PTS after fps — see buildPipeline for the full rationale.
-    // Unrotated branches get the scale_npp format normalizer (see
-    // buildPipeline: raw NVDEC → overlay_cuda fails format negotiation).
-    const rot = gpuRotationChain(rotation);
-    // fps first, then continuous wallclock stamp (see buildPipeline).
-    const chain = [
-      GPU_COLOR_RETAG,
-      `fps=${input.fps}`,
-      `setpts=(RTCTIME-${baseline})/(TB*1000000)`,
-      ...(rot.length > 0 ? rot : ["scale_npp=format=nv12"]),
-    ];
-    let prev = `[xc_in_${i}]`;
-    filters.push(`[${i}:v]${chain.join(",")}${prev}`);
-
-    const rotated = rotatedDimensions(input.width, input.height, rotation);
-    let w = rotated.width;
-    let h = rotated.height;
-
-    // Optional crop (percentages resolve against post-rotation dimensions):
-    // place at negative offsets on a crop-sized GPU canvas.
-    if (ref.crop) {
-      const cx = resolveDimension(ref.crop.x, w);
-      const cy = resolveDimension(ref.crop.y, h);
-      const cw = resolveDimension(ref.crop.width, w);
-      const ch = resolveDimension(ref.crop.height, h);
-      filters.push(gpuCanvas(`[xc_ccv_${i}]`, cw, ch, input.fps, baseline));
-      filters.push(
-        `[xc_ccv_${i}]${prev}overlay_cuda=x=${-cx}:y=${-cy}[xc_crop_${i}]`
-      );
-      // Re-normalize after the crop overlay: an overlay_cuda output feeding
-      // another overlay's second pad fails format negotiation; routing it
-      // through scale_npp pins the link to nv12.
-      const normLbl = `[xc_cn_${i}]`;
-      filters.push(`[xc_crop_${i}]scale_npp=format=nv12${normLbl}`);
-      prev = normLbl;
-      w = cw;
-      h = ch;
-    }
-
-    perInput.push({ label: prev, width: w, height: h });
-  }
-
-  // --- Scale mismatched inputs to the first input's stacking-axis dimension ---
-  const referenceWidth = perInput[0]!.width;
-  const referenceHeight = perInput[0]!.height;
-  const stackPieces: { label: string; width: number; height: number }[] = [];
-
-  for (let i = 0; i < perInput.length; i++) {
-    const r = perInput[i]!;
-    let { label, width, height } = r;
-    // scale_npp has no -2 auto-dimension; compute the even aspect-preserving
-    // size explicitly.
-    if (extra.direction === "vertical" && width !== referenceWidth) {
-      const target = Math.round((height * referenceWidth) / width / 2) * 2;
-      filters.push(
-        `${label}scale_cuda=w=${referenceWidth}:h=${target}:interp_algo=${interp}:format=nv12[xc_scale_${i}]`
-      );
-      label = `[xc_scale_${i}]`;
-      width = referenceWidth;
-      height = target;
-    } else if (extra.direction === "horizontal" && height !== referenceHeight) {
-      const target = Math.round((width * referenceHeight) / height / 2) * 2;
-      filters.push(
-        `${label}scale_cuda=w=${target}:h=${referenceHeight}:interp_algo=${interp}:format=nv12[xc_scale_${i}]`
-      );
-      label = `[xc_scale_${i}]`;
-      width = target;
-      height = referenceHeight;
-    }
-    stackPieces.push({ label, width, height });
-  }
-
-  // --- Stack: GPU canvas + chained overlay_cuda ---
-  const xcVertical = extra.direction === "vertical";
-  const xcW = xcVertical
-    ? stackPieces[0]!.width
-    : stackPieces.reduce((s, p) => s + p.width, 0);
-  const xcH = xcVertical
-    ? stackPieces.reduce((s, p) => s + p.height, 0)
-    : stackPieces[0]!.height;
-  filters.push(gpuCanvas("[xc_cv]", xcW, xcH, resolved[0]!.fps, baseline));
-  let outLbl = "[xc_cv]";
-  let xcOff = 0;
-  for (let i = 0; i < stackPieces.length; i++) {
-    const lbl = `[xc_st_${i}]`;
-    const x = xcVertical ? 0 : xcOff;
-    const y = xcVertical ? xcOff : 0;
+    const lbl = `[xc_in_${i}]`;
     filters.push(
-      `${outLbl}${stackPieces[i]!.label}overlay_cuda=x=${x}:y=${y}${lbl}`
+      `[${i}:v]${GPU_COLOR_RETAG},fps=${input.fps},` +
+        `setpts=(RTCTIME-${baseline})/(TB*1000000),scale_npp=format=nv12${lbl}`
     );
-    xcOff += xcVertical ? stackPieces[i]!.height : stackPieces[i]!.width;
-    outLbl = lbl;
+    pieces.push({
+      label: lbl,
+      width: input.width,
+      height: input.height,
+      rotation: input.rotation,
+      crop: input.ref.crop,
+      fps: input.fps,
+    });
   }
 
-  // --- Post-stack rotation (GPU) ---
-  const postRot = gpuRotationChain(extra.rotation);
-  if (postRot.length > 0) {
-    filters.push(`${outLbl}${postRot.join(",")}[xc_post_rot]`);
-    outLbl = "[xc_post_rot]";
-  }
-
-  // --- Optional post-stack scale (GPU) ---
-  if (extra.scale) {
-    filters.push(
-      `${outLbl}scale_cuda=w=${extra.scale.width}:h=${extra.scale.height}:interp_algo=${interp}:format=nv12[xc_scaled]`
-    );
-    outLbl = "[xc_scaled]";
-  } else if (postRot.length === 0) {
-    // Overlay-final: restore true dimensions with explicit targets (see
-    // buildPipeline — padded canvas allocation otherwise encodes as green bars).
-    // yuv420p forces a real conversion (see buildPipeline normalizer comment).
-    filters.push(`${outLbl}scale_npp=w=${xcW}:h=${xcH}:format=yuv420p[xc_norm]`);
-    outLbl = "[xc_norm]";
-  }
+  const fin = emitExtraChain(filters, extra, pieces, baseline, interp, "xc");
 
   const filterComplex = filters.join(";\n");
   const outputs: PipelineOutput[] = [
     {
       name: extra.name,
-      mapLabel: outLbl,
+      mapLabel: fin.label,
       codecOverride: extra.codec,
       maxrateOverride: extra.maxrate,
       bufsizeOverride: extra.bufsize,

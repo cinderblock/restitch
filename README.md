@@ -24,8 +24,8 @@ A single bun process supervises the whole stack:
 | Subprocess | Purpose |
 |---|---|
 | mediamtx | RTSP/WebRTC/HLS server + control API |
-| ffmpeg (main) | composite + sub-stream crops |
-| ffmpeg (extra) | one per `extra_composites` entry |
+| ffmpeg (main) | composite + sub-stream crops + stream-referencing extra composites |
+| ffmpeg (extra) | one per camera-only `extra_composites` entry |
 | whisper-server | CUDA speech-to-text |
 | ffmpeg (audio fusion) | N-channel amerge → max-abs mono for transcription |
 | dashboard | live status + per-stream actions |

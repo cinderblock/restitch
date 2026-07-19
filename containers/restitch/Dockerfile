@@ -2,8 +2,9 @@
 #
 # Single-container restitch image. One bun process supervises:
 #   - mediamtx (RTSP + WebRTC + HLS + control API)
-#   - main ffmpeg compositor (vstack + sub-stream crops)
-#   - one ffmpeg per extra_composite
+#   - main ffmpeg compositor (vstack + sub-stream crops + inlined
+#     stream-referencing extra composites)
+#   - one ffmpeg per camera-only extra_composite
 #   - whisper-server (CUDA)
 #   - audio fusion ffmpeg (N-channel amerge for transcription)
 #   - dashboard HTTP server

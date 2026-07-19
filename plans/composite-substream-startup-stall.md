@@ -442,6 +442,60 @@ RESOLUTION (A/B-isolated, deployed, live-verified):
   re-entering the CFR trap. Mitigations: VLC network-caching 2000-3000ms
   and/or --clock-jitter=0 --clock-synchro=0; differential test = watch via
   WebRTC (:8889/all-field) side-by-side, which should never rubber-band.
+- REOPENED (2026-07-19): user reports seeing the rubber-banding on OTHER
+  players too — weakens the VLC-clock-resync verdict; suspicion moves back
+  to something all players share. My scans verified TIMESTAMPS only; two
+  mechanisms could rubber-band every player with clean PTS:
+  (a) bursty DELIVERY pacing (encode/graph batching → starve+catch-up
+      oscillation in every low-buffer live player);
+  (b) decoder-level REORDERING (bitstream signals reorder buffering /
+      POC anomalies → players present frames out of order).
+  Step 4: measure wallclock arrival pacing + has_b_frames + decoded-frame
+  order on all-field (plans/tmp-arrival-pacing.sh). Also still need: WHICH
+  other players (WebRTC browser? HLS? scrypted?) — shared-WiFi common cause
+  not yet excluded either.
+- Step 4 DONE — MECHANISM FOUND (two layers):
+  (1) DELIVERY BURSTINESS, measured: all-field 38 arrival-stalls >150ms/60s
+      (max 461ms), the-field 34, raw passthrough only 7 (clean, keyframe-
+      period marks) — same mediamtx, same method → burst source is OUR
+      encode processes. Concurrent dmon: NVENC engine spikes 87-99% about
+      once per second — all 6 encoder sessions use g=30 (keyframe every 1s,
+      phase-aligned at spawn) → keyframe waves transiently saturate the
+      encode engine → output pauses then clumps.
+  (2) STALE-FRAME PAIRING on all-field's top half: all-field re-ingests
+      the-field over RTSP and re-stamps frames with ARRIVAL wallclock
+      (setpts=RTCTIME). Bursty arrival → clumped/gapped stamps → framesync
+      pairs some canvas ticks with a stale the-field frame while Field
+      Centered advances. User pattern (single old frames spliced into
+      forward playback, e.g. 12,[6],13) + "might be just banding on the
+      top half" both match. Verification running: tmp-half-forensics.sh
+      (YDIF top-vs-bottom hold counting).
+- User confirmed both symptoms: banding mostly on the TOP half (the-field
+  region — stale pairing) with milder stutter on the bottom (whole-frame
+  delivery burstiness). "doing all the compositing in one pass seems like a
+  better plan" → fix #1 approved.
+- FIX #1 IMPLEMENTED (committed, NOT yet deployed): stream-referencing extra
+  composites now INLINE into the main pipeline. buildPipeline splits the
+  referenced output pre-encode ([sub_1]split=2[enc_2][tap_2_0]), taps ride
+  the process's own canvas-grid timeline (NO arrival re-stamping — pairing
+  is deterministic), camera refs (Field Centered) join as extra NVDEC inputs
+  with the standard stamped chain. Shared chain emitter (emitExtraChain)
+  now serves both the inlined path and the standalone builder; standalone
+  is camera-only (stream refs there throw). index.ts partitions extras and
+  extends the main watchdog inputPaths with inlined camera refs.
+  VERIFIED: dry-run in-container with real probes — all-field graph correct
+  (crop x=-410 / 3686x1216 top, Field Centered 3686x2074 bottom, 3686x3290
+  stack, h264+12M via [ex0_norm]); entry graph BYTE-IDENTICAL to the old
+  builder. bun run check: only the 2 pre-existing errors.
+  Consequences: all-field restarts with the main process now (was already
+  cascade-coupled via watchdog); -1 NVDEC + -1 ffmpeg process; all-field
+  latency drops by a full encode+publish+decode hop; both halves show the
+  same instant.
+- FIX #2 STAGED (ops config, NEEDS EXPLICIT AUTHORIZATION — not applied):
+  encoder.keyframe_interval_seconds: 2 (halves the per-second aligned
+  keyframe waves that spike NVENC to 87-99% and clump delivery). Trade-off:
+  stream join takes up to 2s (keyframe wait). Also fixes the stale
+  "CPU-decoded" / download-to-CPU comments in the ops config.
 - INCIDENTAL FINDINGS from this hunt (separate issues):
   1. Audio-fusion (whisper) RTSP readers of raw/bay-1..4 are chronically
      "too slow" — ~69k mediamtx discard events/24h, active-hours-correlated
