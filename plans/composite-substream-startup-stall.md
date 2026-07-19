@@ -406,6 +406,55 @@ RESOLUTION (A/B-isolated, deployed, live-verified):
   a few seconds of black pre-roll frames on fresh publish; live-edge viewers
   never see them.
 
+## Rubber-banding (2026-07-19, INVESTIGATING)
+- Symptom (user): overall smoothness much better after the native-canvas fix, but
+  occasional "rubber-banding" — playback jumps BACK ~0.5s for a couple frames.
+  Stream/player not yet identified.
+- User asked whether we do a "proper triple buffer" — n/a as such: the pipeline is
+  queue-based (NVDEC → CUDA filters → NVENC → RTSP); no display buffering on our
+  side. The player's jitter buffer is the closest analog.
+- Hypotheses: (a) non-monotonic/duplicate PTS in our egress (would replay in any
+  player); (b) player-side clock resync (VLC live-RTSP clock jitter, WebRTC/HLS
+  buffer adaptation) with clean egress; (c) raw-camera passthrough carrying a
+  camera timestamp regression into `-c copy` restreams.
+- Step 1 DONE — egress is clean. 60s packet scan on full, full-low, the-field,
+  all-field, entry, raw/field-centered: 0 negative PTS deltas, 0 duplicates,
+  perfect 30fps grids (1800/1800 pkts); entry is natively 10fps (600 pkts,
+  100ms cadence — its "gap>100ms" lines were float noise on the nominal
+  interval, not gaps). No non-monotonic/discontinuity warnings in 3h of
+  container logs. Sentinel clock chrony-disciplined sub-ms, no steps.
+  → Hypothesis (a) and (c) dead: the published timeline never goes backward.
+  Rubber-banding must be viewer-side (player jitter buffer / live-edge
+  behavior) — need to know which player + stream the user sees it in.
+- Step 2: 25-min background scan armed on the-field/all-field/full-low/entry
+  (NEG/DUP only) to rule out rare egress events the 60s window could miss.
+- Tools: plans/tmp-pts-scan.sh, tmp-discard-analysis.sh, tmp-session-churn.sh
+  (scp'd to sentinel:/tmp/).
+- Step 3 DONE — user's viewing path exonerated the server completely. User
+  watches all-field in VLC over RTSP from 10.255.0.77. Their session
+  (d8a57214, created 21:07:52Z): TCP (no loss possible), ZERO mediamtx
+  discards, publisher unbroken since 15:45Z (no swap mid-session), egress
+  monotonic. CONCLUSION: the rewind is VLC's live-input clock resync (its
+  clock controller steps back and replays a few frames when its drift
+  estimate corrects) — server-side there is nothing left to fix without
+  re-entering the CFR trap. Mitigations: VLC network-caching 2000-3000ms
+  and/or --clock-jitter=0 --clock-synchro=0; differential test = watch via
+  WebRTC (:8889/all-field) side-by-side, which should never rubber-band.
+- INCIDENTAL FINDINGS from this hunt (separate issues):
+  1. Audio-fusion (whisper) RTSP readers of raw/bay-1..4 are chronically
+     "too slow" — ~69k mediamtx discard events/24h, active-hours-correlated
+     (Pacific daytime = speech). Fused transcription audio is lossy. Does
+     NOT touch video (per-reader queues). Worth a fix pass on the fusion
+     ffmpeg's consumption (e.g. -allowed_media_types audio / bigger
+     thread_queue_size / check whisper backpressure).
+  2. Dashboard snapshots create 1 reader session per path per minute
+     (~1440/day/path) — by design, benign, but explains RTSP session churn
+     in logs.
+  3. Main compositor restarted 3x in 24h (06:19, 06:45, 15:45Z), each a
+     camera source-reconnect (e.g. bay-3) — legit watchdog recovery; each
+     briefly interrupts all streams and puts all-field through an exit-8
+     retry loop until the-field returns (expected, self-healing).
+
 ## Things not to do
 - Don't try to content-detect a frozen vstack half via a coarse grid — the seam
   bleed + clock-at-seam confound it (proven). Use the source-reconnect signal.
