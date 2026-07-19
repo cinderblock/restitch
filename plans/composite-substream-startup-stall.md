@@ -426,8 +426,10 @@ RESOLUTION (A/B-isolated, deployed, live-verified):
   → Hypothesis (a) and (c) dead: the published timeline never goes backward.
   Rubber-banding must be viewer-side (player jitter buffer / live-edge
   behavior) — need to know which player + stream the user sees it in.
-- Step 2: 25-min background scan armed on the-field/all-field/full-low/entry
-  (NEG/DUP only) to rule out rare egress events the 60s window could miss.
+- Step 2 DONE — 25-min scan: the-field/all-field/full-low each EXACTLY
+  45000 pkts (25min x 30fps), 0 neg, 0 dup, 0 gaps>100ms; entry exactly
+  15000 pkts (10fps), 0 neg, 0 dup (its "gaps" = the 100ms-threshold false
+  positive). Egress cleanliness confirmed at 25-minute scale.
 - Tools: plans/tmp-pts-scan.sh, tmp-discard-analysis.sh, tmp-session-churn.sh
   (scp'd to sentinel:/tmp/).
 - Step 3 DONE — user's viewing path exonerated the server completely. User
