@@ -534,15 +534,25 @@ RESOLUTION (A/B-isolated, deployed, live-verified):
   next keyframe (5s GOP) → seconds-old content flashes into composites.
   NOTE: my own diagnostic load has been TRIGGERING glitches; daytime
   viewer/activity load explains the rest (the daytime correlation).
-- FIX CANDIDATES for discard-immunity (NOT yet applied):
-  (a) -fflags nobuffer+discardcorrupt on compositor inputs — drop frames
-      with decode errors instead of showing concealed time-travel; needs
-      testing with NVDEC (error propagation through hwaccel uncertain).
-  (b) Raise mediamtx writeQueueSize 16384 → 65536 (more burst headroom
-      before discard; memory cost bounded). Do NOT lower (512 caused
-      corruption historically).
-  (c) Shorter camera GOP in UniFi (5s→1s) shrinks the damaged window
-      5x — USER'S DOMAIN, never touch UniFi without direct authorization.
+- DISCARD-IMMUNITY RESULTS (2026-07-20):
+  (a) -fflags discardcorrupt: TESTED AND DEAD on the NVDEC path — 64KB
+      mid-GOP splice of real bay-1 footage decodes to IDENTICAL frame
+      counts (433) with/without the flag, zero corrupt messages: the
+      parser resyncs and NVDEC conceals silently; nothing is ever flagged.
+      (tmp-discardcorrupt-test.sh). DO NOT retry the flag; real
+      suppression needs an rtpdec-level ffmpeg patch: on RTP seq
+      discontinuity, drop packets until the next IDR — turns a discard
+      burst into a ≤GOP region freeze (framesync holds) instead of
+      time-travel. Offered, not yet built.
+  (b) APPLIED: mediamtx writeQueueSize 16384 → 65536 (~4x burst headroom,
+      absorbs ~60-90s stalls; discards for live sessions become
+      near-impossible — the byte-stall watchdog fires first). This is the
+      load-bearing mitigation. Do NOT lower (512 caused corruption
+      historically).
+  (c) Camera GOP 5s→1s shrinks any damage window 5x: NOT exposed in the
+      Protect UI; requires unsupported Protect API edit of per-camera
+      channels[].idrInterval (default 5) — USER'S DOMAIN, never touch
+      UniFi without direct authorization.
   (d) Keep heavy diagnostics off the box during watching hours (self-note).
 - RESIDUAL GAP SOURCE IDENTIFIED: gaps land on an exact 5s cadence
   (+0.8/5.8/10.8/...) = the CAMERAS' OWN keyframe interval; all outputs

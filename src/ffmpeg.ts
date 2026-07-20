@@ -322,6 +322,16 @@ function pushRtspInput(
     // delay. Keeps the compositor reading at the live edge so latency
     // doesn't slowly accumulate (setpts makes the pipeline latency-blind,
     // so the input must not hoard frames).
+    //
+    // NOTE: -fflags discardcorrupt is NOT here because it is a verified
+    // no-op on the NVDEC path: after an RTP discontinuity ("bad cseq" —
+    // mediamtx discarded packets for this reader under load) the parser
+    // resyncs and NVDEC silently error-conceals from stale references;
+    // no packet or frame ever gets flagged corrupt (tested 2026-07-20
+    // with a 64KB mid-GOP splice — identical frame counts, zero corrupt
+    // messages). Suppressing that damage needs an rtpdec-level patch
+    // (drop to next IDR after a discontinuity); mitigation today is a
+    // deep mediamtx writeQueueSize so reader discards never happen.
     "-fflags", "nobuffer",
     "-flags", "low_delay",
     "-thread_queue_size", "4096",

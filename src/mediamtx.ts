@@ -61,7 +61,14 @@ export function generateMediaMTXConfig(
     // while only the tiny `entry` keyframes fit. Latency is bounded
     // separately by -fflags nobuffer on the compositor inputs (they read
     // at the live edge), so a generous queue here costs nothing.
-    writeQueueSize: 16384,
+    //
+    // 65536 (was 16384): the COMPOSITOR'S own camera-input sessions must
+    // also survive multi-second load bursts without discards — a discard
+    // mid-GOP breaks its decode ("RTP: bad cseq") and stale concealed
+    // frames flash into every composite (the rubber-banding root cause,
+    // 2026-07-20). Idle queue slots cost nothing; worst-case memory is
+    // bounded per reader.
+    writeQueueSize: 65536,
 
     // RTSP server
     rtsp: true,
