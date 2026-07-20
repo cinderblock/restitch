@@ -491,11 +491,39 @@ RESOLUTION (A/B-isolated, deployed, live-verified):
   cascade-coupled via watchdog); -1 NVDEC + -1 ffmpeg process; all-field
   latency drops by a full encode+publish+decode hop; both halves show the
   same instant.
-- FIX #2 STAGED (ops config, NEEDS EXPLICIT AUTHORIZATION — not applied):
-  encoder.keyframe_interval_seconds: 2 (halves the per-second aligned
-  keyframe waves that spike NVENC to 87-99% and clump delivery). Trade-off:
-  stream join takes up to 2s (keyframe wait). Also fixes the stale
-  "CPU-decoded" / download-to-CPU comments in the ops config.
+- BOTH FIXES DEPLOYED (user said "deploy", 2026-07-20):
+  1. restitch bad3532 pushed → deploy green → all 15 paths recovered;
+     all-field publishes from the MAIN process (ex0_ chain in the live
+     filter graph, no ffmpeg-all-field process).
+     MEASURED EFFECT (60s pacing, GOP still 1s): the-field 34→0 gaps>150ms
+     (max 429→104ms — better than raw passthrough now); all-field 38→5
+     gaps (max 461→208ms). Killing the extra process helped the WHOLE
+     box's delivery, not just all-field.
+  2. ops 63b1055 (2s GOP + stale-comment refresh) pushed from a TEMP
+     WORKTREE of origin/master — the shared jackson checkout sits on
+     branch ask-worker (another thread's work; NOT switched). My config
+     edits were transplanted via patch, the shared tree's file restored
+     to branch HEAD (safety snapshot stashed first). Deploy green,
+     keyframe_interval_seconds: 2 live. Final steady-state pacing
+     measurement pending (90s settle + 60s capture).
+  NOTE: ops master also carried another agent's 41f18b9 (webrtc
+  ice_servers STUN for Safari/iOS) — deployed together; the live config
+  now has webrtc.ice_servers + additional_hosts.
+- FINAL STEADY-STATE PACING (60s, 90s after recovery, both fixes live):
+  all-field 20 gaps>150ms max 278ms sd 28.5; the-field 21/247/26.9;
+  full-low 20/239/25.1. vs pre-fix 38/461/35.8 — burstiness halved, worst
+  stall down 40%. (The post-#1-only run that showed 5/0 gaps was
+  catch-up-biased — mean 22.6ms < 33.3ms — don't cite it as steady state.)
+- RESIDUAL GAP SOURCE IDENTIFIED: gaps land on an exact 5s cadence
+  (+0.8/5.8/10.8/...) = the CAMERAS' OWN keyframe interval; all outputs
+  gap at the same instants (one camera's keyframe burst briefly stalls
+  the shared graph's framesync pairing). This is the floor for the
+  current architecture. Further levers, NOT applied:
+  (a) small input jitter buffer (~200-300ms) — trades live latency for
+      smoothness (user watches live; ask first);
+  (b) shorter camera GOP (1s) in UniFi → smaller keyframe bursts —
+      UNIFI IS USER'S DOMAIN, never touch;
+  (c) tighter VBV (bufsize < maxrate) to cap our own keyframe sizes.
 - INCIDENTAL FINDINGS from this hunt (separate issues):
   1. Audio-fusion (whisper) RTSP readers of raw/bay-1..4 are chronically
      "too slow" — ~69k mediamtx discard events/24h, active-hours-correlated
