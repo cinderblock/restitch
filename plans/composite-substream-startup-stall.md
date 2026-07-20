@@ -524,6 +524,12 @@ RESOLUTION (A/B-isolated, deployed, live-verified):
   gone (2s GOP + 65536 queue). Cost: ~one decode+GOP hop of latency.
   VALIDATION: re-record the same clock crop post-deploy; expect ~0 backward
   jumps (was 16/180s).
+- FIX VERIFIED (2026-07-20): post-deploy clock detector on 240s (7154
+  frames) = **0 backward jumps** (pre-fix 16/180s ≈ 21/240s). The
+  standalone re-ingest (entry topology) eliminated the stale-frame pairing.
+  10-min confirmation (clock + whole-frame) running. all-field runs as its
+  own process again (ffmpeg-all-field in logs). RESOLVED pending the user's
+  eyes.
 
 ## Rubber-banding (2026-07-19, INVESTIGATING)
 - Symptom (user): overall smoothness much better after the native-canvas fix, but
