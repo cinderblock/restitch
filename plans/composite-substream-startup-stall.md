@@ -406,6 +406,53 @@ RESOLUTION (A/B-isolated, deployed, live-verified):
   a few seconds of black pre-roll frames on fresh publish; live-edge viewers
   never see them.
 
+## Rubber-banding PINPOINTED (2026-07-20 late): all-field the-field-half BLACK-FLASH
+- After all prior fixes user STILL saw "time jumps back" — only all-field,
+  across VLC+WebRTC+HLS (so it's IN the encoded stream, every player).
+- Content-rewind detector v2 (128x72 gray, saves specimen frames;
+  plans/tmp-rewind-detector2.js) on 5 streams, 20 min:
+  * ONLY all-field flags (4 events). the-field, full-low, entry, raw/bay-4:
+    ZERO. → the-field SOURCE is clean; all-field's EMBEDDING of it breaks.
+  * Every event: whole-frame match to exactly 10 frames (0.33s) ago,
+    dMatch ~0.05-0.20, dPrev ~34.
+- SPECIMEN LUMA (raw PGM, top vs bottom quarter), ALL 5 events identical:
+    prev frame:  topY=11.0 (BLACK)  botY=~111 (normal)
+    cur/old10:   topY=~102 (normal) botY=~111 (normal)
+  → the-field REGION (top half of all-field) BLANKS TO CANVAS-BLACK for
+  ~0.3s, then its content returns. Bottom (Field Centered) never affected.
+  The "rewind" is an artifact: when the-field resumes it's near where it
+  paused, and the slow-moving field bottom barely changed, so the whole
+  frame ~matches 0.33s-ago. It is NOT a timestamp regression.
+  Specimens saved: plans/rwspec-allfield-blackflash.png (top half black) +
+  rwspec-allfield-normal.png; thumbnails in plans/rwspec/.
+- NOT input damage: event times (21:51:59/52:19/54:04/56:01) show ZERO
+  cseq / discards / source reconnects in the container log — only the
+  benign dashboard snapshot churn. Pure FILTERGRAPH-INTERNAL defect.
+- MECHANISM (topology): all-field is inlined as
+  [sub_1]→split→[tap]→scale_npp→rotate180→crop(overlay on ex0_ccv canvas)
+  →scale→stack(overlay on ex0_cv canvas with Field Centered). The tap
+  carries the main composite's native-grid PTS; the all-field canvases are
+  also native rate=30; so tap+canvas are frame-locked and framesync SHOULD
+  always pair — yet the tap-overlay intermittently shows canvas-black.
+  That points at an ffmpeg scheduling/framesync quirk in the
+  split-tap→second-framesync path (same family as our 2 existing
+  overlay_cuda/transpose_npp patches). Field Centered (wallclock setpts,
+  bottom) is the drift-prone one yet is CLEAN — confirms it's the tap
+  path, not clock drift.
+- FIX OPTIONS (none deployed; validate OFFLINE first — separate ffmpeg to
+  -f null + detector, no prod interruption):
+  (A) Re-pace/buffer the tap after rotate/crop so a momentary
+      split-cadence gap can't starve the stack framesync (add fps=30 +
+      setpts to canvas grid on the tap leg; low risk, test if it removes
+      the blanks).
+  (B) overlay_cuda framesync flags on the all-field stack:
+      eof_action=pass / explicit repeatlast=1 / shortest=0 — cheap to try.
+  (C) Structural: bring Field Centered into the MAIN single-canvas
+      framesync (which handles 5 inputs with zero blanks) and derive
+      all-field via crops of that one well-behaved composite — removes the
+      second framesync entirely. Biggest change, most robust.
+  Recommendation: reproduce offline, try (A)+(B) first, escalate to (C).
+
 ## Rubber-banding (2026-07-19, INVESTIGATING)
 - Symptom (user): overall smoothness much better after the native-canvas fix, but
   occasional "rubber-banding" — playback jumps BACK ~0.5s for a couple frames.
