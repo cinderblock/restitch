@@ -468,6 +468,62 @@ RESOLUTION (A/B-isolated, deployed, live-verified):
   VALIDATION: deploy + 20-min detector v2 watch for all-field blank
   recurrence (0 events = fixed). If blanks persist → escalate to option
   (C) structural single-framesync rebuild or an ffmpeg framesync patch.
+- PACED FIX FAILED (2026-07-20 22:42): all-field still blanked post-deploy,
+  SAME signature (frame 1643, dPrev 34.4, lag 10, dMatch 0.07). User
+  confirms still seeing single-frame time jumps. → It is NOT a
+  pacing/pairing/timeline issue (pacing changed nothing). It must be a
+  CONTENT issue: some stage EMITS a black frame. Suspects unique to
+  all-field's the-field piece: transpose_npp x2 (the 180 rotation; same
+  NPP family as the green-edge unwritten-region bug we patched) OR the
+  crop/stack overlay_cuda.
+- TRIANGULATION RUNNING (no deploy — standalone probes reading published
+  streams): (1) watch `john` (rotation 180 via transpose_npp x2, NO
+  stack); (2) rot180probe = the-field (fresh RTSP) → EXACT rotate-180
+  chain → detector. Logic:
+  * john blanks OR rot180probe blanks → transpose_npp emits black frames;
+    fix the 180-rotation method (or patch NPP). all-field-specific because
+    only all-field+john rotate 180 (main comp rotates 90 = single
+    transpose, never blanks).
+  * both clean, only all-field blanks → it's the split-of-a-sub-stream fed
+    into the second (stack) framesync; fix = revert all-field to a
+    standalone process re-ingesting the-field+Field Centered as two fresh
+    RTSP inputs (the ENTRY composite topology, which never blanks), now
+    that 2s GOP + 65536 queue removed the old re-ingest stale-pairing.
+  NOTE: tap frames are provably NON-black (identical to the clean the-field
+  = split of [sub_1]=[enc_2]), so the black is introduced AFTER the tap.
+- TRIANGULATION RESULT (2026-07-20 23:xx): john REWIND=0, rot180probe
+  REWIND=0, all-field REWIND=19 (over same window). → The 180 rotation
+  (transpose_npp x2) is INNOCENT; feeding a FRESH the-field through the
+  exact rotate chain never blanks. The defect is SPECIFIC to all-field's
+  topology: split-tap of a sub-stream output ([sub_1]) fed into the second
+  (stack) framesync that also mixes in a fresh camera. Neither pacing nor
+  rotation is the cause.
+- USER REDIRECT: don't analyze the top bar (that black may be a separate/
+  minor artifact) — the artifact they SEE is the burned-in TIMESTAMP
+  jumping back. Recording 180s of the Field Centered clock crop
+  (crop=1000:110:0:1210, clean upright "YYYY-MM-DD HH:MM:SS PM") to confirm
+  the clock regresses and by how much, so the fix is verified against the
+  user-visible signal.
+- CLOCK-REGRESSION PROVEN (2026-07-20): recorded 180s of the Field Centered
+  clock crop (crop=1000:110:0:1210), ran a backward-jump detector
+  (plans/tmp-clock-detector.js): 16 events / 180s (~1 per 11s), jumps
+  0.5-1.5s back. Extracted + READ the actual frames at one event:
+  frame1640=04:25:54, 1641=54, 1642=**53** (single stale frame), 1643=54.
+  EXACTLY the user's "single frame time jumps back a second." Proof images:
+  plans/clock-jump-*.png. It's on the FRESH Field Centered input (bottom),
+  not the tap — so it is the STACK FRAMESYNC pairing a stale frame in the
+  loaded shared process, consistent with the triangulation.
+- FIX IMPLEMENTED + deployed: reverted all-field (and any stream-ref extra
+  composite) to a STANDALONE process re-ingesting the-field + Field Centered
+  as two fresh RTSP inputs = the ENTRY topology (0 events, always). Removed
+  the buildPipeline inline block + the index.ts partition; restored
+  buildExtraCompositePipeline stream-ref re-ingest (using shared
+  emitExtraChain). Main graph back to split=4. Dry-run confirms all-field
+  standalone graph correct (the-field re-ingest → rotate180 → trim crop →
+  stack with Field Centered → h264 12M). The old re-ingest stale-pairing is
+  gone (2s GOP + 65536 queue). Cost: ~one decode+GOP hop of latency.
+  VALIDATION: re-record the same clock crop post-deploy; expect ~0 backward
+  jumps (was 16/180s).
 
 ## Rubber-banding (2026-07-19, INVESTIGATING)
 - Symptom (user): overall smoothness much better after the native-canvas fix, but

@@ -703,151 +703,15 @@ export function buildPipeline(
     });
   }
 
-  // --- Inlined extra composites -------------------------------------------
-  // Extra composites that reference a PRODUCED stream (`stream:` refs) build
-  // INSIDE this graph, tapping the referenced output's pre-encode frames via
-  // split. The previous architecture re-ingested the encoded stream over RTSP
-  // in a separate process; that re-ingest re-stamped frames with their
-  // ARRIVAL wallclock, and NVENC's bursty output pacing (keyframe waves)
-  // made framesync occasionally pair a STALE frame into the referencing
-  // composite (the all-field top-half rubber-banding, 2026-07-19). Tapping
-  // pre-encode frames keeps the referenced branch on this process's exact
-  // canvas-grid timeline — pairing is deterministic — and drops a whole
-  // decode+encode hop of latency plus an NVDEC session. Camera-only extra
-  // composites still run as separate processes (see index.ts).
-  const inlined = config.extra_composites.filter((e) =>
-    e.inputs.some((r) => r.stream !== undefined)
-  );
-  if (inlined.length > 0) {
-    const cameraByName = new Map<string, Camera>(
-      config.cameras.map((c) => [c.name, c])
-    );
-    // Split each referenced output once, with a tap leg per referencing input.
-    const tapsNeeded = new Map<string, number>();
-    for (const ex of inlined)
-      for (const ref of ex.inputs)
-        if (ref.stream !== undefined)
-          tapsNeeded.set(ref.stream, (tapsNeeded.get(ref.stream) ?? 0) + 1);
-    const tapLabels = new Map<string, string[]>();
-    for (const [stream, count] of tapsNeeded) {
-      const out = outputs.find((o) => o.name === stream);
-      if (!out) {
-        throw new Error(
-          `extra_composite references unknown stream "${stream}" ` +
-            `(must be the main composite or a sub_stream name)`
-        );
-      }
-      const oi = outputs.indexOf(out);
-      const labels = Array.from(
-        { length: count },
-        (_, k) => `[tap_${oi}_${k}]`
-      );
-      filters.push(
-        `${out.mapLabel}split=${count + 1}[enc_${oi}]${labels.join("")}`
-      );
-      out.mapLabel = `[enc_${oi}]`;
-      tapLabels.set(stream, labels);
-    }
-
-    let nextInput = cameras.length;
-    for (let ei = 0; ei < inlined.length; ei++) {
-      const extra = inlined[ei]!;
-      const prefix = `ex${ei}`;
-      const pieces: StackPiece[] = [];
-      for (let i = 0; i < extra.inputs.length; i++) {
-        const ref = extra.inputs[i]!;
-        if (ref.stream !== undefined) {
-          const dims = producedStreamDims(config, cameraProbes, ref.stream)!;
-          const tap = tapLabels.get(ref.stream)!.pop()!;
-          // Pin the tap to nv12: unscaled outputs end in the yuv420p
-          // normalizer, and the downstream rotation/crop/overlay chain
-          // expects the graph's nv12 working format. (nv12 taps pass
-          // through untouched — they already carry exact dims.)
-          const lbl = `[${prefix}_tap_${i}]`;
-          // PACED-INPUT CONTRACT: fps + wallclock setpts, identical to the
-          // main-stack cameras, the entry cameras, and this composite's own
-          // camera inputs (e.g. Field Centered). Every framesync input in the
-          // system that is paced this way is blank-free; the tap was the ONE
-          // exception (left on the raw native split cadence), and it was the
-          // ONLY input that intermittently blanked to canvas-black in the
-          // stack overlay — the-field half of all-field dropping out ~0.3s
-          // every 1-2 min (2026-07-20, proven by specimen luma: topY 11 vs
-          // 102). A split leg delivers frames on the main graph's internal
-          // schedule, not real-time-paced; feeding that straight into a
-          // second framesync starves it. fps re-paces to a clean grid and
-          // setpts puts it on the same real-time timeline as the canvas and
-          // the camera input, so the stack framesync always has a frame to
-          // pair. (No stale-pairing risk like the old RTSP re-ingest: these
-          // are pre-encode frames arriving at the composite's steady cadence,
-          // not bursty NVENC output.)
-          filters.push(
-            `${tap}scale_npp=format=nv12,fps=${compositeFps},` +
-              `setpts=(RTCTIME-${baseline})/(TB*1000000)${lbl}`
-          );
-          pieces.push({
-            label: lbl,
-            width: dims.width,
-            height: dims.height,
-            rotation: ref.rotation ?? "0",
-            crop: ref.crop,
-            fps: compositeFps,
-          });
-        } else {
-          const cam = cameraByName.get(ref.name!);
-          if (!cam) {
-            throw new Error(
-              `extra_composite "${extra.name}" references unknown camera "${ref.name}"`
-            );
-          }
-          const probe = cameraProbes.get(ref.name!);
-          if (!probe) {
-            throw new Error(
-              `extra_composite "${extra.name}": no probe result for "${ref.name}"`
-            );
-          }
-          pushRtspInput(
-            inputArgs,
-            config,
-            `${config.output.base_url}/${rawStreamName(cam)}`
-          );
-          // Same stamped chain as the bay cameras: fps pacing + shared
-          // wallclock baseline, so this input pairs with the extra's canvas
-          // exactly like the bays pair with the stack canvas. Rotation is
-          // applied by emitExtraChain (it must precede the crop).
-          const lbl = `[${prefix}_cam_${i}]`;
-          filters.push(
-            `[${nextInput}:v]${GPU_COLOR_RETAG},fps=${probe.fps},` +
-              `setpts=(RTCTIME-${baseline})/(TB*1000000),scale_npp=format=nv12${lbl}`
-          );
-          nextInput++;
-          pieces.push({
-            label: lbl,
-            width: probe.width,
-            height: probe.height,
-            rotation: ref.rotation ?? cam.rotation,
-            crop: ref.crop,
-            fps: probe.fps,
-          });
-        }
-      }
-      const fin = emitExtraChain(
-        filters,
-        extra,
-        pieces,
-        baseline,
-        interp,
-        prefix
-      );
-      outputs.push({
-        name: extra.name,
-        mapLabel: fin.label,
-        codecOverride: extra.codec,
-        maxrateOverride: extra.maxrate,
-        bufsizeOverride: extra.bufsize,
-        fps: compositeFps,
-      });
-    }
-  }
+  // NOTE: extra composites (including `stream:`-referencing ones like
+  // all-field) are NOT built into this graph. Inlining them via a split-tap
+  // fed into their own stack framesync was tried (to save a decode hop) and
+  // reverted 2026-07-20: in this heavily-loaded shared process the stack
+  // framesync intermittently paired a STALE frame (all-field's Field Centered
+  // clock jumping back ~1s for a single frame, ~once/11s — proven by reading
+  // the burned-in clock). Every extra composite now runs as its own process
+  // (buildExtraCompositePipeline + index.ts), decoding fresh RTSP inputs — the
+  // `entry` topology, which never exhibits the artifact.
 
   const filterComplex = filters.join(";\n");
 
@@ -915,15 +779,15 @@ function producedStreamDims(
 }
 
 /**
- * Build an FFmpeg pipeline for a single CAMERA-ONLY "extra" composite — a
- * vstack or hstack of cameras (pulled from local mediamtx raw paths), with
- * optional per-input crop and post-stack rotation/scale. Produces a single
- * output stream named extra.name.
+ * Build an FFmpeg pipeline for a single "extra" composite — a vstack or hstack
+ * of an arbitrary subset of inputs, with optional per-input crop and
+ * post-stack rotation/scale. Produces a single output stream named extra.name.
+ * Inputs are cameras (pulled from local mediamtx raw paths) or already-produced
+ * streams (`stream:` refs, re-ingested from their own mediamtx path — a fresh
+ * decode, NOT an inline tap of the main graph; see the resolve comment for why).
  *
- * Composites that reference an already-produced stream (`stream:` refs) are
- * NOT built here — they inline into the main pipeline (see buildPipeline),
- * which taps the referenced output's pre-encode frames instead of
- * re-ingesting the encoded stream.
+ * Runs as its own process (see index.ts), so a heavy extra composite can't
+ * contend with the main compositor's framesync scheduling.
  *
  * Inputs are auto-scaled to the FIRST input's stacking-axis dimension so
  * vstack/hstack doesn't reject mismatched widths/heights.
@@ -940,19 +804,44 @@ export function buildExtraCompositePipeline(
   const filters: string[] = [];
   const inputArgs: string[] = [];
 
+  // Produced streams (`stream:` refs) run at the main composite rate.
+  const compositeCams = config.cameras.filter((c) => c.composite !== false);
+  const compositeFps = compositeCams[0]
+    ? (cameraProbes.get(compositeCams[0].name)?.fps ?? 30)
+    : 30;
+
   // Resolve each input to a mediamtx path + dimensions + rate. Cameras pull
-  // from raw/<slug> with probed dims. `stream:` refs never reach this builder:
-  // composites that reference a produced stream are inlined into the MAIN
-  // pipeline (see buildPipeline), where they tap pre-encode frames instead of
-  // re-ingesting the encoded stream (whose bursty arrival caused stale-frame
-  // pairing — the all-field rubber-banding).
+  // from raw/<slug> with probed dims; `stream:` refs RE-INGEST the produced
+  // stream from its own mediamtx path with dims derived from config (it may
+  // not be publishing yet — this ffmpeg and the main compositor start
+  // concurrently, and the RTSP reader retries until it appears).
+  //
+  // We RE-INGEST (fresh decode) rather than inline-tap the main graph. Inlining
+  // (split-tap of a sub-stream fed into this stack's framesync) was tried and
+  // reverted: it intermittently paired a STALE frame into the stack — the
+  // Field Centered clock in all-field jumping back ~1s for a single frame,
+  // ~once/11s (2026-07-20, proven by reading the burned-in clock: 54,54,[53],
+  // 54). A standalone process decoding two FRESH RTSP inputs is the exact
+  // topology as `entry` (doorbell over foyer), which never exhibits it; the
+  // old re-ingest problem (bursty delivery → stale pairing) is gone since the
+  // 2s GOP + 65536 writeQueueSize fixes. See plan.
   const resolved = extra.inputs.map((ref) => {
     if (ref.stream !== undefined) {
-      throw new Error(
-        `extra_composite "${extra.name}" has a stream ref ("${ref.stream}") — ` +
-          `stream-referencing composites are inlined into the main pipeline, ` +
-          `not built standalone`
-      );
+      const dims = producedStreamDims(config, cameraProbes, ref.stream);
+      if (!dims) {
+        throw new Error(
+          `extra_composite "${extra.name}" references unknown stream ` +
+            `"${ref.stream}" (must be the main composite or a sub_stream name)`
+        );
+      }
+      return {
+        ref,
+        path: ref.stream,
+        width: dims.width,
+        height: dims.height,
+        fps: compositeFps,
+        rotation: ref.rotation ?? ("0" as const),
+      };
     }
     const cam = cameraByName.get(ref.name!);
     if (!cam) {
