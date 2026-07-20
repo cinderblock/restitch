@@ -514,6 +514,36 @@ RESOLUTION (A/B-isolated, deployed, live-verified):
   full-low 20/239/25.1. vs pre-fix 38/461/35.8 — burstiness halved, worst
   stall down 40%. (The post-#1-only run that showed 5/0 gaps was
   catch-up-biased — mean 22.6ms < 33.3ms — don't cite it as steady state.)
+- REWIND ROOT CAUSE FOUND (2026-07-20, evidence-backed end to end). User
+  still saw rubber-banding post-fixes: "time overlays glitch back a second
+  or two for a frame or two." Content-rewind detector (64x36 gray thumbs,
+  match-vs-4s-ring; plans/tmp-rewind-detector.js) on raw/bay-4,
+  raw/field-centered, the-field, all-field simultaneously (5 min):
+  * RAWS: 0 events / 9000 frames each — cameras + NVR CLEAN.
+  * the-field: single frames of ~3.5s-OLD content spliced in (t=67s,
+    dMatch~1 vs dPrev~5). all-field: 3 isolated glitch frames.
+  → The stale frames are born inside the MAIN compositor and are IN the
+  encoded stream (any player shows them).
+  CHAIN: load spike → mediamtx per-reader queue for the COMPOSITOR'S OWN
+  camera-input session overflows → mediamtx discards RTP (measured: live
+  bay-1 input session 94e04ba2 discarded 7295 frames 20:47:13-37 — the
+  exact window my 4 detector ffmpegs piled load on, and the exact window
+  the detector caught the stale frames) → compositor logs "RTP: bad cseq"
+  (3 in 3h; rare idle, rises with load) → mid-GOP packet loss → NVDEC
+  silently error-conceals from stale DPB references until the camera's
+  next keyframe (5s GOP) → seconds-old content flashes into composites.
+  NOTE: my own diagnostic load has been TRIGGERING glitches; daytime
+  viewer/activity load explains the rest (the daytime correlation).
+- FIX CANDIDATES for discard-immunity (NOT yet applied):
+  (a) -fflags nobuffer+discardcorrupt on compositor inputs — drop frames
+      with decode errors instead of showing concealed time-travel; needs
+      testing with NVDEC (error propagation through hwaccel uncertain).
+  (b) Raise mediamtx writeQueueSize 16384 → 65536 (more burst headroom
+      before discard; memory cost bounded). Do NOT lower (512 caused
+      corruption historically).
+  (c) Shorter camera GOP in UniFi (5s→1s) shrinks the damaged window
+      5x — USER'S DOMAIN, never touch UniFi without direct authorization.
+  (d) Keep heavy diagnostics off the box during watching hours (self-note).
 - RESIDUAL GAP SOURCE IDENTIFIED: gaps land on an exact 5s cadence
   (+0.8/5.8/10.8/...) = the CAMERAS' OWN keyframe interval; all outputs
   gap at the same instants (one camera's keyframe burst briefly stalls
