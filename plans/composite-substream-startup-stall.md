@@ -452,6 +452,22 @@ RESOLUTION (A/B-isolated, deployed, live-verified):
       all-field via crops of that one well-behaved composite — removes the
       second framesync entirely. Biggest change, most robust.
   Recommendation: reproduce offline, try (A)+(B) first, escalate to (C).
+- FIX APPLIED (2026-07-20, user chose robust redesign + deploy now):
+  the tap now obeys the PACED-INPUT CONTRACT — scale_npp=nv12 followed by
+  fps=30 + setpts=(RTCTIME-baseline), identical to every clean framesync
+  input (main-stack bays, entry cameras, Field Centered). Root asymmetry:
+  the tap was the ONLY framesync input left on the raw native split
+  cadence (I removed its fps/setpts during inlining, thinking native-grid
+  alignment was better — that was the bug). A split leg emits on the main
+  graph's internal schedule, not real-time; fed straight into the second
+  framesync it starves and the canvas (black) shows through. Pacing
+  re-clocks it to the shared real-time grid so the stack overlay always
+  has a frame to pair. No stale-pairing risk (pre-encode frames at steady
+  cadence, not bursty NVENC). Typecheck clean; dry-run confirms
+  `[tap_2_0]scale_npp=format=nv12,fps=30,setpts=(RTCTIME-...)`.
+  VALIDATION: deploy + 20-min detector v2 watch for all-field blank
+  recurrence (0 events = fixed). If blanks persist → escalate to option
+  (C) structural single-framesync rebuild or an ffmpeg framesync patch.
 
 ## Rubber-banding (2026-07-19, INVESTIGATING)
 - Symptom (user): overall smoothness much better after the native-canvas fix, but

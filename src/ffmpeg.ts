@@ -764,10 +764,26 @@ export function buildPipeline(
           // expects the graph's nv12 working format. (nv12 taps pass
           // through untouched — they already carry exact dims.)
           const lbl = `[${prefix}_tap_${i}]`;
-          filters.push(`${tap}scale_npp=format=nv12${lbl}`);
-          // Deliberately NO fps/setpts re-stamp here: tap frames already
-          // ride this process's canvas-grid timeline, so pairing with the
-          // extra's canvas is exact — that is the point of inlining.
+          // PACED-INPUT CONTRACT: fps + wallclock setpts, identical to the
+          // main-stack cameras, the entry cameras, and this composite's own
+          // camera inputs (e.g. Field Centered). Every framesync input in the
+          // system that is paced this way is blank-free; the tap was the ONE
+          // exception (left on the raw native split cadence), and it was the
+          // ONLY input that intermittently blanked to canvas-black in the
+          // stack overlay — the-field half of all-field dropping out ~0.3s
+          // every 1-2 min (2026-07-20, proven by specimen luma: topY 11 vs
+          // 102). A split leg delivers frames on the main graph's internal
+          // schedule, not real-time-paced; feeding that straight into a
+          // second framesync starves it. fps re-paces to a clean grid and
+          // setpts puts it on the same real-time timeline as the canvas and
+          // the camera input, so the stack framesync always has a frame to
+          // pair. (No stale-pairing risk like the old RTSP re-ingest: these
+          // are pre-encode frames arriving at the composite's steady cadence,
+          // not bursty NVENC output.)
+          filters.push(
+            `${tap}scale_npp=format=nv12,fps=${compositeFps},` +
+              `setpts=(RTCTIME-${baseline})/(TB*1000000)${lbl}`
+          );
           pieces.push({
             label: lbl,
             width: dims.width,
