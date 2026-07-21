@@ -282,9 +282,28 @@ struct OutSpec {
   const char *maxrate; // null = uncapped
 };
 
+// A camera aux decoder + the frame we ref into each tick.
+struct Aux {
+  Decoder *dec = nullptr;
+  AVFrame *cur = nullptr;
+  int open(const char *url, AVBufferRef *device) {
+    dec = new Decoder();
+    if (dec->open(url, device) < 0) return -1;
+    dec->start();
+    cur = av_frame_alloc();
+    return 0;
+  }
+  bool ready() { return dec && dec->latest(cur); }
+  void refresh() { if (dec) dec->latest(cur); }
+  void close() {
+    if (dec) { dec->stop(); delete dec; dec = nullptr; }
+    if (cur) av_frame_free(&cur);
+  }
+};
+
 int run_composite(const std::vector<std::string> &in_urls, const char *dest,
                   int fps, long long max_frames, bool unpaced,
-                  const char *fc_url) {
+                  const char *fc_url, const char *db_url, const char *fy_url) {
   av_log_set_level(AV_LOG_ERROR);
   Device dev;
   int err = dev.create();
@@ -305,15 +324,15 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
   }
   LOGF("%d decoders started; waiting for first frames (cold start)...", N);
 
-  // Field Centered — an AUX input (not part of the 5-bay composite stack); used
-  // only as all-field's bottom half.
-  Decoder *fcdec = nullptr;
-  AVFrame *fccur = nullptr;
-  if (fc_url) {
-    fcdec = new Decoder();
-    if (fcdec->open(fc_url, dev.ref) < 0) { LOGF("fc open failed"); return 1; }
-    fcdec->start();
-    fccur = av_frame_alloc();
+  // AUX inputs — cameras NOT in the 5-bay stack: Field Centered (all-field's
+  // bottom), Doorbell + Foyer (entry).
+  Aux fc, db, fy;
+  const bool has_af = fc_url != nullptr;
+  const bool has_entry = db_url != nullptr && fy_url != nullptr;
+  if (has_af && fc.open(fc_url, dev.ref) < 0) { LOGF("fc open"); return 1; }
+  if (has_entry && (db.open(db_url, dev.ref) < 0 || fy.open(fy_url, dev.ref) < 0)) {
+    LOGF("entry cams open");
+    return 1;
   }
 
   std::vector<AVFrame *> cur(N);
@@ -322,7 +341,8 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
     bool all = true;
     for (int i = 0; i < N; ++i)
       if (!decs[i]->latest(cur[i])) all = false;
-    if (fcdec && !fcdec->latest(fccur)) all = false;
+    if (has_af && !fc.ready()) all = false;
+    if (has_entry && (!db.ready() || !fy.ready())) all = false;
     if (all || g_stop) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
@@ -388,7 +408,6 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
   const int afBotH = ((1512 * afTopW / 2688) + 1) & ~1; // FC scaled, even
   const int afW = afTopW, afH = afTopH + afBotH;   // 3686 x 3290
   Out afOut{};
-  const bool has_af = fcdec != nullptr;
   if (has_af) {
     AVBufferRef *frames = av_hwframe_ctx_alloc(dev.ref);
     AVHWFramesContext *fc = (AVHWFramesContext *)frames->data;
@@ -407,6 +426,33 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
     std::string url = to_null ? "null" : std::string(dest) + "/all-field.mp4";
     if (open_output(url.c_str(), "h264_nvenc", afW, afH, frames, tb, fr,
                     "12000000", afOut.io) < 0)
+      return 1;
+  }
+
+  // entry: Doorbell (cropped) over Foyer (scaled). Two fresh cameras, no
+  // composite-buffer dependency. Doorbell 1200x1600 crop(0,462,1200,676);
+  // Foyer 2688x1512 scaled to 1200 wide.
+  const int enTopW = 1200, enTopH = 676;              // doorbell crop
+  const int enBotH = ((1512 * enTopW / 2688) + 1) & ~1; // foyer scaled, even
+  const int enW = enTopW, enH = enTopH + enBotH;      // 1200 x 1352
+  Out enOut{};
+  if (has_entry) {
+    AVBufferRef *frames = av_hwframe_ctx_alloc(dev.ref);
+    AVHWFramesContext *fc2 = (AVHWFramesContext *)frames->data;
+    fc2->format = AV_PIX_FMT_CUDA;
+    fc2->sw_format = AV_PIX_FMT_NV12;
+    fc2->width = enW;
+    fc2->height = enH;
+    fc2->initial_pool_size = 8;
+    if ((err = av_hwframe_ctx_init(frames)) < 0) {
+      LOGF("hwframe_ctx_init(entry): %s", av_err(err).c_str());
+      return 1;
+    }
+    enOut.spec = {"entry", "h264_nvenc", 0, 0, enW, enH, enW, enH, 0, nullptr};
+    enOut.frames = frames;
+    std::string url = to_null ? "null" : std::string(dest) + "/entry.mp4";
+    if (open_output(url.c_str(), "h264_nvenc", enW, enH, frames, tb, fr,
+                    nullptr, enOut.io) < 0)
       return 1;
   }
 
@@ -467,18 +513,44 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
             /*rot180=*/1, stream);
         // bottom: Field Centered scaled to (afTopW x afBotH), written at row
         // afTopH of the all-field frame.
-        fcdec->latest(fccur);
+        fc.refresh();
         uint8_t *botY = af->data[0] + (size_t)afTopH * af->linesize[0];
         uint8_t *botUV = af->data[1] + (size_t)(afTopH / 2) * af->linesize[1];
         launch_crop_scale_rot180(
-            fccur->data[0], fccur->linesize[0], fccur->data[1],
-            fccur->linesize[1], fccur->width, fccur->height, 0, 0, fccur->width,
-            fccur->height, botY, af->linesize[0], botUV, af->linesize[1],
-            afTopW, afBotH, /*rot180=*/0, stream);
+            fc.cur->data[0], fc.cur->linesize[0], fc.cur->data[1],
+            fc.cur->linesize[1], fc.cur->width, fc.cur->height, 0, 0,
+            fc.cur->width, fc.cur->height, botY, af->linesize[0], botUV,
+            af->linesize[1], afTopW, afBotH, /*rot180=*/0, stream);
         af->pts = frames_out;
       } else {
         av_frame_free(&af);
         af = nullptr;
+      }
+    }
+
+    // 2c) entry: Doorbell crop (top) over Foyer scaled (bottom).
+    AVFrame *en = nullptr;
+    if (has_entry) {
+      en = av_frame_alloc();
+      if (av_hwframe_get_buffer(enOut.frames, en, 0) == 0) {
+        db.refresh();
+        fy.refresh();
+        launch_crop_scale_rot180(
+            db.cur->data[0], db.cur->linesize[0], db.cur->data[1],
+            db.cur->linesize[1], db.cur->width, db.cur->height, 0, 462, enTopW,
+            enTopH, en->data[0], en->linesize[0], en->data[1], en->linesize[1],
+            enTopW, enTopH, 0, stream);
+        uint8_t *bY = en->data[0] + (size_t)enTopH * en->linesize[0];
+        uint8_t *bUV = en->data[1] + (size_t)(enTopH / 2) * en->linesize[1];
+        launch_crop_scale_rot180(
+            fy.cur->data[0], fy.cur->linesize[0], fy.cur->data[1],
+            fy.cur->linesize[1], fy.cur->width, fy.cur->height, 0, 0,
+            fy.cur->width, fy.cur->height, bY, en->linesize[0], bUV,
+            en->linesize[1], enTopW, enBotH, 0, stream);
+        en->pts = frames_out;
+      } else {
+        av_frame_free(&en);
+        en = nullptr;
       }
     }
 
@@ -498,6 +570,12 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
       av_frame_free(&af);
       drain(afOut.io);
     }
+    if (en) {
+      if (avcodec_send_frame(enOut.io.enc, en) < 0)
+        LOGF("send_frame(entry)");
+      av_frame_free(&en);
+      drain(enOut.io);
+    }
     if (++frames_out % 300 == 0)
       LOGF("composite alive: %lld frames", frames_out);
   }
@@ -513,9 +591,15 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
     drain(afOut.io);
     close_output(afOut.io);
     av_buffer_unref(&afOut.frames);
-    fcdec->stop();
-    delete fcdec;
-    av_frame_free(&fccur);
+    fc.close();
+  }
+  if (has_entry) {
+    avcodec_send_frame(enOut.io.enc, nullptr);
+    drain(enOut.io);
+    close_output(enOut.io);
+    av_buffer_unref(&enOut.frames);
+    db.close();
+    fy.close();
   }
   for (int i = 0; i < N; ++i) decs[i]->stop();
   auto secs =
@@ -535,7 +619,7 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
 int main(int argc, char **argv) {
   std::vector<std::string> in_urls;
   const char *out_url = nullptr, *codec = nullptr, *maxrate = nullptr;
-  const char *fc_url = nullptr;
+  const char *fc_url = nullptr, *db_url = nullptr, *fy_url = nullptr;
   long long max_frames = 0;
   int fps = 30;
   bool composite = false, unpaced = false;
@@ -550,6 +634,8 @@ int main(int argc, char **argv) {
     else if (a == "--composite-full") composite = true;
     else if (a == "--unpaced") unpaced = true;
     else if (a == "--field-centered" && i + 1 < argc) fc_url = argv[++i];
+    else if (a == "--doorbell" && i + 1 < argc) db_url = argv[++i];
+    else if (a == "--foyer" && i + 1 < argc) fy_url = argv[++i];
   }
   std::signal(SIGINT, [](int) { g_stop = 1; });
   std::signal(SIGTERM, [](int) { g_stop = 1; });
@@ -561,7 +647,8 @@ int main(int argc, char **argv) {
     }
     (void)codec;
     (void)maxrate; // per-output specs are hardcoded (phase 3)
-    return run_composite(in_urls, out_url, fps, max_frames, unpaced, fc_url);
+    return run_composite(in_urls, out_url, fps, max_frames, unpaced, fc_url,
+                         db_url, fy_url);
   }
   return selftest();
 }

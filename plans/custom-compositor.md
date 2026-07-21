@@ -200,8 +200,12 @@ draining. User is OK with slightly slow cold starts.
       geometry/flip/colors verified (plans/p4-all-field.png). Field Centered is
       an AUX decoder (not in the 5-bay stack); same-stream ordering means
       the-field's kernel completes before all-field reads it (no extra sync).
-      REMAINING: `entry` (Doorbell crop over Foyer) — a separate 2-camera
-      composite, no composite-buffer dependency; straightforward follow-on.
+      `entry` DONE too (Doorbell crop over Foyer, 1200x1352, aux decoders via a
+      small Aux helper). **100% OUTPUT PARITY**: stitchd now produces ALL 6
+      production outputs (full/full-low/the-field/john/all-field/entry) from
+      ONE process + ONE decode set (5 bays + 3 aux cams), all dims exact,
+      300/300 frames, all verified (plans/p4-*.png). ~22.7 fps for all 6
+      outputs concurrent with live production sharing the GPU.
 - [ ] Phase 5: backpressure/drop scheduler.
 - [ ] Phase 6: cutover behind `compositor: native`, ffmpeg fallback retained.
 
