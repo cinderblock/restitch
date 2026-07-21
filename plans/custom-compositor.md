@@ -181,6 +181,45 @@ draining. User is OK with slightly slow cold starts.
 - [ ] Phase 5: backpressure/drop scheduler.
 - [ ] Phase 6: cutover behind `compositor: native`, ffmpeg fallback retained.
 
+## Phase 2 design (the CUDA compositing core — next to build)
+Target: reproduce `full` (5 bays vstack → rotate 90 CW → HEVC 7560x2688) in
+our own code, proving the compositing kernel + the async tick scheduler.
+
+- **Refactor first** (out of the single-file passthrough):
+  - `Device` — the shared AVBufferRef CUDA hwdevice + a CUstream.
+  - `Decoder` — one per input; a thread runs the read→send→receive loop and
+    publishes its LATEST AVFrame (CUDA) into a double-buffered slot behind a
+    mutex (+ capture wallclock). Stall = last frame retained; flood = slot
+    overwritten (natural drop). This slot IS the deterministic pairing source.
+  - `Encoder` — one per output (from phase 1's open_output/drain, generalized).
+  - `Compositor` — owns the output NV12 GPU buffer(s) + the kernels.
+- **NV12 layout:** Y plane W*H (8-bit), then interleaved UV plane W*(H/2)
+  (u,v,u,v…), chroma subsampled 2x2. Allocate output as a CUDA hwframe from an
+  AV_PIX_FMT_CUDA/NV12 hw_frames_ctx so NVENC consumes it directly.
+- **Stack+rotate as ONE gather kernel** (writes every output pixel exactly once
+  → no unwritten-region/green-edge class). For `full`:
+  - Stacked S = Ws×Hs = 2688×7560 (5 bays of 2688×1512, input i at rows
+    [i*1512,(i+1)*1512)). Output O after 90° CW = Wo×Ho = 7560×2688.
+  - Inverse map (gather): O(co,ro) ← S(cs,rs) with cs=ro, rs=Hs-1-co.
+  - Then S(cs,rs): input_idx = rs/1512, local=(cs, rs%1512); sample that
+    decoder's Y at (local); UV at (local.x&~1, local.y/2). Write O.Y(co,ro)
+    and, for even co,ro, O.UV. (Handle chroma on the rotated grid carefully —
+    likely a separate chroma pass or compute chroma from the 2x2 luma block's
+    source coords to avoid color fringing on rotation.)
+  - Launch: 2D grid over O; one thread per luma pixel, chroma in a second
+    kernel or guarded in the same.
+- **Tick scheduler:** a wallclock timer at composite fps. Each tick: snapshot
+  every Decoder's latest slot, run the kernel into a fresh output frame, set
+  its pts from the tick index (clean monotonic grid — no wallclock jitter),
+  send to the Encoder. Missing input at cold start → wait (phase says slow cold
+  start OK); missing mid-stream → reuse last (or blank per policy).
+- **Validate:** produce `full` to a file; compare against ffmpeg `full`
+  (dims, a few frames visually, monotonic pts, no green edges); check sync by
+  the burned-in clocks across bays. Then Phase 3 adds scale for full-low etc.
+- Open kernel question: do rotation+subsampled-chroma in one pass or two.
+  Start with a correctness-first two-pass (luma, then chroma resampled from
+  source), optimize later. Quality must match (no bilinear shortcut).
+
 ## Open questions for the user (numbered; my recommendation in [])
 1. **Language:** C++/CUDA linking libav*? [Yes — natural for CUDA+NVENC+libav;
    Rust bindings are less mature for this stack.] Or do you want Rust?
