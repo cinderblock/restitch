@@ -198,9 +198,11 @@ int open_output(const char *url, const char *codec_name, int w, int h,
   }
 
   const bool is_rtsp = std::strncmp(url, "rtsp://", 7) == 0;
+  const bool is_null = std::strcmp(url, "null") == 0;
+  const char *fmt_name = is_rtsp ? "rtsp" : (is_null ? "null" : nullptr);
   int err;
-  if ((err = avformat_alloc_output_context2(
-           &out.fmt, nullptr, is_rtsp ? "rtsp" : nullptr, url)) < 0)
+  if ((err = avformat_alloc_output_context2(&out.fmt, nullptr, fmt_name, url)) <
+      0)
     return err;
   if (out.fmt->oformat->flags & AVFMT_GLOBALHEADER)
     out.enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
@@ -271,7 +273,8 @@ int selftest() {
 
 int run_composite_full(const std::vector<std::string> &in_urls,
                        const char *out_url, const char *codec, int fps,
-                       long long max_frames, const char *maxrate) {
+                       long long max_frames, const char *maxrate,
+                       bool unpaced) {
   av_log_set_level(AV_LOG_ERROR);
   Device dev;
   int err = dev.create();
@@ -329,9 +332,12 @@ int run_composite_full(const std::vector<std::string> &in_urls,
   const auto t0 = std::chrono::steady_clock::now();
   long long frames_out = 0;
   while (!g_stop && (max_frames <= 0 || frames_out < max_frames)) {
-    // real-time tick: sample newest frames every 1/fps
-    auto target = t0 + std::chrono::microseconds(frames_out * 1000000 / fps);
-    std::this_thread::sleep_until(target);
+    // real-time tick: sample newest frames every 1/fps (unless --unpaced, which
+    // runs flat-out for throughput benchmarking).
+    if (!unpaced) {
+      auto target = t0 + std::chrono::microseconds(frames_out * 1000000 / fps);
+      std::this_thread::sleep_until(target);
+    }
 
     CompositeInputs ci{};
     ci.n = N;
@@ -387,7 +393,7 @@ int main(int argc, char **argv) {
   const char *out_url = nullptr, *codec = nullptr, *maxrate = nullptr;
   long long max_frames = 0;
   int fps = 30;
-  bool composite = false;
+  bool composite = false, unpaced = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--in" && i + 1 < argc) in_urls.push_back(argv[++i]);
@@ -397,6 +403,7 @@ int main(int argc, char **argv) {
     else if (a == "--fps" && i + 1 < argc) fps = std::atoi(argv[++i]);
     else if (a == "--maxrate" && i + 1 < argc) maxrate = argv[++i];
     else if (a == "--composite-full") composite = true;
+    else if (a == "--unpaced") unpaced = true;
   }
   std::signal(SIGINT, [](int) { g_stop = 1; });
   std::signal(SIGTERM, [](int) { g_stop = 1; });
@@ -404,7 +411,7 @@ int main(int argc, char **argv) {
   if (composite) {
     if (in_urls.empty() || !out_url) { LOGF("need --in ... --out"); return 2; }
     return run_composite_full(in_urls, out_url, codec ? codec : "hevc_nvenc",
-                              fps, max_frames, maxrate);
+                              fps, max_frames, maxrate, unpaced);
   }
   return selftest();
 }

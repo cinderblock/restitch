@@ -226,6 +226,30 @@ our own code, proving the compositing kernel + the async tick scheduler.
   Start with a correctness-first two-pass (luma, then chroma resampled from
   source), optimize later. Quality must match (no bilinear shortcut).
 
+## Benchmark: stitchd vs ffmpeg producing `full` (2026-07-21)
+Both produce the identical 7560x2688 HEVC (cq18/p4/hq/bf0/g60), 5-bay
+vstack+rotate90. Run on sentinel concurrently with live production (shared
+GPU), so absolute numbers are suppressed but the RATIO is fair.
+- **Max throughput (unpaced, 600 frames from 5 local files):**
+  stitchd **37.1 fps** (16.2s) vs ffmpeg **30.4 fps** (19.7s) → stitchd
+  ~1.22x faster for the same output. Expected: stitchd does the composite in
+  ONE gather kernel + encode; ffmpeg's chain is scale_npp x5 + canvas
+  hwupload + scale_cuda + 5x overlay_cuda + scale_npp + transpose_npp +
+  scale_npp + encode (many more launches + intermediate buffers).
+- **Real-time (30fps) resource cost, delta over live baseline:** too noisy to
+  split cleanly — production's own encode load swings ±15% (keyframe waves).
+  Both add ~13% NVDEC (5 decodes). stitchd did NOT spike enc/sm the way the
+  ffmpeg run did (enc 43% vs 69% during each). stitchd container CPU 3.6%;
+  both trivial-CPU (GPU-resident).
+- Caveats: single runs (not averaged); stitchd decoders read the file once
+  then held last frame (slightly less decode than ffmpeg's continuous decode);
+  encode dominates at this resolution so the kernel-vs-filtergraph delta is the
+  real signal. Benchmark added transient GPU load; production stayed 15/15
+  ready (no outage).
+- Bottom line: stitchd is at least as fast, ~20% faster here, trivial CPU,
+  pixel-correct — AND with deterministic pairing (no framesync bug) + headroom.
+  Tools: plans/tmp-bench-compositor.sh (resource), tmp-bench-throughput.sh (fps).
+
 ## Open questions for the user (numbered; my recommendation in [])
 1. **Language:** C++/CUDA linking libav*? [Yes — natural for CUDA+NVENC+libav;
    Rust bindings are less mature for this stack.] Or do you want Rust?
