@@ -182,7 +182,14 @@ draining. User is OK with slightly slow cold starts.
       in 10.3s). Natural drop confirmed: inputs decoded 318-750 frames each over
       10s; tick sampled newest, dropped the rest. Primary CUDA context shared by
       decode/encode/kernel (AV_CUDA_USE_PRIMARY_CONTEXT) — no push/pop needed.
-- [ ] Phase 3: sub-stream crops.
+- [x] Phase 3: sub-streams. Build composite ONCE into a pitched work buffer
+      (cudaMallocPitch), then derive every output with a crop+scale+rot180
+      Lanczos-3 gather kernel, each into its own NV12 pool + encoder. All 4
+      production outputs correct: full (hevc 7560x2688), full-low (h264
+      3600x1280 scaled), the-field (h264 4096x1216 crop+scale), john (h264
+      3024x1344 crop+rot180) — 300/300 frames each, geometry + colors + Lanczos
+      scaling all verified (plans/p3-*.png). Scale-aware Lanczos support
+      (radius = 3/min(1,dst/src)) antialiases downscale; no bilinear shortcut.
 - [ ] Phase 4: extra composites incl. produced-stream refs (all-field, entry).
 - [ ] Phase 5: backpressure/drop scheduler.
 - [ ] Phase 6: cutover behind `compositor: native`, ffmpeg fallback retained.

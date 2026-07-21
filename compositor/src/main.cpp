@@ -271,10 +271,19 @@ int selftest() {
   return ok ? 0 : 1;
 }
 
-int run_composite_full(const std::vector<std::string> &in_urls,
-                       const char *out_url, const char *codec, int fps,
-                       long long max_frames, const char *maxrate,
-                       bool unpaced) {
+// A derived output: crop a rect from the composite, scale to (w,h), optional
+// rotate180, encode. Crop rect is in COMPOSITE (post-rotate) coordinates.
+struct OutSpec {
+  const char *name;
+  const char *codec;
+  int cropX, cropY, cropW, cropH;
+  int w, h;
+  int rot180;
+  const char *maxrate; // null = uncapped
+};
+
+int run_composite(const std::vector<std::string> &in_urls, const char *dest,
+                  int fps, long long max_frames, bool unpaced) {
   av_log_set_level(AV_LOG_ERROR);
   Device dev;
   int err = dev.create();
@@ -295,7 +304,6 @@ int run_composite_full(const std::vector<std::string> &in_urls,
   }
   LOGF("%d decoders started; waiting for first frames (cold start)...", N);
 
-  // Cold start: wait until every input has delivered a frame.
   std::vector<AVFrame *> cur(N);
   for (int i = 0; i < N; ++i) cur[i] = av_frame_alloc();
   for (;;) {
@@ -308,80 +316,124 @@ int run_composite_full(const std::vector<std::string> &in_urls,
   if (g_stop) return 1;
 
   const int inW = cur[0]->width, inH = cur[0]->height;
-  const int outW = N * inH, outH = inW; // vstack + rotate 90
-  LOGF("inputs %dx%d x%d -> composite %dx%d", inW, inH, N, outW, outH);
+  const int compW = N * inH, compH = inW; // vstack + rotate 90
+  LOGF("inputs %dx%d x%d -> composite %dx%d", inW, inH, N, compW, compH);
 
-  // Output NV12 CUDA frame pool (shared by compositor allocs + the encoder).
-  AVBufferRef *frames = av_hwframe_ctx_alloc(dev.ref);
-  AVHWFramesContext *fc = (AVHWFramesContext *)frames->data;
-  fc->format = AV_PIX_FMT_CUDA;
-  fc->sw_format = AV_PIX_FMT_NV12;
-  fc->width = outW;
-  fc->height = outH;
-  fc->initial_pool_size = 12;
-  if ((err = av_hwframe_ctx_init(frames)) < 0) {
-    LOGF("hwframe_ctx_init: %s", av_err(err).c_str());
-    return 1;
-  }
+  // Persistent NV12 composite work buffer (gather writes it; every sub-stream
+  // crop/scale reads it). Raw pitched device memory — no AVFrame overhead.
+  uint8_t *wbY = nullptr, *wbUV = nullptr;
+  size_t pY = 0, pUV = 0;
+  cudaMallocPitch((void **)&wbY, &pY, compW, compH);
+  cudaMallocPitch((void **)&wbUV, &pUV, compW, compH / 2);
 
-  Output out;
+  // Outputs matching the production config (hardcoded until config parsing).
+  const int fw = compW, fh = compH; // 7560x2688
+  std::vector<OutSpec> specs = {
+      {"full", "hevc_nvenc", 0, 0, fw, fh, fw, fh, 0, nullptr},
+      {"full-low", "h264_nvenc", 0, 0, fw, fh, 3600, 1280, 0, "8000000"},
+      {"the-field", "h264_nvenc", (int)(0.40 * fw), 0, (int)(0.60 * fw),
+       fh / 2, 4096, 1216, 0, "12000000"},
+      {"john", "h264_nvenc", (int)(0.60 * fw), fh / 2, (int)(0.40 * fw),
+       fh / 2, (int)(0.40 * fw), fh / 2, 1, nullptr},
+  };
+  const bool to_null = std::strcmp(dest, "null") == 0;
   AVRational tb{1, fps}, fr{fps, 1};
-  if (open_output(out_url, codec, outW, outH, frames, tb, fr, maxrate, out) < 0)
-    return 1;
+
+  struct Out {
+    OutSpec spec;
+    AVBufferRef *frames;
+    Output io;
+  };
+  std::vector<Out> outs;
+  for (auto &s : specs) {
+    AVBufferRef *frames = av_hwframe_ctx_alloc(dev.ref);
+    AVHWFramesContext *fc = (AVHWFramesContext *)frames->data;
+    fc->format = AV_PIX_FMT_CUDA;
+    fc->sw_format = AV_PIX_FMT_NV12;
+    fc->width = s.w;
+    fc->height = s.h;
+    fc->initial_pool_size = 8;
+    if ((err = av_hwframe_ctx_init(frames)) < 0) {
+      LOGF("hwframe_ctx_init(%s): %s", s.name, av_err(err).c_str());
+      return 1;
+    }
+    Out o{s, frames, {}};
+    std::string url = to_null ? "null"
+                              : std::string(dest) + "/" + s.name + ".mp4";
+    if (open_output(url.c_str(), s.codec, s.w, s.h, frames, tb, fr, s.maxrate,
+                    o.io) < 0)
+      return 1;
+    outs.push_back(o);
+  }
 
   const auto t0 = std::chrono::steady_clock::now();
   long long frames_out = 0;
   while (!g_stop && (max_frames <= 0 || frames_out < max_frames)) {
-    // real-time tick: sample newest frames every 1/fps (unless --unpaced, which
-    // runs flat-out for throughput benchmarking).
     if (!unpaced) {
       auto target = t0 + std::chrono::microseconds(frames_out * 1000000 / fps);
       std::this_thread::sleep_until(target);
     }
 
+    // 1) build the composite once into the work buffer
     CompositeInputs ci{};
     ci.n = N;
     ci.inW = inW;
     ci.inH = inH;
     for (int i = 0; i < N; ++i) {
-      decs[i]->latest(cur[i]); // refresh to newest (keeps last if none new)
+      decs[i]->latest(cur[i]);
       ci.y[i] = cur[i]->data[0];
       ci.uv[i] = cur[i]->data[1];
       ci.pitchY[i] = cur[i]->linesize[0];
       ci.pitchUV[i] = cur[i]->linesize[1];
     }
+    launch_vstack_rotate90cw(&ci, wbY, (int)pY, wbUV, (int)pUV, compW, compH,
+                             stream);
 
-    AVFrame *of = av_frame_alloc();
-    if ((err = av_hwframe_get_buffer(frames, of, 0)) < 0) {
-      LOGF("get_buffer: %s", av_err(err).c_str());
-      av_frame_free(&of);
-      break;
+    // 2) derive every output from the work buffer
+    std::vector<AVFrame *> ofs(outs.size(), nullptr);
+    for (size_t k = 0; k < outs.size(); ++k) {
+      AVFrame *of = av_frame_alloc();
+      if (av_hwframe_get_buffer(outs[k].frames, of, 0) < 0) {
+        av_frame_free(&of);
+        continue;
+      }
+      const OutSpec &s = outs[k].spec;
+      launch_crop_scale_rot180(wbY, (int)pY, wbUV, (int)pUV, compW, compH,
+                               s.cropX, s.cropY, s.cropW, s.cropH, of->data[0],
+                               of->linesize[0], of->data[1], of->linesize[1],
+                               s.w, s.h, s.rot180, stream);
+      of->pts = frames_out;
+      ofs[k] = of;
     }
-    launch_vstack_rotate90cw(&ci, of->data[0], of->linesize[0], of->data[1],
-                             of->linesize[1], outW, outH, stream);
     cudaStreamSynchronize(stream);
 
-    of->pts = frames_out;
-    if ((err = avcodec_send_frame(out.enc, of)) < 0)
-      LOGF("send_frame: %s", av_err(err).c_str());
-    av_frame_free(&of);
-    if (drain(out) < 0) break;
+    // 3) encode
+    for (size_t k = 0; k < outs.size(); ++k) {
+      if (!ofs[k]) continue;
+      if (avcodec_send_frame(outs[k].io.enc, ofs[k]) < 0)
+        LOGF("send_frame(%s)", outs[k].spec.name);
+      av_frame_free(&ofs[k]);
+      drain(outs[k].io);
+    }
     if (++frames_out % 300 == 0)
       LOGF("composite alive: %lld frames", frames_out);
   }
 
-  avcodec_send_frame(out.enc, nullptr);
-  drain(out);
-  close_output(out);
-  for (int i = 0; i < N; ++i) { decs[i]->stop(); }
-  auto secs = std::chrono::duration<double>(
-                  std::chrono::steady_clock::now() - t0)
-                  .count();
-  LOGF("done: %lld composite frames in %.1fs (%.1f fps); decoder counts:",
-       frames_out, secs, frames_out / secs);
-  for (int i = 0; i < N; ++i)
-    LOGF("  input %d: %lld decoded", i, (long long)decs[i]->count_);
+  for (auto &o : outs) {
+    avcodec_send_frame(o.io.enc, nullptr);
+    drain(o.io);
+    close_output(o.io);
+    av_buffer_unref(&o.frames);
+  }
+  for (int i = 0; i < N; ++i) decs[i]->stop();
+  auto secs =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+          .count();
+  LOGF("done: %lld composite frames in %.1fs (%.1f fps), %zu outputs",
+       frames_out, secs, frames_out / secs, outs.size());
   for (int i = 0; i < N; ++i) { av_frame_free(&cur[i]); delete decs[i]; }
+  cudaFree(wbY);
+  cudaFree(wbUV);
   cudaStreamDestroy(stream);
   return 0;
 }
@@ -409,9 +461,13 @@ int main(int argc, char **argv) {
   std::signal(SIGTERM, [](int) { g_stop = 1; });
 
   if (composite) {
-    if (in_urls.empty() || !out_url) { LOGF("need --in ... --out"); return 2; }
-    return run_composite_full(in_urls, out_url, codec ? codec : "hevc_nvenc",
-                              fps, max_frames, maxrate, unpaced);
+    if (in_urls.empty() || !out_url) {
+      LOGF("need --in ... --out <dir|null>");
+      return 2;
+    }
+    (void)codec;
+    (void)maxrate; // per-output specs are hardcoded (phase 3)
+    return run_composite(in_urls, out_url, fps, max_frames, unpaced);
   }
   return selftest();
 }
