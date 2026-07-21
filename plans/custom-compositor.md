@@ -104,7 +104,12 @@ draining. User is OK with slightly slow cold starts.
 - GPU-or-error policy still holds: any failure to build the GPU path = loud
   error, never CPU fallback, never silent quality downgrade. Drops must be
   logged, never silent. [[gpu-or-error]]
-- Recommended (pending explicit confirm): C++/CUDA linking libav* (see §Arch).
+- **CONFIRMED (user, 2026-07-20): C++/CUDA, linking our existing libav\*** for
+  RTSP I/O + NVDEC/NVENC. Not bare-metal (no from-scratch RTSP/NVIDIA SDK).
+  Compositing + tick pairing + drop scheduler are all ours.
+- Repo placement: `compositor/` dir in restitch, own CMake, new Dockerfile
+  builder stage (proceeding with this default; flag if you want a separate repo).
+- Codename: `stitchd` (binary/dir) unless you object.
 
 ## Plan / steps (phased — MVP first, keep ffmpeg fallback)
 0. **[current] Architecture sign-off** — confirm the C++/CUDA + libav* approach,
@@ -127,7 +132,31 @@ draining. User is OK with slightly slow cold starts.
    while; then remove the ffmpeg compositor path.
 
 ## Findings / gotchas (append as we learn)
-- (none yet — project just scoped)
+- Dev loop established. The old `ffmpeg-npp-test:latest` image already carries
+  the ffmpeg-builder contents: static libav* + headers + pkgconfig at
+  /opt/ffmpeg, CUDA 12.9 devel (nvcc), g++, NPP. Built `stitchd-dev:latest` =
+  that + cmake 3.28. Compile in it (no GPU needed); run with `--gpus all`
+  `-e NVIDIA_DRIVER_CAPABILITIES=compute,video`. Source synced to
+  sentinel:/tmp/stitchd-src. libav is n7.1.5 (avformat 61.7.103).
+- libav is STATIC (.a, no --enable-shared). CMake links via pkg-config; use
+  the `_STATIC_STATIC_LIBRARIES` var + `PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig`
+  to pull transitive deps. Works (Phase 1a links clean).
+- compositor/** is NOT in deploy.yml trigger paths (src/**, containers/**,
+  servers/**), so committing compositor code does NOT trigger a sentinel
+  deploy. Safe to iterate freely until we wire it into the image/config.
+
+## Progress log
+- [x] Phase 0: architecture signed off (C++/CUDA + libav*, confirmed by user).
+- [x] Phase 1a: toolchain/link check. stitchd binary links static libav* +
+      CUDA + NPP, runs on the 4090, confirms h264 decoder + h264_nvenc +
+      hevc_nvenc present and CUDA hwdevice creates. "PHASE-1A OK".
+- [ ] Phase 1: single passthrough (RTSP in → NVDEC → NVENC → RTSP out) in our
+      own libav* code, shared CUDA context. NEXT.
+- [ ] Phase 2: `full` composite (5-bay CUDA stack + rotate).
+- [ ] Phase 3: sub-stream crops.
+- [ ] Phase 4: extra composites incl. produced-stream refs (all-field, entry).
+- [ ] Phase 5: backpressure/drop scheduler.
+- [ ] Phase 6: cutover behind `compositor: native`, ffmpeg fallback retained.
 
 ## Open questions for the user (numbered; my recommendation in [])
 1. **Language:** C++/CUDA linking libav*? [Yes — natural for CUDA+NVENC+libav;
