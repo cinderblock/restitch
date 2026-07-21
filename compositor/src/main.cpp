@@ -283,7 +283,8 @@ struct OutSpec {
 };
 
 int run_composite(const std::vector<std::string> &in_urls, const char *dest,
-                  int fps, long long max_frames, bool unpaced) {
+                  int fps, long long max_frames, bool unpaced,
+                  const char *fc_url) {
   av_log_set_level(AV_LOG_ERROR);
   Device dev;
   int err = dev.create();
@@ -304,12 +305,24 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
   }
   LOGF("%d decoders started; waiting for first frames (cold start)...", N);
 
+  // Field Centered — an AUX input (not part of the 5-bay composite stack); used
+  // only as all-field's bottom half.
+  Decoder *fcdec = nullptr;
+  AVFrame *fccur = nullptr;
+  if (fc_url) {
+    fcdec = new Decoder();
+    if (fcdec->open(fc_url, dev.ref) < 0) { LOGF("fc open failed"); return 1; }
+    fcdec->start();
+    fccur = av_frame_alloc();
+  }
+
   std::vector<AVFrame *> cur(N);
   for (int i = 0; i < N; ++i) cur[i] = av_frame_alloc();
   for (;;) {
     bool all = true;
     for (int i = 0; i < N; ++i)
       if (!decs[i]->latest(cur[i])) all = false;
+    if (fcdec && !fcdec->latest(fccur)) all = false;
     if (all || g_stop) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
@@ -366,6 +379,37 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
     outs.push_back(o);
   }
 
+  // all-field: the-field (in-GPU, rot180, left-10% trimmed) over Field Centered.
+  // THE PAYOFF — it samples the-field's PRE-ENCODE output frame directly, so
+  // there is no re-decode, no re-encode (no generation loss), and no second
+  // framesync (the stale-frame bug that started this project is impossible).
+  const int TF_IDX = 2;                            // the-field in `outs`
+  const int afTopW = 3686, afTopH = 1216;          // the-field trimmed+flipped
+  const int afBotH = ((1512 * afTopW / 2688) + 1) & ~1; // FC scaled, even
+  const int afW = afTopW, afH = afTopH + afBotH;   // 3686 x 3290
+  Out afOut{};
+  const bool has_af = fcdec != nullptr;
+  if (has_af) {
+    AVBufferRef *frames = av_hwframe_ctx_alloc(dev.ref);
+    AVHWFramesContext *fc = (AVHWFramesContext *)frames->data;
+    fc->format = AV_PIX_FMT_CUDA;
+    fc->sw_format = AV_PIX_FMT_NV12;
+    fc->width = afW;
+    fc->height = afH;
+    fc->initial_pool_size = 8;
+    if ((err = av_hwframe_ctx_init(frames)) < 0) {
+      LOGF("hwframe_ctx_init(all-field): %s", av_err(err).c_str());
+      return 1;
+    }
+    afOut.spec = {"all-field", "h264_nvenc", 0, 0, afW, afH,
+                  afW,         afH,          0, "12000000"};
+    afOut.frames = frames;
+    std::string url = to_null ? "null" : std::string(dest) + "/all-field.mp4";
+    if (open_output(url.c_str(), "h264_nvenc", afW, afH, frames, tb, fr,
+                    "12000000", afOut.io) < 0)
+      return 1;
+  }
+
   const auto t0 = std::chrono::steady_clock::now();
   long long frames_out = 0;
   while (!g_stop && (max_frames <= 0 || frames_out < max_frames)) {
@@ -405,6 +449,39 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
       of->pts = frames_out;
       ofs[k] = of;
     }
+
+    // 2b) all-field: sample the-field's in-GPU frame (top, rot180+trim) + Field
+    // Centered (bottom). Same stream as the base kernels, so the-field's kernel
+    // has already run when this reads it (serialized) — no extra sync needed.
+    AVFrame *af = nullptr;
+    if (has_af && ofs[TF_IDX]) {
+      af = av_frame_alloc();
+      if (av_hwframe_get_buffer(afOut.frames, af, 0) == 0) {
+        AVFrame *tf = ofs[TF_IDX]; // the-field 4096x1216, pre-encode, in GPU
+        // top: crop the-field's left `afTopW` and rot180 (== rot180 then trim
+        // left 10%); no scale.
+        launch_crop_scale_rot180(
+            tf->data[0], tf->linesize[0], tf->data[1], tf->linesize[1],
+            tf->width, tf->height, 0, 0, afTopW, afTopH, af->data[0],
+            af->linesize[0], af->data[1], af->linesize[1], afTopW, afTopH,
+            /*rot180=*/1, stream);
+        // bottom: Field Centered scaled to (afTopW x afBotH), written at row
+        // afTopH of the all-field frame.
+        fcdec->latest(fccur);
+        uint8_t *botY = af->data[0] + (size_t)afTopH * af->linesize[0];
+        uint8_t *botUV = af->data[1] + (size_t)(afTopH / 2) * af->linesize[1];
+        launch_crop_scale_rot180(
+            fccur->data[0], fccur->linesize[0], fccur->data[1],
+            fccur->linesize[1], fccur->width, fccur->height, 0, 0, fccur->width,
+            fccur->height, botY, af->linesize[0], botUV, af->linesize[1],
+            afTopW, afBotH, /*rot180=*/0, stream);
+        af->pts = frames_out;
+      } else {
+        av_frame_free(&af);
+        af = nullptr;
+      }
+    }
+
     cudaStreamSynchronize(stream);
 
     // 3) encode
@@ -415,6 +492,12 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
       av_frame_free(&ofs[k]);
       drain(outs[k].io);
     }
+    if (af) {
+      if (avcodec_send_frame(afOut.io.enc, af) < 0)
+        LOGF("send_frame(all-field)");
+      av_frame_free(&af);
+      drain(afOut.io);
+    }
     if (++frames_out % 300 == 0)
       LOGF("composite alive: %lld frames", frames_out);
   }
@@ -424,6 +507,15 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
     drain(o.io);
     close_output(o.io);
     av_buffer_unref(&o.frames);
+  }
+  if (has_af) {
+    avcodec_send_frame(afOut.io.enc, nullptr);
+    drain(afOut.io);
+    close_output(afOut.io);
+    av_buffer_unref(&afOut.frames);
+    fcdec->stop();
+    delete fcdec;
+    av_frame_free(&fccur);
   }
   for (int i = 0; i < N; ++i) decs[i]->stop();
   auto secs =
@@ -443,6 +535,7 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
 int main(int argc, char **argv) {
   std::vector<std::string> in_urls;
   const char *out_url = nullptr, *codec = nullptr, *maxrate = nullptr;
+  const char *fc_url = nullptr;
   long long max_frames = 0;
   int fps = 30;
   bool composite = false, unpaced = false;
@@ -456,6 +549,7 @@ int main(int argc, char **argv) {
     else if (a == "--maxrate" && i + 1 < argc) maxrate = argv[++i];
     else if (a == "--composite-full") composite = true;
     else if (a == "--unpaced") unpaced = true;
+    else if (a == "--field-centered" && i + 1 < argc) fc_url = argv[++i];
   }
   std::signal(SIGINT, [](int) { g_stop = 1; });
   std::signal(SIGTERM, [](int) { g_stop = 1; });
@@ -467,7 +561,7 @@ int main(int argc, char **argv) {
     }
     (void)codec;
     (void)maxrate; // per-output specs are hardcoded (phase 3)
-    return run_composite(in_urls, out_url, fps, max_frames, unpaced);
+    return run_composite(in_urls, out_url, fps, max_frames, unpaced, fc_url);
   }
   return selftest();
 }

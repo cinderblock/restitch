@@ -190,7 +190,18 @@ draining. User is OK with slightly slow cold starts.
       3024x1344 crop+rot180) — 300/300 frames each, geometry + colors + Lanczos
       scaling all verified (plans/p3-*.png). Scale-aware Lanczos support
       (radius = 3/min(1,dst/src)) antialiases downscale; no bilinear shortcut.
-- [ ] Phase 4: extra composites incl. produced-stream refs (all-field, entry).
+- [~] Phase 4: extra composites. all-field DONE (the payoff) — built by
+      sampling the-field's PRE-ENCODE output frame directly (crop left 3686 +
+      rot180 == rot180-then-trim-left-10%) + Field Centered scaled to the
+      bottom → 3686x3290 h264. NO re-decode, NO re-encode, NO second framesync:
+      the stale-frame bug is structurally impossible, and the top half is
+      HIGHER quality than production (prod re-encoded+re-decoded the-field;
+      stitchd uses pristine pre-encode pixels). 300/300 frames, dims exact,
+      geometry/flip/colors verified (plans/p4-all-field.png). Field Centered is
+      an AUX decoder (not in the 5-bay stack); same-stream ordering means
+      the-field's kernel completes before all-field reads it (no extra sync).
+      REMAINING: `entry` (Doorbell crop over Foyer) — a separate 2-camera
+      composite, no composite-buffer dependency; straightforward follow-on.
 - [ ] Phase 5: backpressure/drop scheduler.
 - [ ] Phase 6: cutover behind `compositor: native`, ffmpeg fallback retained.
 
