@@ -175,7 +175,13 @@ draining. User is OK with slightly slow cold starts.
       Validated to a file: 300 frames in → 300 out, 9.97s, h264 2688x1512,
       clean trailer. Graceful SIGTERM flush added. RTSP-out path is the same
       code (works once publishing to a configured mediamtx path).
-- [ ] Phase 2: `full` composite (5-bay CUDA stack + rotate).
+- [x] Phase 2: `full` composite (5-bay CUDA stack+rotate90 gather kernel +
+      threaded per-input decoders + tick scheduler). Produces HEVC 7560x2688,
+      300/300 frames, 9.97s, geometry + colors correct, NO green edges (verified
+      visually: plans/stitchd-full.png). Sustains real-time 30fps (300 frames
+      in 10.3s). Natural drop confirmed: inputs decoded 318-750 frames each over
+      10s; tick sampled newest, dropped the rest. Primary CUDA context shared by
+      decode/encode/kernel (AV_CUDA_USE_PRIMARY_CONTEXT) — no push/pop needed.
 - [ ] Phase 3: sub-stream crops.
 - [ ] Phase 4: extra composites incl. produced-stream refs (all-field, entry).
 - [ ] Phase 5: backpressure/drop scheduler.
