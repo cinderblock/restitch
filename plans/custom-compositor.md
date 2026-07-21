@@ -144,14 +144,37 @@ draining. User is OK with slightly slow cold starts.
 - compositor/** is NOT in deploy.yml trigger paths (src/**, containers/**,
   servers/**), so committing compositor code does NOT trigger a sentinel
   deploy. Safe to iterate freely until we wire it into the image/config.
+- Phase 1 gotchas (all resolved):
+  * RTSP publish to mediamtx needs AV_CODEC_FLAG_GLOBAL_HEADER on the encoder
+    (SPS/PPS in extradata for the SDP ANNOUNCE) — set it BEFORE avcodec_open2,
+    gated on (oformat->flags & AVFMT_GLOBALHEADER).
+  * The restitch mediamtx config only allows publishing to CONFIGURED paths
+    (each output `source: publisher`); an unconfigured path → "400 Bad
+    Request" / "path is not configured". So dev-testing publishes can't use a
+    random path — validate to a FILE, or (later) publish to the real output
+    names inside the container. In production stitchd publishes the configured
+    names, so this is a non-issue.
+  * File muxers need avio_open on fmt->pb (rtsp is AVFMT_NOFILE, doesn't).
+  * mp4 "moov atom not found" = process killed before trailer. Added SIGTERM/
+    SIGINT → g_stop → clean flush+trailer (the supervisor stops us with
+    SIGTERM, so graceful shutdown is needed in production anyway).
+  * Zero-copy transcode confirmed: encoder reuses the decoder frame's
+    hw_frames_ctx (av_buffer_ref frame->hw_frames_ctx), pix_fmt=CUDA,
+    sw_pix_fmt=NV12 — NVENC consumes NVDEC frames directly, no download.
+  * Dev-test containers can leak if `timeout`/`docker stop` detaches them;
+    clean strays with `docker ps --filter ancestor=stitchd-dev -q | xargs -r
+    docker rm -f`. Prefer `--frames N` for a self-terminating run.
 
 ## Progress log
 - [x] Phase 0: architecture signed off (C++/CUDA + libav*, confirmed by user).
 - [x] Phase 1a: toolchain/link check. stitchd binary links static libav* +
       CUDA + NPP, runs on the 4090, confirms h264 decoder + h264_nvenc +
       hevc_nvenc present and CUDA hwdevice creates. "PHASE-1A OK".
-- [ ] Phase 1: single passthrough (RTSP in → NVDEC → NVENC → RTSP out) in our
-      own libav* code, shared CUDA context. NEXT.
+- [x] Phase 1: zero-copy transcode loop in our own libav* code. RTSP in →
+      NVDEC (CUDA frames) → NVENC → mux, shared CUDA device, no PCIe download.
+      Validated to a file: 300 frames in → 300 out, 9.97s, h264 2688x1512,
+      clean trailer. Graceful SIGTERM flush added. RTSP-out path is the same
+      code (works once publishing to a configured mediamtx path).
 - [ ] Phase 2: `full` composite (5-bay CUDA stack + rotate).
 - [ ] Phase 3: sub-stream crops.
 - [ ] Phase 4: extra composites incl. produced-stream refs (all-field, entry).
