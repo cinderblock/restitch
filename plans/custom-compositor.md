@@ -206,7 +206,18 @@ draining. User is OK with slightly slow cold starts.
       ONE process + ONE decode set (5 bays + 3 aux cams), all dims exact,
       300/300 frames, all verified (plans/p4-*.png). ~22.7 fps for all 6
       outputs concurrent with live production sharing the GPU.
-- [ ] Phase 5: backpressure/drop scheduler.
+- [x] Phase 5: backpressure/drop scheduler. Each output has its OWN
+      encode+mux thread + bounded queue (depth 6, pool 16). The tick composites
+      and submit()s each frame; queue-full (output not draining) → DROP + count
+      + log; never blocks the tick or siblings. Input side: decoders overwrite
+      their latest slot (natural drop) + a 10s socket timeout so a wedged input
+      can't hang its decode thread. VALIDATED: (a) normal paced run = 0 drops,
+      all 6 outputs intact, real-time; (b) unpaced = 0 drops (all encoders keep
+      up at the ~24fps shared-GPU limit); (c) ISOLATION — with `full` stalled
+      80ms/frame, full dropped 324/600 while EVERY sibling stayed at 0 drops
+      and the tick kept running at 26.6fps. Sibling-starvation (the CFR
+      dup-spiral / foyer-freeze) is now structurally impossible. Test hook:
+      STITCHD_SLOW_NAME + STITCHD_SLOW_MS.
 - [ ] Phase 6: cutover behind `compositor: native`, ffmpeg fallback retained.
 
 ## Phase 2 design (the CUDA compositing core — next to build)

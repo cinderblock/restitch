@@ -14,11 +14,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 #include <vector>
@@ -78,6 +80,9 @@ public:
     AVDictionary *opt = nullptr;
     av_dict_set(&opt, "rtsp_transport", "tcp", 0);
     av_dict_set(&opt, "fflags", "nobuffer", 0);
+    // Socket I/O timeout (us): a wedged input errors out of av_read_frame
+    // instead of hanging the decode thread forever (last frame is retained).
+    av_dict_set(&opt, "timeout", "10000000", 0);
     int err = avformat_open_input(&fmt_, url, nullptr, &opt);
     av_dict_free(&opt);
     if (err < 0) { LOGF("open %s: %s", url, av_err(err).c_str()); return err; }
@@ -282,6 +287,103 @@ struct OutSpec {
   const char *maxrate; // null = uncapped
 };
 
+// One output: its encoder + muxer run on their OWN thread, fed by a bounded
+// queue. The compositor tick tries to submit() a frame; if the queue is full
+// (this output isn't draining — slow downstream / mediamtx backpressure), the
+// frame is DROPPED (counted, logged) instead of blocking the tick or any
+// sibling output. This makes sibling-starvation structurally impossible — a
+// stuck reader can only starve ITS OWN stream. (User's phase-5 requirement:
+// drop compositions/inputs when outputs aren't draining, never silently.)
+class OutputWorker {
+public:
+  OutSpec spec{};
+  AVBufferRef *frames = nullptr;
+
+  int open(const std::string &url, const OutSpec &s, AVBufferRef *fr,
+           AVRational tb, AVRational frr, int depth) {
+    spec = s;
+    frames = av_buffer_ref(fr);
+    max_depth_ = depth;
+    if (open_output(url.c_str(), s.codec, s.w, s.h, fr, tb, frr, s.maxrate,
+                    io_) < 0)
+      return -1;
+    th_ = std::thread([this] { loop(); });
+    return 0;
+  }
+
+  // Takes ownership of `f` on success (returns true). On false (queue full),
+  // the caller still owns `f` and must free it — that is the drop.
+  bool submit(AVFrame *f) {
+    std::unique_lock<std::mutex> lk(mu_);
+    if ((int)q_.size() >= max_depth_) {
+      ++dropped_;
+      return false;
+    }
+    q_.push(f);
+    cv_.notify_one();
+    return true;
+  }
+
+  void stop() {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      running_ = false;
+    }
+    cv_.notify_all();
+    if (th_.joinable())
+      th_.join();
+    avcodec_send_frame(io_.enc, nullptr); // flush
+    drain(io_);
+    close_output(io_);
+    if (frames)
+      av_buffer_unref(&frames);
+  }
+
+  void note_pool_drop() { ++dropped_; }
+  long long dropped() const { return dropped_; }
+  long long encoded() const { return encoded_; }
+
+private:
+  void loop() {
+    cudaSetDevice(0); // primary context (shared) for NVENC on this thread
+    // Test hook: STITCHD_SLOW_NAME + STITCHD_SLOW_MS artificially stalls ONE
+    // output to exercise the drop path (simulates a stuck downstream reader).
+    const char *sn = std::getenv("STITCHD_SLOW_NAME");
+    const int sms = std::getenv("STITCHD_SLOW_MS")
+                        ? std::atoi(std::getenv("STITCHD_SLOW_MS"))
+                        : 0;
+    const bool slow = sn && sms > 0 && std::strcmp(sn, spec.name) == 0;
+    for (;;) {
+      AVFrame *f = nullptr;
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [this] { return !q_.empty() || !running_; });
+        if (q_.empty() && !running_)
+          break;
+        f = q_.front();
+        q_.pop();
+      }
+      if (avcodec_send_frame(io_.enc, f) < 0)
+        LOGF("send_frame(%s)", spec.name);
+      av_frame_free(&f);
+      drain(io_); // may block on slow downstream — only backs up THIS queue
+      if (slow)
+        std::this_thread::sleep_for(std::chrono::milliseconds(sms));
+      ++encoded_;
+    }
+  }
+
+  Output io_{};
+  std::queue<AVFrame *> q_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::thread th_;
+  bool running_ = true;
+  int max_depth_ = 6;
+  std::atomic<long long> dropped_{0};
+  std::atomic<long long> encoded_{0};
+};
+
 // A camera aux decoder + the frame we ref into each tick.
 struct Aux {
   Decoder *dec = nullptr;
@@ -371,32 +473,37 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
   };
   const bool to_null = std::strcmp(dest, "null") == 0;
   AVRational tb{1, fps}, fr{fps, 1};
+  const int QDEPTH = 6, POOL = 16; // queue depth per output; frame pool per output
 
-  struct Out {
-    OutSpec spec;
-    AVBufferRef *frames;
-    Output io;
-  };
-  std::vector<Out> outs;
-  for (auto &s : specs) {
+  // Helper: build an output's NV12 CUDA pool + its threaded worker.
+  auto make_worker = [&](const OutSpec &s) -> OutputWorker * {
     AVBufferRef *frames = av_hwframe_ctx_alloc(dev.ref);
     AVHWFramesContext *fc = (AVHWFramesContext *)frames->data;
     fc->format = AV_PIX_FMT_CUDA;
     fc->sw_format = AV_PIX_FMT_NV12;
     fc->width = s.w;
     fc->height = s.h;
-    fc->initial_pool_size = 8;
-    if ((err = av_hwframe_ctx_init(frames)) < 0) {
-      LOGF("hwframe_ctx_init(%s): %s", s.name, av_err(err).c_str());
-      return 1;
+    fc->initial_pool_size = POOL;
+    if (av_hwframe_ctx_init(frames) < 0) {
+      LOGF("hwframe_ctx_init(%s)", s.name);
+      return nullptr;
     }
-    Out o{s, frames, {}};
-    std::string url = to_null ? "null"
-                              : std::string(dest) + "/" + s.name + ".mp4";
-    if (open_output(url.c_str(), s.codec, s.w, s.h, frames, tb, fr, s.maxrate,
-                    o.io) < 0)
-      return 1;
-    outs.push_back(o);
+    auto *w = new OutputWorker();
+    std::string url = to_null ? "null" : std::string(dest) + "/" + s.name + ".mp4";
+    if (w->open(url, s, frames, tb, fr, QDEPTH) < 0) {
+      delete w;
+      av_buffer_unref(&frames);
+      return nullptr;
+    }
+    av_buffer_unref(&frames); // worker took its own ref
+    return w;
+  };
+
+  std::vector<OutputWorker *> outs;
+  for (auto &s : specs) {
+    OutputWorker *w = make_worker(s);
+    if (!w) return 1;
+    outs.push_back(w);
   }
 
   // all-field: the-field (in-GPU, rot180, left-10% trimmed) over Field Centered.
@@ -407,26 +514,12 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
   const int afTopW = 3686, afTopH = 1216;          // the-field trimmed+flipped
   const int afBotH = ((1512 * afTopW / 2688) + 1) & ~1; // FC scaled, even
   const int afW = afTopW, afH = afTopH + afBotH;   // 3686 x 3290
-  Out afOut{};
+  OutSpec afSpec{"all-field", "h264_nvenc", 0, 0, afW, afH, afW, afH, 0,
+                 "12000000"};
+  OutputWorker *afw = nullptr;
   if (has_af) {
-    AVBufferRef *frames = av_hwframe_ctx_alloc(dev.ref);
-    AVHWFramesContext *fc = (AVHWFramesContext *)frames->data;
-    fc->format = AV_PIX_FMT_CUDA;
-    fc->sw_format = AV_PIX_FMT_NV12;
-    fc->width = afW;
-    fc->height = afH;
-    fc->initial_pool_size = 8;
-    if ((err = av_hwframe_ctx_init(frames)) < 0) {
-      LOGF("hwframe_ctx_init(all-field): %s", av_err(err).c_str());
-      return 1;
-    }
-    afOut.spec = {"all-field", "h264_nvenc", 0, 0, afW, afH,
-                  afW,         afH,          0, "12000000"};
-    afOut.frames = frames;
-    std::string url = to_null ? "null" : std::string(dest) + "/all-field.mp4";
-    if (open_output(url.c_str(), "h264_nvenc", afW, afH, frames, tb, fr,
-                    "12000000", afOut.io) < 0)
-      return 1;
+    afw = make_worker(afSpec);
+    if (!afw) return 1;
   }
 
   // entry: Doorbell (cropped) over Foyer (scaled). Two fresh cameras, no
@@ -435,25 +528,11 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
   const int enTopW = 1200, enTopH = 676;              // doorbell crop
   const int enBotH = ((1512 * enTopW / 2688) + 1) & ~1; // foyer scaled, even
   const int enW = enTopW, enH = enTopH + enBotH;      // 1200 x 1352
-  Out enOut{};
+  OutSpec enSpec{"entry", "h264_nvenc", 0, 0, enW, enH, enW, enH, 0, nullptr};
+  OutputWorker *enw = nullptr;
   if (has_entry) {
-    AVBufferRef *frames = av_hwframe_ctx_alloc(dev.ref);
-    AVHWFramesContext *fc2 = (AVHWFramesContext *)frames->data;
-    fc2->format = AV_PIX_FMT_CUDA;
-    fc2->sw_format = AV_PIX_FMT_NV12;
-    fc2->width = enW;
-    fc2->height = enH;
-    fc2->initial_pool_size = 8;
-    if ((err = av_hwframe_ctx_init(frames)) < 0) {
-      LOGF("hwframe_ctx_init(entry): %s", av_err(err).c_str());
-      return 1;
-    }
-    enOut.spec = {"entry", "h264_nvenc", 0, 0, enW, enH, enW, enH, 0, nullptr};
-    enOut.frames = frames;
-    std::string url = to_null ? "null" : std::string(dest) + "/entry.mp4";
-    if (open_output(url.c_str(), "h264_nvenc", enW, enH, frames, tb, fr,
-                    nullptr, enOut.io) < 0)
-      return 1;
+    enw = make_worker(enSpec);
+    if (!enw) return 1;
   }
 
   const auto t0 = std::chrono::steady_clock::now();
@@ -479,15 +558,18 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
     launch_vstack_rotate90cw(&ci, wbY, (int)pY, wbUV, (int)pUV, compW, compH,
                              stream);
 
-    // 2) derive every output from the work buffer
+    // 2) derive every output from the work buffer. get_buffer can fail if an
+    // output's pool is exhausted because it isn't draining — that's a drop too.
     std::vector<AVFrame *> ofs(outs.size(), nullptr);
     for (size_t k = 0; k < outs.size(); ++k) {
       AVFrame *of = av_frame_alloc();
-      if (av_hwframe_get_buffer(outs[k].frames, of, 0) < 0) {
+      if (av_hwframe_get_buffer(outs[k]->frames, of, 0) < 0) {
+        // pool exhausted because this output isn't draining — also a drop
+        outs[k]->note_pool_drop();
         av_frame_free(&of);
         continue;
       }
-      const OutSpec &s = outs[k].spec;
+      const OutSpec &s = outs[k]->spec;
       launch_crop_scale_rot180(wbY, (int)pY, wbUV, (int)pUV, compW, compH,
                                s.cropX, s.cropY, s.cropW, s.cropH, of->data[0],
                                of->linesize[0], of->data[1], of->linesize[1],
@@ -502,7 +584,7 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
     AVFrame *af = nullptr;
     if (has_af && ofs[TF_IDX]) {
       af = av_frame_alloc();
-      if (av_hwframe_get_buffer(afOut.frames, af, 0) == 0) {
+      if (av_hwframe_get_buffer(afw->frames, af, 0) == 0) {
         AVFrame *tf = ofs[TF_IDX]; // the-field 4096x1216, pre-encode, in GPU
         // top: crop the-field's left `afTopW` and rot180 (== rot180 then trim
         // left 10%); no scale.
@@ -532,7 +614,7 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
     AVFrame *en = nullptr;
     if (has_entry) {
       en = av_frame_alloc();
-      if (av_hwframe_get_buffer(enOut.frames, en, 0) == 0) {
+      if (av_hwframe_get_buffer(enw->frames, en, 0) == 0) {
         db.refresh();
         fy.refresh();
         launch_crop_scale_rot180(
@@ -556,48 +638,46 @@ int run_composite(const std::vector<std::string> &in_urls, const char *dest,
 
     cudaStreamSynchronize(stream);
 
-    // 3) encode
+    // 3) hand each output's frame to its worker thread. submit() returns false
+    // when that output's queue is full (it isn't draining) — we DROP the frame
+    // (free it) rather than block the tick or any sibling. One slow reader can
+    // only starve its own stream.
     for (size_t k = 0; k < outs.size(); ++k) {
-      if (!ofs[k]) continue;
-      if (avcodec_send_frame(outs[k].io.enc, ofs[k]) < 0)
-        LOGF("send_frame(%s)", outs[k].spec.name);
-      av_frame_free(&ofs[k]);
-      drain(outs[k].io);
+      if (ofs[k] && !outs[k]->submit(ofs[k]))
+        av_frame_free(&ofs[k]); // dropped
     }
-    if (af) {
-      if (avcodec_send_frame(afOut.io.enc, af) < 0)
-        LOGF("send_frame(all-field)");
+    if (af && !afw->submit(af))
       av_frame_free(&af);
-      drain(afOut.io);
-    }
-    if (en) {
-      if (avcodec_send_frame(enOut.io.enc, en) < 0)
-        LOGF("send_frame(entry)");
+    if (en && !enw->submit(en))
       av_frame_free(&en);
-      drain(enOut.io);
+
+    if (++frames_out % 300 == 0) {
+      std::string drops;
+      for (auto *w : outs)
+        if (w->dropped())
+          drops += " " + std::string(w->spec.name) + "=" +
+                   std::to_string(w->dropped());
+      if (afw && afw->dropped())
+        drops += " all-field=" + std::to_string(afw->dropped());
+      if (enw && enw->dropped())
+        drops += " entry=" + std::to_string(enw->dropped());
+      LOGF("alive: %lld frames%s", frames_out,
+           drops.empty() ? " (0 drops)" : (", drops:" + drops).c_str());
     }
-    if (++frames_out % 300 == 0)
-      LOGF("composite alive: %lld frames", frames_out);
   }
 
-  for (auto &o : outs) {
-    avcodec_send_frame(o.io.enc, nullptr);
-    drain(o.io);
-    close_output(o.io);
-    av_buffer_unref(&o.frames);
+  for (auto *w : outs) {
+    w->stop();
+    delete w;
   }
   if (has_af) {
-    avcodec_send_frame(afOut.io.enc, nullptr);
-    drain(afOut.io);
-    close_output(afOut.io);
-    av_buffer_unref(&afOut.frames);
+    afw->stop();
+    delete afw;
     fc.close();
   }
   if (has_entry) {
-    avcodec_send_frame(enOut.io.enc, nullptr);
-    drain(enOut.io);
-    close_output(enOut.io);
-    av_buffer_unref(&enOut.frames);
+    enw->stop();
+    delete enw;
     db.close();
     fy.close();
   }
