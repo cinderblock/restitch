@@ -96,6 +96,22 @@ RUN cd /opt/ffmpeg-src && \
     make install
 
 
+# --- builder: stitchd, the custom CUDA compositor (compositor/) ---
+# Compiles against the libav* we just built (/opt/ffmpeg) + CUDA/NPP. Only used
+# when config `compositor: native`. Reuses the ffmpeg-builder stage so it has
+# the static libav*, headers, pkgconfig, nvcc and NPP already in place.
+FROM ffmpeg-builder AS compositor-builder
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends cmake && \
+    rm -rf /var/lib/apt/lists/*
+COPY compositor /opt/compositor
+RUN cmake -S /opt/compositor -B /opt/compositor/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PREFIX_PATH=/opt/ffmpeg && \
+    PKG_CONFIG_PATH=/opt/ffmpeg/lib/pkgconfig \
+        cmake --build /opt/compositor/build -j"$(nproc)"
+
+
 # --- runtime ---
 FROM nvidia/cuda:12.9.2-runtime-ubuntu24.04
 
@@ -112,6 +128,10 @@ RUN apt-get update -qq && \
 # nvidia/cuda runtime image ships.
 COPY --from=ffmpeg-builder /opt/ffmpeg/bin/ffmpeg  /usr/local/bin/ffmpeg
 COPY --from=ffmpeg-builder /opt/ffmpeg/bin/ffprobe /usr/local/bin/ffprobe
+
+# stitchd, the custom CUDA compositor (used when config `compositor: native`).
+# Static-links libav*, dynamically links libnpp*/cudart from the cuda runtime.
+COPY --from=compositor-builder /opt/compositor/build/stitchd /usr/local/bin/stitchd
 
 # mediamtx (RTSP/WebRTC/HLS + control API). Version pinned via ARG so the
 # build script can override from versions.json.

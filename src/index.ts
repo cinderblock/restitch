@@ -2,13 +2,16 @@ import { parseArgs } from "util";
 import { resolve } from "path";
 import YAML from "yaml";
 import { ConfigSchema, type Config } from "./config.ts";
+import { writeFileSync } from "fs";
 import {
   buildPipeline,
   buildExtraCompositePipeline,
   buildCommand,
+  buildStitchdConfig,
   ensureHwaccelWorks,
   type ProbeResult,
   type Pipeline,
+  type PipelineOutput,
 } from "./ffmpeg.ts";
 import { probeAllCameras } from "./probe.ts";
 import { writeMediaMTXConfig, rawStreamName } from "./mediamtx.ts";
@@ -25,6 +28,7 @@ const { values } = parseArgs({
     "dry-run": { type: "boolean", default: false },
     "skip-probe": { type: "boolean", default: false },
     "mediamtx-bin": { type: "string", default: "mediamtx" },
+    "stitchd-bin": { type: "string", default: "stitchd" },
     "no-mediamtx": { type: "boolean", default: false },
   },
 });
@@ -77,54 +81,71 @@ async function main() {
     }
   }
 
-  // Build the main FFmpeg pipeline (Bay 1-5 composite + sub-streams)
-  const pipeline = buildPipeline(config, cameraProbes);
+  // Which compositor? "native" = stitchd (custom CUDA compositor, one process
+  // for ALL outputs); "ffmpeg" = the classic filtergraph (main + one per extra).
+  const nativeCompositor = config.compositor === "native";
+  const cameraByName = new Map(config.cameras.map((c) => [c.name, c]));
 
-  // Build a separate pipeline per extra composite — each runs as its own
-  // process (including `stream:`-referencing ones like all-field, which
-  // re-ingest the produced stream as a fresh RTSP input). Inlining stream-ref
-  // composites into the main graph was tried and reverted: the shared
-  // process's stack framesync intermittently paired a stale frame (all-field
-  // clock jumping back — see plan). We keep the `extra` config around so the
-  // launch factory can REBUILD the command on every (re)spawn — see the note
-  // on the ffmpeg launch below for why a fresh build per spawn matters (the
-  // setpts wall-clock baseline must be recomputed each restart).
-  const extraPipelines: {
+  let pipeline: Pipeline | undefined;
+  let extraPipelines: {
     name: string;
     extra: (typeof config.extra_composites)[number];
     pipeline: Pipeline;
     cmd: string[];
-  }[] = config.extra_composites.map((extra) => {
-    const p = buildExtraCompositePipeline(config, extra, cameraProbes);
-    return { name: extra.name, extra, pipeline: p, cmd: buildCommand(config, p) };
-  });
+  }[] = [];
+  let stitchd:
+    | { text: string; inputPaths: string[]; outputNames: string[] }
+    | undefined;
+  let allOutputs: PipelineOutput[];
 
-  console.log("\n--- Filter Complex (main) ---");
-  console.log(pipeline.filterComplex);
-  console.log("\n--- Output Streams ---");
-  const allOutputs = [
-    ...pipeline.outputs,
-    ...extraPipelines.flatMap((e) => e.pipeline.outputs),
-  ];
-  for (const out of allOutputs) {
-    console.log(`  ${out.name} -> ${config.output.base_url}/${out.name}`);
-  }
-  if (extraPipelines.length > 0) {
-    console.log("\n--- Extra Composites ---");
-    for (const e of extraPipelines) {
-      console.log(`[${e.name}]`);
-      console.log(e.pipeline.filterComplex);
+  if (nativeCompositor) {
+    stitchd = buildStitchdConfig(config, cameraProbes);
+    allOutputs = stitchd.outputNames.map((name) => ({ name, mapLabel: name }));
+    console.log("\n--- stitchd (native compositor) config ---");
+    console.log(stitchd.text);
+    console.log("--- Output Streams ---");
+    for (const n of stitchd.outputNames)
+      console.log(`  ${n} -> ${config.output.base_url}/${n}`);
+  } else {
+    // Main FFmpeg pipeline (composite + sub-streams) + one pipeline per extra
+    // composite (each its own process; see the launch note below). Kept as
+    // `extra` config so the launch factory can rebuild the command per spawn.
+    pipeline = buildPipeline(config, cameraProbes);
+    extraPipelines = config.extra_composites.map((extra) => {
+      const p = buildExtraCompositePipeline(config, extra, cameraProbes);
+      return { name: extra.name, extra, pipeline: p, cmd: buildCommand(config, p) };
+    });
+    console.log("\n--- Filter Complex (main) ---");
+    console.log(pipeline.filterComplex);
+    console.log("\n--- Output Streams ---");
+    allOutputs = [
+      ...pipeline.outputs,
+      ...extraPipelines.flatMap((e) => e.pipeline.outputs),
+    ];
+    for (const out of allOutputs)
+      console.log(`  ${out.name} -> ${config.output.base_url}/${out.name}`);
+    if (extraPipelines.length > 0) {
+      console.log("\n--- Extra Composites ---");
+      for (const e of extraPipelines) {
+        console.log(`[${e.name}]`);
+        console.log(e.pipeline.filterComplex);
+      }
     }
   }
 
-  const fullCmd = buildCommand(config, pipeline);
-
   if (values["dry-run"]) {
-    console.log("\n--- FFmpeg Command (main, dry run) ---");
-    console.log(fullCmd.join(" \\\n  "));
-    for (const e of extraPipelines) {
-      console.log(`\n--- FFmpeg Command (${e.name}, dry run) ---`);
-      console.log(e.cmd.join(" \\\n  "));
+    if (nativeCompositor) {
+      console.log("\n--- stitchd command (dry run) ---");
+      console.log(
+        `stitchd --config <runtime>/stitchd.conf --out ${config.output.base_url}`
+      );
+    } else {
+      console.log("\n--- FFmpeg Command (main, dry run) ---");
+      console.log(buildCommand(config, pipeline!).join(" \\\n  "));
+      for (const e of extraPipelines) {
+        console.log(`\n--- FFmpeg Command (${e.name}, dry run) ---`);
+        console.log(e.cmd.join(" \\\n  "));
+      }
     }
     return;
   }
@@ -177,6 +198,37 @@ async function main() {
   // sub-streams took 9–14 min to start publishing after a restart. Recomputing
   // the baseline per spawn keeps PTS ~0 and the stream live immediately.
   const watched: WatchedProcess[] = [];
+
+  if (nativeCompositor) {
+    // stitchd: ONE process produces every output. Rewrite its config file each
+    // (re)spawn (cheap; keeps behavior identical to the ffmpeg factory which
+    // rebuilds per spawn). The watchdog restarts it if any output path stalls
+    // or any input source reconnects — same contract as the ffmpeg compositor.
+    const stitchdConfPath = `${runtimeDir}/stitchd.conf`;
+    const stitchdProc = launchManaged("stitchd", () => {
+      writeFileSync(
+        stitchdConfPath,
+        buildStitchdConfig(config, cameraProbes).text
+      );
+      return {
+        cmd: [
+          values["stitchd-bin"] ?? "stitchd",
+          "--config",
+          stitchdConfPath,
+          "--out",
+          config.output.base_url,
+        ],
+        onStderr: stderrFilter("stitchd"),
+      };
+    });
+    processes.push(stitchdProc);
+    watched.push({
+      name: "stitchd",
+      paths: stitchd!.outputNames,
+      process: stitchdProc,
+      inputPaths: stitchd!.inputPaths,
+    });
+  } else {
   const ffmpegProc = launchManaged("ffmpeg", () => ({
     cmd: buildCommand(config, buildPipeline(config, cameraProbes)),
     onStderr: stderrFilter("ffmpeg"),
@@ -185,10 +237,9 @@ async function main() {
   // Raw input paths the main compositor reads (the composite cameras). If any
   // of these sources reconnects, the watchdog restarts the compositor before a
   // wedged read can silently freeze that bay.
-  const cameraByName = new Map(config.cameras.map((c) => [c.name, c]));
   watched.push({
     name: "ffmpeg",
-    paths: pipeline.outputs.map((o) => o.name),
+    paths: pipeline!.outputs.map((o) => o.name),
     process: ffmpegProc,
     inputPaths: config.cameras
       .filter((c) => c.composite !== false)
@@ -218,6 +269,7 @@ async function main() {
         return cam ? [rawStreamName(cam)] : [];
       }),
     });
+  }
   }
 
   // Transcription stack (whisper-server + audio fusion pump). Spawns its

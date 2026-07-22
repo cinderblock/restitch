@@ -36,10 +36,10 @@ target_include_directories(stitchd PRIVATE
   ${LIBAV_INCLUDE_DIRS}
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-# Link the static libav archives + their transitive deps, then CUDA/NPP.
+# Link the static libav archives + their transitive deps, then CUDA runtime.
+# (stitchd's compositing is our own CUDA kernels — no NPP dependency.)
 target_link_directories(stitchd PRIVATE ${LIBAV_STATIC_LIBRARY_DIRS})
 target_link_libraries(stitchd PRIVATE
   ${LIBAV_STATIC_STATIC_LIBRARIES}
   CUDA::cudart
-  CUDA::nppc CUDA::nppig CUDA::nppidei CUDA::nppicc
   pthread m dl)

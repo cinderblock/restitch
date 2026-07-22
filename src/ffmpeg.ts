@@ -1130,3 +1130,164 @@ function outputUrl(
   // For HLS/mpegts the base_url is a directory path
   return `${output.base_url}/${streamName}.m3u8`;
 }
+
+/** Parse a bitrate string like "8M" / "800k" into bits/sec (0 if absent). */
+function parseRate(s: string | undefined): number {
+  if (!s) return 0;
+  const m = /^(\d+(?:\.\d+)?)\s*([kKmMgG]?)$/.exec(s.trim());
+  if (!m) return 0;
+  const mult = { "": 1, k: 1e3, K: 1e3, m: 1e6, M: 1e6, g: 1e9, G: 1e9 }[m[2]!]!;
+  return Math.round(parseFloat(m[1]!) * mult);
+}
+
+/** stitchd piece rotation: the CUDA kernel supports 0 or 180. */
+function stitchdRot(rotation: string, ctx: string): number {
+  if (rotation === "0" || rotation === "180")
+    return rotation === "180" ? 180 : 0;
+  throw new Error(
+    `stitchd (compositor: native) supports rotation 0 or 180 only; ` +
+      `${ctx} uses "${rotation}". Use the ffmpeg compositor for this config.`
+  );
+}
+
+/**
+ * Generate the stitchd (native compositor) config from config.yaml. stitchd
+ * decodes each camera once and builds every output GPU-resident. The config is
+ * a simple line format (see compositor/src/main.cpp parse_config): composite
+ * inputs + dims, aux cameras, and per-output `piece` lists. Every output is a
+ * vertical stack of crop→scale→rot180 gather pieces whose source is
+ * "composite", an aux camera slug, or a previously-declared output name (so
+ * all-field samples the-field's in-GPU frame — no re-decode/re-encode).
+ *
+ * Returns the config text plus the raw input paths (for the watchdog) and the
+ * output stream names. Assumes the composite is a vstack rotated 90 (the CUDA
+ * kernel's fixed geometry); throws on unsupported rotations so we never
+ * silently produce wrong output.
+ */
+export function buildStitchdConfig(
+  config: Config,
+  cameraProbes: Map<string, ProbeResult>
+): { text: string; inputPaths: string[]; outputNames: string[] } {
+  if (config.composite.rotation !== "90") {
+    throw new Error(
+      `stitchd assumes composite rotation 90 (got "${config.composite.rotation}").`
+    );
+  }
+  const base = config.output.base_url;
+  const cameras = config.cameras
+    .filter((c) => c.composite !== false)
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  const fps = Math.round(cameraProbes.get(cameras[0]!.name)!.fps);
+  const comp = mainCompositeDims(config, cameraProbes);
+  const cameraByName = new Map(config.cameras.map((c) => [c.name, c]));
+
+  const lines: string[] = [];
+  const inputPaths: string[] = [];
+  const outputNames: string[] = [];
+
+  lines.push(`fps ${fps}`);
+  lines.push(`comp-rot ${config.composite.rotation}`);
+  lines.push(`comp-dim ${comp.width} ${comp.height}`);
+  for (const cam of cameras) {
+    const slug = rawStreamName(cam);
+    lines.push(`comp-in ${base}/${slug}`);
+    inputPaths.push(slug);
+  }
+
+  // Aux cameras: those referenced by extra composites (by name, not stream).
+  const aux = new Map<string, string>(); // slug -> url
+  for (const extra of config.extra_composites)
+    for (const ref of extra.inputs)
+      if (ref.stream === undefined && ref.name) {
+        const cam = cameraByName.get(ref.name);
+        if (cam) aux.set(rawStreamName(cam), `${base}/${rawStreamName(cam)}`);
+      }
+  for (const [slug, url] of aux) {
+    lines.push(`aux ${slug} ${url}`);
+    inputPaths.push(slug);
+  }
+
+  type P = { src: string; cx: number; cy: number; cw: number; ch: number; sw: number; sh: number; rot: number };
+  const emit = (name: string, codec: string, maxrate: number, pieces: P[]) => {
+    lines.push(`out ${name} ${codec} ${maxrate}`);
+    for (const p of pieces)
+      lines.push(
+        `piece ${p.src} ${p.cx} ${p.cy} ${p.cw} ${p.ch} ${p.sw} ${p.sh} ${p.rot}`
+      );
+    outputNames.push(name);
+  };
+
+  // Main composite (`full`): the whole composite, optional scale.
+  const mScale = config.composite.scale;
+  emit(config.composite.name, config.encoder.codec, 0, [
+    {
+      src: "composite", cx: 0, cy: 0, cw: comp.width, ch: comp.height,
+      sw: mScale?.width ?? comp.width, sh: mScale?.height ?? comp.height, rot: 0,
+    },
+  ]);
+
+  // Sub-streams: crop the composite, scale, rotate.
+  for (const sub of config.sub_streams) {
+    const cx = resolveDimension(sub.x, comp.width);
+    const cy = resolveDimension(sub.y, comp.height);
+    const cw = resolveDimension(sub.width, comp.width);
+    const ch = resolveDimension(sub.height, comp.height);
+    const scale = sub.scale ?? { width: cw, height: ch };
+    emit(sub.name, sub.codec ?? config.encoder.codec, parseRate(sub.maxrate), [
+      {
+        src: "composite", cx, cy, cw, ch, sw: scale.width, sh: scale.height,
+        rot: stitchdRot(sub.rotation, `sub_stream "${sub.name}"`),
+      },
+    ]);
+  }
+
+  // Extra composites: a vertical stack; each input a crop+scale+rot piece.
+  for (const extra of config.extra_composites) {
+    const raw = extra.inputs.map((ref, i) => {
+      let src: string, srcW: number, srcH: number, rot: string;
+      if (ref.stream !== undefined) {
+        src = ref.stream;
+        const d = producedStreamDims(config, cameraProbes, ref.stream);
+        if (!d)
+          throw new Error(
+            `extra_composite "${extra.name}" refs unknown stream "${ref.stream}"`
+          );
+        srcW = d.width; srcH = d.height;
+        rot = ref.rotation ?? "0";
+      } else {
+        const cam = cameraByName.get(ref.name!)!;
+        src = rawStreamName(cam);
+        const probe = cameraProbes.get(ref.name!)!;
+        srcW = probe.width; srcH = probe.height;
+        rot = ref.rotation ?? cam.rotation;
+      }
+      // restitch applies rotation THEN crop (crop is post-rotation). Resolve the
+      // crop against post-rotation dims, then translate to stitchd's
+      // crop-then-rot180 order.
+      const pr = rotatedDimensions(srcW, srcH, rot);
+      let cx = 0, cy = 0, cw = pr.width, ch = pr.height;
+      if (ref.crop) {
+        cx = resolveDimension(ref.crop.x, pr.width);
+        cy = resolveDimension(ref.crop.y, pr.height);
+        cw = resolveDimension(ref.crop.width, pr.width);
+        ch = resolveDimension(ref.crop.height, pr.height);
+      }
+      const r = stitchdRot(rot, `extra_composite "${extra.name}" input ${i}`);
+      // For 180, gather the mirrored source rect then rot180 the output.
+      const scx = r === 180 ? srcW - cx - cw : cx;
+      const scy = r === 180 ? srcH - cy - ch : cy;
+      return { src, scx, scy, cw, ch, rot: r };
+    });
+    // Vertical stack: scale every piece to the first piece's width.
+    const refW = raw[0]!.cw;
+    const pieces: P[] = raw.map((p, i) => {
+      const sw = refW;
+      const sh = i === 0 ? p.ch : Math.round((p.ch * refW) / p.cw / 2) * 2;
+      return { src: p.src, cx: p.scx, cy: p.scy, cw: p.cw, ch: p.ch, sw, sh, rot: p.rot };
+    });
+    emit(extra.name, extra.codec ?? config.encoder.codec,
+         parseRate(extra.maxrate), pieces);
+  }
+
+  return { text: lines.join("\n") + "\n", inputPaths, outputNames };
+}
