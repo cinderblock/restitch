@@ -326,6 +326,12 @@ export const ConfigSchema = z.object({
     extra_args: [],
   }),
   hwaccel: HwAccelSchema,
+  // Which compositor produces the streams. "ffmpeg" = the classic
+  // filtergraph pipeline (main compositor + one ffmpeg per extra composite).
+  // "native" = stitchd, the custom CUDA compositor (compositor/), which
+  // decodes each camera once and builds every output GPU-resident with
+  // deterministic frame pairing + per-output drop scheduling.
+  compositor: z.enum(["ffmpeg", "native"]).default("ffmpeg"),
   output: OutputSchema.default({
     format: "rtsp",
     base_url: "rtsp://localhost:8554",
