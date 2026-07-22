@@ -218,7 +218,21 @@ draining. User is OK with slightly slow cold starts.
       and the tick kept running at 26.6fps. Sibling-starvation (the CFR
       dup-spiral / foyer-freeze) is now structurally impossible. Test hook:
       STITCHD_SLOW_NAME + STITCHD_SLOW_MS.
-- [ ] Phase 6: cutover behind `compositor: native`, ffmpeg fallback retained.
+- [x] Phase 6: config-driven + CUTOVER LIVE. stitchd reads a generated config
+      (buildStitchdConfig in ffmpeg.ts translates config.yaml → stitchd's line
+      format, incl. restitch's rotate-then-crop → stitchd's crop-then-rot180).
+      index.ts launches stitchd as ONE process when `compositor: native`,
+      watched like the ffmpeg compositor; ffmpeg path retained for fallback.
+      Dockerfile compositor-builder stage compiles stitchd (91MB, static libav*
+      + cudart, no NPP) into the runtime image. DEPLOYED + FLIPPED TO NATIVE on
+      sentinel (user authorized, 2026-07-22): stitchd publishes all 6 outputs
+      to mediamtx, all 15 paths ready, 0 drops at 1200 frames, GPU 45% / 7.7GB
+      (down from ffmpeg's ~13.5GB — one decode per camera). Revert = set
+      `compositor: ffmpeg`.
+
+## STATUS: LIVE. The custom compositor is in production on sentinel, producing
+## every stream, ffmpeg filtergraph retired. Remaining: watch clock-regression
+## = 0 (the original bug) and keep an eye on stability.
 
 ## Phase 2 design (the CUDA compositing core — next to build)
 Target: reproduce `full` (5 bays vstack → rotate 90 CW → HEVC 7560x2688) in
