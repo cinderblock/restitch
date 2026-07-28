@@ -163,13 +163,42 @@ the audio pump, so they'd need audio-only inputs.
 - Don't tune `silence_threshold_db` for this — discards are decoupled from
   whisper activity (proven above).
 
+## Recurrence watch (step 3, in flight)
+
+A sampler is running on sentinel: `/tmp/discard-watch.sh` → `/tmp/discard-watch.csv`,
+one row per 10 min for 24 h (`timestamp, uptime_s, discards_per_10min, bun_cpu`).
+Started 2026-07-28 ~06:45 UTC, right after the `aa27470` deploy (restitch
+restarted 06:40:49 UTC, pump back to 10 cameras, discards 0/60 s).
+
+Read it with: `ssh sentinel 'column -s, -t /tmp/discard-watch.csv'`
+
+**Interpretation:**
+
+- `discards_per_10min` climbing with `uptime_s` ⇒ time/drift-based degradation.
+  Chase `amerge`/PTS drift across the 10 inputs, or mediamtx per-reader queue
+  state. Camera count would be an aggravator, not the cause.
+- Stays ~0 ⇒ the trigger was specific to the pre-reboot process/environment
+  (older restitch build, pre-timezone-change clock). Close it out and leave
+  `transcribe: false` as an unused knob.
+
+**Limitation, deliberate:** it lives in `/tmp` and does not survive a reboot —
+and unattended-upgrades may now reboot at 02:00 local. That is acceptable for a
+24 h diagnostic (a partial series still answers the question), but if it comes
+back empty, check for a reboot before concluding anything. Do not promote this
+to a service; if a permanent signal is wanted, the right home is the `/health`
+probe or the uptime worker, not a `nohup` in `/tmp`.
+
 ## Progress log
 
 - [x] Root-caused the regression window to the 9→10 pump change.
 - [x] Disproved bullet-specific, whisper-load, and noise hypotheses with data.
 - [x] Confirmed NVR is read once per camera (10 connections).
 - [x] Identified `appendMono` O(n)-per-chunk copy as prime suspect.
-- [ ] Step 1: per-camera transcribe opt-out.
-- [ ] Step 2: measurement.
-- [ ] Step 3: real fix.
-- [ ] Step 4: stitchd audio decision.
+- [x] Step 1: per-camera transcribe opt-out shipped (`aa27470`), deliberately
+      not applied to any camera.
+- [x] Step 2: measured. Consumer not CPU-bound (11.4%); 0 discards post-reboot
+      with the same 10 cameras. Both hypotheses refuted.
+- [ ] Step 3: recurrence watch running on sentinel (24 h sampler) — this is the
+      deciding experiment.
+- [ ] Step 4: stitchd audio — downgraded to architectural cleanup, deferred
+      until step 3 reports.
