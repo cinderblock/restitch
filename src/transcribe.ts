@@ -557,13 +557,17 @@ export function startTranscription(
 ): { ring: RingBuffer; stats: LiveStats } {
   const t = config.transcription;
   const ring = new RingBuffer(t.max_entries_per_camera);
+  // Only cameras opted in to transcription. Each one is another RTSP input on
+  // the single amerge'd ffmpeg and another channel the consumer walks per
+  // sample, so this set — not config.cameras — defines the pump's whole cost.
+  const cameras = config.cameras.filter((c) => c.transcribe);
   const stats: LiveStats = {
     state: "silent",
     threshold_db: t.silence_threshold_db,
     mono_rms_db: -100,
-    per_cam_rms_db: Object.fromEntries(
-      config.cameras.map((c) => [c.name, -100])
-    ),
+    // Only transcribed cameras get an RMS row; listing the others would show a
+    // permanent -100 dB that reads as "mic is dead" rather than "not listening".
+    per_cam_rms_db: Object.fromEntries(cameras.map((c) => [c.name, -100])),
     transitions_total: 0,
     last_segment_at: null,
   };
@@ -574,6 +578,10 @@ export function startTranscription(
   }
   if (config.cameras.length === 0) {
     console.error("[transcribe] no cameras configured");
+    return { ring, stats };
+  }
+  if (cameras.length === 0) {
+    console.log("[transcribe] no cameras have transcribe enabled — pump not started");
     return { ring, stats };
   }
 
@@ -588,11 +596,13 @@ export function startTranscription(
     try {
       await waitForServer(whisperUrl);
       console.log(`[transcribe] whisper-server ready at ${whisperUrl}`);
+      const skipped = config.cameras.length - cameras.length;
       console.log(
-        `[transcribe] starting combined pump for ${config.cameras.length} camera(s)`
+        `[transcribe] starting combined pump for ${cameras.length} camera(s)` +
+          (skipped > 0 ? ` (${skipped} excluded via transcribe: false)` : "")
       );
       processes.push(
-        startCombinedPump(config.cameras, config, whisperUrl, ring, stats)
+        startCombinedPump(cameras, config, whisperUrl, ring, stats)
       );
     } catch (err) {
       console.error("[transcribe] whisper-server never came up:", err);

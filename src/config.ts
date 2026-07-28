@@ -21,6 +21,17 @@ const CameraSchema = z
       .describe(
         "If false, restream this camera through mediamtx but exclude it from the composite stack"
       ),
+    transcribe: z
+      .boolean()
+      .default(true)
+      .describe(
+        "If false, exclude this camera's audio from the transcription pump. " +
+          "Every camera costs one more RTSP input on the single amerge'd ffmpeg " +
+          "and one more channel for the consumer to process, so cameras whose " +
+          "audio is never useful (outdoor/bullet cams, duplicate coverage) are " +
+          "worth turning off — the pump has been observed saturating and " +
+          "triggering mediamtx 'reader is too slow' discards across ALL inputs."
+      ),
   })
   .refine((cam) => cam.composite === false || cam.order !== undefined, {
     message: "Cameras included in the composite must have 'order' set",

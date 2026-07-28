@@ -6,6 +6,11 @@ cameras:
     url: rtsp://192.168.1.100:554/stream    # RTSP URL for this camera
     rotation: "0"    # 0, 90, 180, 270 (clockwise)
     order: 0         # position in the stack (0 = first/top)
+    # composite: true   # false = restream only, keep out of the composite stack
+    # transcribe: true  # false = keep this camera's audio out of the
+    #                   # transcription pump (one less RTSP input + channel).
+    #                   # Worth disabling for cameras whose audio is never
+    #                   # useful, e.g. outdoor/bullet cams.
 
   - name: Camera 2
     url: rtsp://192.168.1.101:554/stream

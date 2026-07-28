@@ -27,7 +27,7 @@ A single bun process supervises the whole stack:
 | ffmpeg (main) | composite + sub-stream crops |
 | ffmpeg (extra) | one per `extra_composites` entry (camera or `stream:` inputs) |
 | whisper-server | CUDA speech-to-text |
-| ffmpeg (audio fusion) | N-channel amerge → max-abs mono for transcription |
+| ffmpeg (audio fusion) | N-channel amerge → max-abs mono for transcription. N = cameras with `transcribe: true` (the default); set `transcribe: false` per camera to keep its audio out of the pump |
 | dashboard | live status + per-stream actions |
 
 ## Deployment
