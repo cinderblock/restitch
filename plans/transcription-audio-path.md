@@ -141,9 +141,12 @@ the audio pump, so they'd need audio-only inputs.
        if the problem returns.
 2. [x] Measured. Consumer is **not** CPU-bound (11.4%); discards are **0/hr**
        post-reboot with the same 10 inputs. Both prior hypotheses refuted.
-3. [x] Recurrence watch — **COMPLETE**. Discards did recur, but the cause was
-       duplicate `stitchd` instances (supervisor restart race), not the audio
-       path. Fixed in `f233404`; 0 discards with a single stitchd.
+3. [~] Recurrence watch — discards DO recur, ramping with uptime. The duplicate
+       -stitchd race found along the way (`f233404`) fixed the `/entry` stutter
+       but NOT the discards: 4.4 h after that fix, with one stitchd, the audio
+       pump is discarding ~4,500/hr again. **Cause still open.** See the
+       retraction section. Next: test the drift hypothesis — instrument
+       per-input PTS divergence across the 10 `amerge` inputs over hours.
 4. [ ] Audio-in-stitchd: **downgrade from "fix" to "architectural cleanup".**
        The measurement removed the performance justification — the audio path is
        not saturated. Still attractive (stitchd already demuxes and discards
@@ -162,7 +165,52 @@ the audio pump, so they'd need audio-only inputs.
 - Don't tune `silence_threshold_db` for this — discards are decoupled from
   whisper activity (proven above).
 
-## RESOLVED (2026-07-29): it was duplicate stitchd instances, not the audio path
+## RETRACTION (2026-07-29 16:50 PDT): the section below is WRONG about the discards
+
+**Read this before believing the "RESOLVED" section that follows.**
+
+The duplicate-stitchd finding is real and it fixed the `/entry` stutter. But
+attributing the **discards** to it was wrong, and I made the same measurement
+error twice: I sampled discards immediately after restarting restitch, got zero,
+and read that as "fixed" when it only meant "uptime ≈ 0".
+
+Measured 4.4 h after the `f233404` deploy, with **exactly one stitchd running**:
+
+```
+restitch started 19:23:05Z, now 23:48Z  (4.4 h uptime)
+discards: ~60-100/min sustained  (~4,500/hr)
+discarding sessions all resolve to the AUDIO PUMP:
+  3f0ff171 -> raw/bay-3  (2 tracks: MPEG-4 Audio, Opus)
+  63a53b7b -> raw/bay-2
+  10e5af56 -> raw/bay-1
+  104d0477 -> raw/bay-4
+```
+
+So the discards are a **time-based ramp on the audio pump**, independent of the
+stitchd duplication. This matches the 24 h sampler exactly — 0 at uptime 0,
+non-zero from ~2 h onward, 150–1,030 per 10 min thereafter — which I misread as
+"appeared once a restart had a chance to race."
+
+**Corrected status:**
+
+| Symptom | Cause | Status |
+| --- | --- | --- |
+| `/entry` stutter, all outputs | two stitchd publishing to the same paths | **FIXED** (`f233404`) |
+| audio-pump "reader is too slow" | unknown; ramps with uptime | **STILL OPEN** |
+
+**Standing rule for this bug, learned twice the hard way: never evaluate the
+discard rate on a restitch process younger than ~3 h.** A fresh process always
+reads clean. Any future "it's fixed" claim must come from a measurement at
+several hours of uptime.
+
+**Leading hypothesis, now that CPU saturation and camera count are both ruled
+out:** progressive drift. `aresample=async=1` per input plus `amerge` across 10
+inputs in lockstep — if the inputs' clocks diverge, amerge waits longer and
+longer on the laggard, so ffmpeg drains RTSP progressively more slowly and
+mediamtx's per-reader queues overflow. Time-dependent, load-independent, and
+CPU-cheap, which fits every measurement. Untested.
+
+## SUPERSEDED (see retraction above): it was duplicate stitchd instances, not the audio path
 
 The recurrence watch answered the question, and the answer was outside the audio
 path entirely.
@@ -246,8 +294,10 @@ probe or the uptime worker, not a `nohup` in `/tmp`.
       not applied to any camera.
 - [x] Step 2: measured. Consumer not CPU-bound (11.4%); 0 discards post-reboot
       with the same 10 cameras. Both hypotheses refuted.
-- [x] Step 3: recurrence watch complete. Root cause was a duplicate-stitchd
-      supervisor race (`f233404`), NOT the audio path. 0 discards after the fix.
+- [~] Step 3: discards recur, ramping with uptime; cause STILL OPEN. The
+      duplicate-stitchd race (`f233404`) was a real find but fixed the stutter,
+      not the discards — retracted that conclusion after measuring at 4.4 h
+      uptime. Never judge this bug on a process younger than ~3 h.
 - [ ] Step 4: stitchd audio — optional architectural cleanup only; its
       performance justification is gone.
 - [ ] Step 5: `appendMono` ring buffer — optional, not a bottleneck.
