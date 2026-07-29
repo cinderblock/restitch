@@ -45,7 +45,21 @@ export function launchManaged(
   // the old process finally exits, leaking orphan compositors that nothing
   // tracks or kills (→ NVENC session exhaustion, all composites go dark).
   let restarting = false;
+  // The crash-respawn timer armed by the exit handler. restart() and stop()
+  // MUST cancel it: if a process exits on its own and the watchdog calls
+  // restart() before the timer fires, restart() spawns the replacement and
+  // then the stale timer spawns a SECOND one. Observed in production
+  // 2026-07-29 — two stitchd instances publishing to the same mediamtx paths,
+  // which stuttered every consumer of every output.
+  let pendingRespawn: ReturnType<typeof setTimeout> | null = null;
   let proc: Subprocess;
+
+  function cancelPendingRespawn(): void {
+    if (pendingRespawn !== null) {
+      clearTimeout(pendingRespawn);
+      pendingRespawn = null;
+    }
+  }
 
   function spawn(): Subprocess {
     const { cmd, onStderr, onStdout } = factory();
@@ -99,6 +113,18 @@ export function launchManaged(
     // Watch for exit and auto-restart with exponential backoff
     child.exited.then((code) => {
       if (stopped) return;
+      // Only the CURRENT child may trigger a respawn. Every spawned child gets
+      // this handler, so without the identity check an orphan left over from a
+      // race keeps its own respawn lineage alive: killing it just brings it
+      // back, and the duplicate can never be cleared without restarting the
+      // whole supervisor. (That is exactly how the 2026-07-29 double-stitchd
+      // survived being killed twice.)
+      if (child !== proc) {
+        console.warn(
+          `[${name}] A superseded instance exited with code ${code} — not respawning.`
+        );
+        return;
+      }
       // An intentional restart() already spawned the replacement — don't
       // double-spawn. Clear the flag and bail.
       if (intentionalRestart) {
@@ -110,7 +136,8 @@ export function launchManaged(
       console.warn(
         `[${name}] Exited with code ${code}. Restarting (attempt ${restartCount}) in ${(delay / 1000).toFixed(0)}s...`
       );
-      setTimeout(() => {
+      pendingRespawn = setTimeout(() => {
+        pendingRespawn = null;
         if (!stopped) {
           proc = spawn();
         }
@@ -131,6 +158,11 @@ export function launchManaged(
       if (stopped || restarting) return;
       restarting = true;
       try {
+        // If the process already died on its own, the exit handler has a
+        // respawn timer armed. Cancel it before we spawn our own replacement —
+        // otherwise both fire and we end up with two live instances fighting
+        // over the same mediamtx publish paths.
+        cancelPendingRespawn();
         // Tell the exit handler not to auto-respawn; we'll spawn the one
         // replacement ourselves once the old process is gone.
         intentionalRestart = true;
@@ -155,6 +187,11 @@ export function launchManaged(
     },
     stop() {
       stopped = true;
+      // A pending crash-respawn would otherwise resurrect the process during
+      // shutdown. (`stopped` guards the timer body too, but cancelling is the
+      // honest way to say "no more spawns" rather than relying on a flag read
+      // inside a timer that has no business still being armed.)
+      cancelPendingRespawn();
       const dying = proc;
       dying.kill();
       // Force-kill if it lingers, so container shutdown isn't blocked by a
