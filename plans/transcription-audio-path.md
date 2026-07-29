@@ -141,10 +141,9 @@ the audio pump, so they'd need audio-only inputs.
        if the problem returns.
 2. [x] Measured. Consumer is **not** CPU-bound (11.4%); discards are **0/hr**
        post-reboot with the same 10 inputs. Both prior hypotheses refuted.
-3. [ ] **← current** Watch for recurrence over the next several hours/days.
-       This is now the deciding experiment: recurrence ⇒ time/drift-based
-       degradation (chase `amerge`/PTS drift); no recurrence ⇒ the trigger was
-       something in the pre-reboot process state.
+3. [x] Recurrence watch — **COMPLETE**. Discards did recur, but the cause was
+       duplicate `stitchd` instances (supervisor restart race), not the audio
+       path. Fixed in `f233404`; 0 discards with a single stitchd.
 4. [ ] Audio-in-stitchd: **downgrade from "fix" to "architectural cleanup".**
        The measurement removed the performance justification — the audio path is
        not saturated. Still attractive (stitchd already demuxes and discards
@@ -163,7 +162,56 @@ the audio pump, so they'd need audio-only inputs.
 - Don't tune `silence_threshold_db` for this — discards are decoupled from
   whisper activity (proven above).
 
-## Recurrence watch (step 3, in flight)
+## RESOLVED (2026-07-29): it was duplicate stitchd instances, not the audio path
+
+The recurrence watch answered the question, and the answer was outside the audio
+path entirely.
+
+**What was actually wrong:** two `stitchd` processes were running simultaneously,
+both publishing to the same mediamtx paths. Found while investigating a user
+report of stutters on `/entry`. Every consumer of every output was affected; the
+"reader is too slow" discards were collateral, not the disease.
+
+Cause, in `src/process.ts` (fixed in `f233404`):
+
+1. The exit handler arms a respawn timer. If a process self-exits and the
+   watchdog calls `restart()` before that timer fires, `restart()` cancelled
+   nothing — it spawned the replacement, then the stale timer spawned a second.
+   `intentionalRestart` only guards the synchronous path inside the exit
+   handler, never an already-scheduled timer.
+2. Every spawned child got its own exit handler, so a duplicate owned a
+   self-perpetuating respawn lineage. **Killing the orphan brought it back** —
+   confirmed the hard way on the box, twice, before restarting the container.
+
+**Evidence it was the cause of the discards too:**
+
+| State | discards |
+| --- | --- |
+| two stitchd (07-28 → 07-29) | 150–1,030 per 10 min, sustained |
+| one stitchd (after fix) | **0 per 90 s**, all 6 paths ready |
+
+The 24 h sampler series (saved on sentinel at
+`/opt/restitch/diag/discard-watch-2026-07-28.csv`) shows discards absent at
+uptime 0, then persistently non-zero from ~2 h onward — i.e. appearing once a
+watchdog restart had had a chance to race, not scaling with time or load.
+
+**This retro-explains the whole investigation:** the 9→10 camera correlation was
+coincidence. The 00:32 restart that "added bullet" was also a restart that could
+race. Zero discards immediately after a clean reboot, and zero again now with a
+single stitchd, both fit "duplicate publisher" and neither fits "audio pump
+capacity". Camera count was never the variable.
+
+**Consequences for the remaining steps:**
+
+- Step 4 (audio in stitchd) loses its last performance justification. Keep it as
+  optional architectural cleanup only.
+- Step 5 (`appendMono` ring buffer) is still a real O(n)-per-chunk wart, still
+  not a bottleneck, still optional.
+- The `transcribe: false` knob (`aa27470`) stays shipped and unused. Correct call
+  not to have applied it to `bullet` — it would have "fixed" the symptom by
+  coincidence and buried a supervisor bug that was corrupting every output.
+
+## Recurrence watch (step 3) — COMPLETE, see above
 
 A sampler is running on sentinel: `/tmp/discard-watch.sh` → `/tmp/discard-watch.csv`,
 one row per 10 min for 24 h (`timestamp, uptime_s, discards_per_10min, bun_cpu`).
@@ -198,7 +246,8 @@ probe or the uptime worker, not a `nohup` in `/tmp`.
       not applied to any camera.
 - [x] Step 2: measured. Consumer not CPU-bound (11.4%); 0 discards post-reboot
       with the same 10 cameras. Both hypotheses refuted.
-- [ ] Step 3: recurrence watch running on sentinel (24 h sampler) — this is the
-      deciding experiment.
-- [ ] Step 4: stitchd audio — downgraded to architectural cleanup, deferred
-      until step 3 reports.
+- [x] Step 3: recurrence watch complete. Root cause was a duplicate-stitchd
+      supervisor race (`f233404`), NOT the audio path. 0 discards after the fix.
+- [ ] Step 4: stitchd audio — optional architectural cleanup only; its
+      performance justification is gone.
+- [ ] Step 5: `appendMono` ring buffer — optional, not a bottleneck.
