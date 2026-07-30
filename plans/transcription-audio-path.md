@@ -156,6 +156,53 @@ the audio pump, so they'd need audio-only inputs.
        fixed-size ring buffer. Not the bottleneck, but it is a genuine O(n)
        -per-chunk wart with real allocation churn.
 
+## Instrumentation (shipped `d70e016`) — how to read it
+
+The pump now reports whether it is keeping up with real time. It is a live
+capture, so in the steady state it must deliver
+`SAMPLE_RATE * channels * 2` bytes per wall-clock second; any shortfall means
+ffmpeg is not draining its RTSP inputs fast enough, which is exactly when
+mediamtx discards for those inputs.
+
+A line lands in the container log every ~5 min of audio, deliberately in the
+same stream as mediamtx's discard warnings so the two can be correlated:
+
+```
+[combined] pump: uptime 5.0min lag 0.05s recent 99.9% inflight 0
+```
+
+Read it with:
+
+```bash
+ssh sentinel 'docker logs restitch --since 6h 2>&1 | grep "pump: uptime"'
+```
+
+- `lag` — **cumulative** seconds of audio behind real time. Catches slow drift
+  that a spot check would miss.
+- `recent` — delivered/expected over the last minute. Separates "degrading right
+  now" from "took one hit hours ago".
+- Dashboard shows `pump <age> · lag <s> · rate <%>` inline, red past 5 s lag or
+  under 95 % rate.
+
+Sensitivity, verified by simulation before deploying: 100 % delivery → lag 0.0 s
+/ ratio 1.000; a **1 %** shortfall → 36 s lag after an hour, ratio 0.990. So even
+a slight persistent shortfall is unmistakable.
+
+ffmpeg's stderr is also no longer swallowed — the old `/error|fail/` filter
+dropped every `timestamp discontinuity` / `non-monotonic DTS` / `aresample`
+message, which is precisely the evidence the drift hypothesis needs.
+
+**Baseline at 5 min uptime (2026-07-30 02:08 UTC):** `lag 0.05s recent 99.9%`,
+0 discards. Healthy, as expected for a fresh process.
+
+**What each outcome means at ~4 h uptime:**
+
+| Observation | Conclusion |
+| --- | --- |
+| `lag` grows steadily, `recent` < 100 % | Confirms the pump falls behind progressively. Then find *which* input: drift hypothesis lives or dies on the ffmpeg timestamp warnings now being surfaced. |
+| `lag` ~0 and `recent` ~100 % while discards climb | The pump is keeping up, so the discards are NOT a pump-drain problem — look at mediamtx's per-reader queue/write path instead. This would refute the drift hypothesis outright. |
+| `lag` jumps once then flat | A one-off stall (a reconnect), not progressive degradation. |
+
 ## Things not to do
 
 - Don't "fix" this by disabling transcription wholesale — silence detection is
