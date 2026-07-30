@@ -123,6 +123,58 @@ So "add audio to stitchd" is mostly _stop discarding what's already in hand_.
 Caveat: stitchd opens only 8 of 10 paths; `blue` and `bullet` are read solely by
 the audio pump, so they'd need audio-only inputs.
 
+## Data flow as of 2026-07-30 (verified on the box)
+
+Sources: mediamtx `/v3/paths/list` (path `source` types), `/tmp/stitchd.conf`,
+the host process list, and the NVR connection count.
+
+```mermaid
+flowchart TD
+    NVR["UniFi NVR<br/>10.255.0.2:7447<br/>10 cameras"]
+
+    subgraph MTX["mediamtx (in the restitch container)"]
+        RAW["raw/* - 10 paths<br/>source: rtspSource<br/>mediamtx pulls these itself"]
+        OUT["composites - 6 paths<br/>source: rtspSession<br/>published in by stitchd"]
+    end
+
+    STITCHD["stitchd - C++/CUDA<br/>NVDEC decode, GPU-resident<br/>composite, crop, rotate, scale, NVENC"]
+    PUMP["ffmpeg audio pump<br/>10 RTSP inputs, audio only<br/>amerge, 10-ch s16le"]
+    BUN["Bun consumer<br/>max-abs mono mix, per-cam RMS<br/>silence detection"]
+    WHISPER["whisper-server<br/>CUDA speech-to-text"]
+    SNAP["dashboard snapshotter<br/>ffmpeg, 1 frame, mjpeg"]
+
+    CADDY["Caddy<br/>TLS, token gate, /health"]
+    CLIENTS["Clients<br/>VLC over RTSP<br/>Home Assistant<br/>browser over WebRTC<br/>pFMS scoreboard over HLS"]
+
+    NVR -->|"10 pulls, 1 per camera"| RAW
+
+    RAW -->|"RTSP localhost - video<br/>8 of 10: bay-1..5 + doorbell, foyer, field-centered"| STITCHD
+    STITCHD -->|"RTSP localhost publish<br/>full, full-low, the-field, john, entry, all-field"| OUT
+
+    RAW -->|"RTSP localhost - AUDIO only, all 10<br/>these readers are the ones being discarded"| PUMP
+    PUMP -->|"stdout pipe, s16le"| BUN
+    BUN -->|"HTTP, speech segments only"| WHISPER
+
+    RAW --> SNAP
+    OUT --> SNAP
+
+    OUT -->|"RTSP 8554 / WebRTC 8889+8189 / HLS 8890"| CADDY
+    CADDY --> CLIENTS
+    OUT -->|"RTSP direct on LAN"| CLIENTS
+```
+
+What the diagram makes obvious:
+
+- **`blue` and `bullet` are read ONLY by the audio pump** — stitchd never opens
+  them. Hence the two extra audio-only inputs that step 4 needs.
+- **The round-trip:** stitchd pulls frames over localhost RTSP that mediamtx just
+  pulled from the NVR, then publishes results back the same way.
+- **The discard hotspot is exactly one edge**, `raw/* -> audio pump`: ten reader
+  sessions that stitchd could serve from packets it already receives and throws
+  away. Step 4 deletes that edge.
+- **mediamtx is load-bearing in three places** (NVR ingest, fan-out, client
+  delivery), which is why it cannot simply be absorbed into stitchd.
+
 ## Decisions already made (don't re-ask)
 
 - The NVR is **not** double-read; only mediamtx is consumed twice, and the audio
