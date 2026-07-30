@@ -1,0 +1,32 @@
+flowchart TD
+    NVR["UniFi NVR<br/>10.255.0.2:7447<br/>10 cameras"]
+
+    subgraph MTX["mediamtx (in the restitch container)"]
+        RAW["raw/* - 10 paths<br/>source: rtspSource<br/>mediamtx pulls these itself"]
+        OUT["composites - 6 paths<br/>source: rtspSession<br/>published in by stitchd"]
+    end
+
+    STITCHD["stitchd - C++/CUDA<br/>NVDEC decode, GPU-resident<br/>composite, crop, rotate, scale, NVENC"]
+    PUMP["ffmpeg audio pump<br/>10 RTSP inputs, audio only<br/>amerge, 10-ch s16le"]
+    BUN["Bun consumer<br/>max-abs mono mix, per-cam RMS<br/>silence detection"]
+    WHISPER["whisper-server<br/>CUDA speech-to-text"]
+    SNAP["dashboard snapshotter<br/>ffmpeg, 1 frame, mjpeg"]
+
+    CADDY["Caddy<br/>TLS, token gate, /health"]
+    CLIENTS["Clients<br/>VLC over RTSP<br/>Home Assistant<br/>browser over WebRTC<br/>pFMS scoreboard over HLS"]
+
+    NVR -->|"10 pulls, 1 per camera"| RAW
+
+    RAW -->|"RTSP localhost - video<br/>8 of 10: bay-1..5 + doorbell, foyer, field-centered"| STITCHD
+    STITCHD -->|"RTSP localhost publish<br/>full, full-low, the-field, john, entry, all-field"| OUT
+
+    RAW -->|"RTSP localhost - AUDIO only, all 10<br/>these readers are the ones being discarded"| PUMP
+    PUMP -->|"stdout pipe, s16le"| BUN
+    BUN -->|"HTTP, speech segments only"| WHISPER
+
+    RAW --> SNAP
+    OUT --> SNAP
+
+    OUT -->|"RTSP 8554 / WebRTC 8889+8189 / HLS 8890"| CADDY
+    CADDY --> CLIENTS
+    OUT -->|"RTSP direct on LAN"| CLIENTS
