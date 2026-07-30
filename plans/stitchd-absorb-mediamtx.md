@@ -62,7 +62,7 @@ direct cause of the still-open "reader is too slow" discards
 
 ## The one genuinely risky piece
 
-WebRTC (Stage 5) carries the **public field stream**: `stream.tomsawyerlabs.com`
+WebRTC (Stage 4) carries the **public field stream**: `stream.tomsawyerlabs.com`
 → Cloudflare → office → steamboat → sentinel, gated by `STREAM_WEBRTC_TOKEN` in
 Caddy, with media on a **WAN-forwarded UDP 8189**. Three contracts must survive
 byte-for-byte or the public stream breaks:
@@ -73,7 +73,7 @@ byte-for-byte or the public stream breaks:
 3. STUN (`stun.l.google.com:19302`) for the numeric-IP srflx candidate that
    Safari/iOS require (WebKit ignores non-mDNS FQDN candidates).
 
-Stage 5 must be validated from an actual off-LAN iPhone before mediamtx is
+Stage 4 must be validated from an actual off-LAN iPhone before mediamtx is
 deleted. Until then mediamtx stays installed and can be re-pointed in one config
 change.
 
@@ -82,27 +82,30 @@ change.
 Ordered so the highest value and lowest risk land first, and so the outstanding
 discard bug dies in Stage 1.
 
-1. [ ] **← current. Ingest + audio inside stitchd.**
-   Open the 10 NVR URLs directly (video **and** audio). Decode audio to PCM,
-   resample to 16 kHz mono per camera, and hand an N-channel interleaved stream
-   to the transcription consumer over a pipe — the exact byte format
-   `src/transcribe.ts` already parses, so the Bun side barely changes.
+1. [ ] **← current. Ingest + audio + `raw/*` ownership, in one step.**
+   stitchd opens the 10 NVR URLs directly (video **and** audio) AND becomes the
+   source of `raw/*`, so mediamtx stops pulling from the NVR in the same change.
+   Decode audio to PCM, resample to 16 kHz mono per camera, hand an N-channel
+   interleaved stream to the transcription consumer over a pipe — the exact byte
+   format `src/transcribe.ts` already parses, so the Bun side barely changes.
    **Deletes:** 18 internal RTSP sessions, the audio-pump ffmpeg, `amerge`, and
    the "reader is too slow" bug *by construction*.
    mediamtx keeps serving clients; stitchd still publishes to it.
 
-2. [ ] **`raw/*` served by stitchd.** Re-expose per-camera streams for the
-   snapshotter and occasional external viewing, so mediamtx's `rtspSource`
-   pulls disappear and the NVR sees exactly 10 connections — from stitchd.
+   **These were originally two stages. Merged deliberately:** doing ingest first
+   and `raw/*` ownership second leaves an intermediate state where stitchd and
+   mediamtx BOTH pull every camera — 20 NVR connections instead of 10. Trading
+   18 localhost hops for a doubled load on the NVR is a regression, even
+   transiently. The NVR must never see more than one connection per camera.
 
-3. [ ] **HLS in stitchd** (libavformat `hls` muxer → disk, HTTP serves it).
+2. [ ] **HLS in stitchd** (libavformat `hls` muxer → disk, HTTP serves it).
 
-4. [ ] **RTSP server in stitchd.** VLC / Home Assistant talk to stitchd directly.
+3. [ ] **RTSP server in stitchd.** VLC / Home Assistant talk to stitchd directly.
 
-5. [ ] **WebRTC via libdatachannel** + WHEP. Preserve the three contracts above.
+4. [ ] **WebRTC via libdatachannel** + WHEP. Preserve the three contracts above.
    Validate off-LAN on iOS *before* proceeding.
 
-6. [ ] **Control API + dashboard cutover, then delete mediamtx.**
+5. [ ] **Control API + dashboard cutover, then delete mediamtx.**
 
 ## Findings / gotchas
 
@@ -117,13 +120,13 @@ discard bug dies in Stage 1.
   compositor takes ~30 s to connect all inputs before producing frames. Any
   replacement server must tolerate a slow first frame.
 - The dashboard depends on `/v3/paths/list`, `/v3/rtspsessions/list`,
-  `/v3/webrtcsessions/list`, `/v3/hlsmuxers/list`. Stage 6 must supply
+  `/v3/webrtcsessions/list`, `/v3/hlsmuxers/list`. Stage 5 must supply
   equivalents or the dashboard loses its stream state.
 
 ## Things not to do
 
 - Don't hand-roll DTLS-SRTP or ICE.
-- Don't delete mediamtx until Stage 5 is validated off-LAN on iOS — the public
+- Don't delete mediamtx until Stage 4 is validated off-LAN on iOS — the public
   field stream is the one externally-visible thing that can break badly.
 - Don't change the UDP mux port from 8189; a WAN forward depends on it.
 - Don't do a big-bang cutover. Each stage ships independently.
@@ -134,4 +137,24 @@ discard bug dies in Stage 1.
 
 - [x] Scoped: measured internal-vs-external reader split, inventoried every
       mediamtx role, confirmed the build system and its constraints.
+- [x] Caught a staging flaw while re-checking against the stated goal: the
+      original Stage 1/2 split would have doubled NVR connections in between.
+      Merged into one step.
 - [ ] Stage 1.
+
+## Stream-copy accounting (the actual scoreboard)
+
+Persistent internal sessions carrying media between processes in the same
+container. This is what "minimize stream copying" means concretely:
+
+| State | NVR pulls | internal localhost RTSP | separate processes |
+| --- | --- | --- | --- |
+| today | 10 | ~24 (8 video + 10 audio + 6 publish) + snapshotter | mediamtx, stitchd, audio ffmpeg, whisper, Bun |
+| after Stage 1 | 10 | 6 (publish only) | mediamtx, stitchd, whisper, Bun |
+| after Stage 2 (HLS) | 10 | 6 | same |
+| after Stage 3 (RTSP) | 10 | 6 | same |
+| after Stage 4 (WebRTC) | 10 | 6 | same |
+| after Stage 5 (delete mediamtx) | 10 | **0** | stitchd, whisper, Bun |
+
+Stage 1 removes ~75% of the copying. The last 6 hops only disappear when
+mediamtx is actually deleted, because publishing to it IS the remaining hop.
