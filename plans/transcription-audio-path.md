@@ -147,11 +147,12 @@ the audio pump, so they'd need audio-only inputs.
        pump is discarding ~4,500/hr again. **Cause still open.** See the
        retraction section. Next: test the drift hypothesis — instrument
        per-input PTS divergence across the 10 `amerge` inputs over hours.
-4. [ ] Audio-in-stitchd: **downgrade from "fix" to "architectural cleanup".**
-       The measurement removed the performance justification — the audio path is
-       not saturated. Still attractive (stitchd already demuxes and discards
-       these audio packets; it would delete 10 RTSP sessions and the second
-       ffmpeg), but it is no longer urgent and must not be sold as a fix.
+4. [ ] **← current. Audio-in-stitchd: RE-PROMOTED to the fix.** Not because the
+       pump is saturated (it isn't — it holds 100% of real time), but because
+       the audio pump's 10 reader sessions ARE the sessions mediamtx discards
+       for. Moving audio into stitchd deletes the reader rather than tuning it,
+       so the bug cannot recur. stitchd already demuxes these streams and throws
+       the audio away at main.cpp:130. See the VERDICT section.
 5. [ ] Optional, on its own merits: replace `appendMono`'s grow-and-copy with a
        fixed-size ring buffer. Not the bottleneck, but it is a genuine O(n)
        -per-chunk wart with real allocation churn.
@@ -202,6 +203,67 @@ message, which is precisely the evidence the drift hypothesis needs.
 | `lag` grows steadily, `recent` < 100 % | Confirms the pump falls behind progressively. Then find *which* input: drift hypothesis lives or dies on the ffmpeg timestamp warnings now being surfaced. |
 | `lag` ~0 and `recent` ~100 % while discards climb | The pump is keeping up, so the discards are NOT a pump-drain problem — look at mediamtx's per-reader queue/write path instead. This would refute the drift hypothesis outright. |
 | `lag` jumps once then flat | A one-off stall (a reconnect), not progressive degradation. |
+
+## VERDICT (2026-07-30, 17 h uptime): drift REFUTED; audio-in-stitchd re-promoted
+
+The instrument refuted the hypothesis it was built to test — the good outcome.
+
+```
+uptime  485min  lag  0.07s  recent 100.0%   <- 8h in, essentially perfect
+uptime  545min  lag 10.54s  recent 100.0%   <- ONE discrete ~10.5s step
+uptime 1020min  lag 10.54s  recent  99.9%   <- 17h in, still exactly 10.5s
+```
+
+Lag was ~0 for 8 h, took a single step, then stayed flat for 9 h. `recent` never
+left 100 %. Zero ffmpeg timestamp warnings in 18 h. Meanwhile discards ran
+~5,200/hr, and **the first one fired at 02:46 — 44 min in, while lag was 0.00 s
+and rate 100 %**.
+
+**So the pump keeps up with real time perfectly and mediamtx discards anyway.**
+That kills every throughput/drift explanation, including this plan's.
+
+Remaining mechanism: **burstiness, not bandwidth.** mediamtx's per-reader write
+queue overflows when a reader doesn't drain *promptly*, regardless of average
+rate. One ffmpeg round-robining 10 `amerge` inputs necessarily reads each in
+bursts — while it services inputs 1-9, input 10's queue builds. Perfect average
+throughput, periodic overflow.
+
+### Architecture, verified (answers "why have mediamtx at all?")
+
+mediamtx does three jobs, not one:
+
+1. **Ingest** — `raw/*` are `source: rtspSource`, i.e. mediamtx pulls all 10
+   cameras from the NVR itself (this is the 10 NVR connections).
+2. **Fan-out** — serves `raw/*` to stitchd, the audio pump, the snapshotter.
+3. **Delivery** — RTSP + WebRTC (WHIP/WHEP, ICE/STUN) + HLS + control API.
+
+Job 3 is not replaceable by stitchd at sane cost, and the
+`stream.tomsawyerlabs.com` token gate is built on mediamtx's endpoints. Keep it.
+
+### Step 4 is re-promoted, on better grounds than before
+
+Audio-in-stitchd was downgraded when the saturation theory died. Today's data
+revives it for a different and stronger reason:
+
+- stitchd **already opens 8 of the 10 streams** and already receives their audio
+  packets, discarding them at `main.cpp:130`.
+- The audio pump's 10 reader sessions **are** the sessions mediamtx discards for.
+- Moving audio into stitchd does not *fix* the burstiness — it **deletes the
+  reader**. No reader, no "reader is too slow". Fixes the bug by construction.
+
+Cost: `blue` and `bullet` need audio-only inputs (stitchd doesn't open them);
+AAC→PCM decode (trivial vs. the video work); a path to hand PCM to the Bun
+consumer.
+
+**Do NOT bother with `-thread_queue_size`** — it widens a buffer under a consumer
+we intend to delete. (Also note: my stderr filter still would not surface
+ffmpeg's `Thread message queue blocking` warning; checked the raw logs directly
+and it is genuinely absent, but widen the filter if that path is revisited.)
+
+Second, separate redundancy worth naming but NOT bundling: stitchd fetches
+frames over localhost RTSP that mediamtx just pulled from the NVR, then publishes
+back the same way. stitchd uses libavformat and could open the NVR URLs directly
+— but that doubles NVR connections unless mediamtx stops pulling those paths.
 
 ## Things not to do
 
