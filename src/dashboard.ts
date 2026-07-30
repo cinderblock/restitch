@@ -700,8 +700,25 @@ async function tick() {
         : lastSeg < 60 ? Math.floor(lastSeg) + 's ago'
         : lastSeg < 3600 ? Math.floor(lastSeg / 60) + 'm ago'
         : Math.floor(lastSeg / 3600) + 'h ago';
+      // Pump health: lag is how many seconds of audio ffmpeg is behind real
+      // time. It should sit near 0; a value that grows with uptime means the
+      // pump is not draining its RTSP inputs fast enough, which is what makes
+      // mediamtx discard frames. Shown inline (not a tooltip) so it is visible
+      // on a phone without hovering.
+      const lagS = audioStats.pump_lag_s ?? 0;
+      const ratioPct = ((audioStats.pump_recent_ratio ?? 1) * 100);
+      const upMin = (audioStats.pump_uptime_s ?? 0) / 60;
+      const pumpStr = 'pump ' + (upMin < 60
+          ? upMin.toFixed(0) + 'm'
+          : (upMin / 60).toFixed(1) + 'h')
+        + ' · lag ' + lagS.toFixed(1) + 's'
+        + ' · rate ' + ratioPct.toFixed(0) + '%';
       audioMeta.textContent = 'threshold ' + threshold + ' dB · state ' + audioStats.state
-        + ' · ' + audioStats.transitions_total + ' transitions · last segment ' + lastSegStr;
+        + ' · ' + audioStats.transitions_total + ' transitions · last segment ' + lastSegStr
+        + ' · ' + pumpStr;
+      // Flag it visually once the pump is meaningfully behind, so a slow drift
+      // doesn't hide in a text line nobody reads.
+      audioMeta.style.color = (lagS > 5 || ratioPct < 95) ? '#f85149' : '';
 
       // Render a per-camera level row + the combined "mono" row vs the threshold
       const entries = [

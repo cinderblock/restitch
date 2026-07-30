@@ -207,6 +207,21 @@ export interface LiveStats {
   per_cam_rms_db: Record<string, number>;
   transitions_total: number;
   last_segment_at: number | null;
+  /** Seconds since the audio pump started delivering. */
+  pump_uptime_s: number;
+  /** How many seconds of audio the pump is BEHIND real time, cumulatively.
+   *  The pump is a live capture, so in the steady state it must deliver
+   *  SAMPLE_RATE * channels * 2 bytes per wall-clock second. Any shortfall
+   *  means ffmpeg is not draining its RTSP inputs fast enough — which is
+   *  exactly when mediamtx starts logging "reader is too slow" and discarding
+   *  frames for those inputs. A lag that grows with uptime is the signature of
+   *  progressive drift (amerge waiting ever longer on a laggard input); a lag
+   *  that jumps once and stays flat is a one-off stall. */
+  pump_lag_s: number;
+  /** Delivered bytes as a fraction of what real time demands, over the most
+   *  recent window. 1.0 = keeping up; < 1.0 = falling behind right now.
+   *  Distinguishes "currently degrading" from "took one hit hours ago". */
+  pump_recent_ratio: number;
 }
 
 function startCombinedPump(
@@ -261,6 +276,54 @@ function startCombinedPump(
   let silencePendingSamples = 0;
 
   let inflight = 0;
+
+  // --- Pump lag instrumentation -------------------------------------------
+  // Measures whether ffmpeg is keeping up with real time. Byte-triggered
+  // rather than timer-driven on purpose: startCombinedPump() is re-invoked on
+  // every pump restart, and a setInterval here would outlive the pump it
+  // belongs to and leak one timer per restart.
+  const BYTES_PER_SEC_TOTAL = SAMPLE_RATE * GROUP_SIZE; // all channels
+  let pumpStartMs = 0; // set on first chunk, not launch (ffmpeg needs to connect)
+  let bytesIn = 0;
+  let lastLogBytes = 0;
+  let windowStartMs = 0;
+  let windowStartBytes = 0;
+  const LOG_EVERY_BYTES = BYTES_PER_SEC_TOTAL * 300; // ~5 min of audio
+
+  function recordBytes(n: number): void {
+    const now = Date.now();
+    if (pumpStartMs === 0) {
+      pumpStartMs = now;
+      windowStartMs = now;
+      return; // no elapsed time yet — a ratio here would divide by ~0
+    }
+    bytesIn += n;
+
+    const elapsedS = (now - pumpStartMs) / 1000;
+    const expected = elapsedS * BYTES_PER_SEC_TOTAL;
+    stats.pump_uptime_s = Math.round(elapsedS);
+    stats.pump_lag_s = Math.max(0, (expected - bytesIn) / BYTES_PER_SEC_TOTAL);
+
+    const winMs = now - windowStartMs;
+    if (winMs >= 60_000) {
+      const winExpected = (winMs / 1000) * BYTES_PER_SEC_TOTAL;
+      stats.pump_recent_ratio = winExpected > 0 ? (bytesIn - windowStartBytes) / winExpected : 1;
+      windowStartMs = now;
+      windowStartBytes = bytesIn;
+    }
+
+    // Periodic line so hours of history land in the container log next to
+    // mediamtx's discard warnings — correlating the two is the whole point.
+    if (bytesIn - lastLogBytes >= LOG_EVERY_BYTES) {
+      lastLogBytes = bytesIn;
+      console.log(
+        `[combined] pump: uptime ${(elapsedS / 60).toFixed(1)}min ` +
+          `lag ${stats.pump_lag_s.toFixed(2)}s ` +
+          `recent ${(stats.pump_recent_ratio * 100).toFixed(1)}% ` +
+          `inflight ${inflight}`
+      );
+    }
+  }
 
   function appendMono(samples: Int16Array): void {
     if (samples.length === 0) return;
@@ -428,6 +491,7 @@ function startCombinedPump(
   }
 
   const onStdout = (chunk: Uint8Array): void => {
+    recordBytes(chunk.length);
     let data: Uint8Array;
     if (leftoverBytes.length > 0) {
       data = new Uint8Array(leftoverBytes.length + chunk.length);
@@ -527,7 +591,13 @@ function startCombinedPump(
       cmd,
       onStdout,
       onStderr: (line) => {
-        if (/error|fail/i.test(line)) {
+        // ffmpeg runs at -loglevel warning, and its timestamp complaints are
+        // the most diagnostic thing it emits for this pump — "timestamp
+        // discontinuity", "non-monotonic DTS", aresample compensation. The old
+        // /error|fail/ filter dropped every one of them, so the pump looked
+        // silent while it was falling behind. Match those explicitly rather
+        // than forwarding everything, which would spam the log on startup.
+        if (/error|fail|discontinu|non-monotonic|timestamp|aresample|async/i.test(line)) {
           console.error(`[combined] ${line}`);
         }
       },
@@ -570,6 +640,9 @@ export function startTranscription(
     per_cam_rms_db: Object.fromEntries(cameras.map((c) => [c.name, -100])),
     transitions_total: 0,
     last_segment_at: null,
+    pump_uptime_s: 0,
+    pump_lag_s: 0,
+    pump_recent_ratio: 1,
   };
 
   if (!t.enabled) {
