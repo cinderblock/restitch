@@ -1,0 +1,137 @@
+# Absorb mediamtx into stitchd
+
+## Goal
+
+Make `stitchd` the whole media system: ingest from the NVR, composite on GPU,
+extract audio, and serve clients directly — deleting mediamtx and every internal
+localhost RTSP hop.
+
+## Why (measured, not assumed)
+
+The `raw/*` fan-out exists almost entirely to serve ourselves. RTSP sessions on
+sentinel over a 6 h window:
+
+```
+~23,000 sessions from 127.0.0.1   (stitchd, audio pump, snapshotter)
+      6 sessions from real LAN clients
+```
+
+So today we run a full streaming server, pull 10 cameras into it, then read them
+back over localhost to feed processes in the *same container*. stitchd also
+publishes its 6 outputs back into that same server over RTSP. Every internal hop
+costs a demux/remux and a per-reader queue that can overflow — which is the
+direct cause of the still-open "reader is too slow" discards
+(see [transcription-audio-path.md](transcription-audio-path.md)).
+
+## Environment / context
+
+- `compositor/` builds `stitchd` via CMake: C++20 + CUDA (sm_89), linking our
+  **own static libav\*** from `/opt/ffmpeg` (`libavformat libavcodec libavutil
+  libswresample`) plus `CUDA::cudart`. New C++ deps go in the builder image.
+- `stitchd` today: `av_find_best_stream(VIDEO)` per input, drops every non-video
+  packet (`main.cpp:130`), composites GPU-resident, publishes outputs over RTSP.
+- Supervisor is Bun (`src/index.ts`); dashboard (`src/dashboard.ts`, 1076 lines)
+  reads mediamtx's control API; `src/transcribe.ts` owns the audio pump and the
+  whisper consumer.
+- Live config is owned by the **ops** repo, not here.
+
+## What mediamtx actually does (all of it must be replaced)
+
+| Job | Port | Replacement | Difficulty |
+| --- | --- | --- | --- |
+| NVR ingest, 10 pulls + reconnect | — | `avformat_open_input` per camera | **Easy** — already done for 8 |
+| Internal fan-out of `raw/*` | 8554 | in-process buffers | **Easy** — deletes the hop entirely |
+| RTSP server | 8554 | RTP/RTSP over TCP interleaved | Moderate |
+| HLS | 8890 | libavformat `hls` muxer → disk + HTTP | **Easy** — muxer already linked |
+| **WebRTC + UDP mux** | 8889 / 8189 | **libdatachannel** (ICE/DTLS-SRTP/SDP) + WHEP | **Hard** |
+| Control API | 9997 | small HTTP server; dashboard reads it | Easy |
+| Auth / permissions | — | Caddy already fronts the public path | Easy |
+
+## Decisions already made (don't re-ask)
+
+- **Full replacement is the goal.** User directive, 2026-07-30.
+- **Do NOT hand-roll WebRTC.** Use `libdatachannel` (ICE + DTLS-SRTP + SDP,
+  BSD-licensed, mature). Hand-rolling DTLS-SRTP is the one way this project
+  ends badly.
+- **HLS via libavformat's `hls` muxer**, not a hand-written segmenter — we
+  already link it statically.
+- **Stage it.** Every stage must leave the system fully working and deployable
+  on its own. No big-bang cutover.
+- Do NOT bother with `-thread_queue_size` on the audio pump — Stage 1 deletes
+  that pump entirely.
+
+## The one genuinely risky piece
+
+WebRTC (Stage 5) carries the **public field stream**: `stream.tomsawyerlabs.com`
+→ Cloudflare → office → steamboat → sentinel, gated by `STREAM_WEBRTC_TOKEN` in
+Caddy, with media on a **WAN-forwarded UDP 8189**. Three contracts must survive
+byte-for-byte or the public stream breaks:
+
+1. UDP mux stays on **8189** (the WAN forward points at exactly this port).
+2. `webrtcAdditionalHosts` equivalent — advertise `stream.tomsawyerlabs.com` as
+   an ICE candidate (split-horizon DNS).
+3. STUN (`stun.l.google.com:19302`) for the numeric-IP srflx candidate that
+   Safari/iOS require (WebKit ignores non-mDNS FQDN candidates).
+
+Stage 5 must be validated from an actual off-LAN iPhone before mediamtx is
+deleted. Until then mediamtx stays installed and can be re-pointed in one config
+change.
+
+## Plan / steps
+
+Ordered so the highest value and lowest risk land first, and so the outstanding
+discard bug dies in Stage 1.
+
+1. [ ] **← current. Ingest + audio inside stitchd.**
+   Open the 10 NVR URLs directly (video **and** audio). Decode audio to PCM,
+   resample to 16 kHz mono per camera, and hand an N-channel interleaved stream
+   to the transcription consumer over a pipe — the exact byte format
+   `src/transcribe.ts` already parses, so the Bun side barely changes.
+   **Deletes:** 18 internal RTSP sessions, the audio-pump ffmpeg, `amerge`, and
+   the "reader is too slow" bug *by construction*.
+   mediamtx keeps serving clients; stitchd still publishes to it.
+
+2. [ ] **`raw/*` served by stitchd.** Re-expose per-camera streams for the
+   snapshotter and occasional external viewing, so mediamtx's `rtspSource`
+   pulls disappear and the NVR sees exactly 10 connections — from stitchd.
+
+3. [ ] **HLS in stitchd** (libavformat `hls` muxer → disk, HTTP serves it).
+
+4. [ ] **RTSP server in stitchd.** VLC / Home Assistant talk to stitchd directly.
+
+5. [ ] **WebRTC via libdatachannel** + WHEP. Preserve the three contracts above.
+   Validate off-LAN on iOS *before* proceeding.
+
+6. [ ] **Control API + dashboard cutover, then delete mediamtx.**
+
+## Findings / gotchas
+
+- stitchd already receives the audio packets it needs — it discards them one
+  line after demux. Stage 1 is mostly *stop throwing them away*.
+- `blue` and `bullet` are opened by nothing but the audio pump today, so Stage 1
+  must add them as inputs (audio-only is fine).
+- `writeQueueSize: 65536` in the mediamtx config exists because a 7560x2688 HEVC
+  keyframe exceeds 1000 RTP packets; any replacement RTSP/RTP writer needs
+  equivalent headroom or large keyframes will be shredded.
+- mediamtx's generous `readTimeout/writeTimeout: 5m` exists because the
+  compositor takes ~30 s to connect all inputs before producing frames. Any
+  replacement server must tolerate a slow first frame.
+- The dashboard depends on `/v3/paths/list`, `/v3/rtspsessions/list`,
+  `/v3/webrtcsessions/list`, `/v3/hlsmuxers/list`. Stage 6 must supply
+  equivalents or the dashboard loses its stream state.
+
+## Things not to do
+
+- Don't hand-roll DTLS-SRTP or ICE.
+- Don't delete mediamtx until Stage 5 is validated off-LAN on iOS — the public
+  field stream is the one externally-visible thing that can break badly.
+- Don't change the UDP mux port from 8189; a WAN forward depends on it.
+- Don't do a big-bang cutover. Each stage ships independently.
+- Don't evaluate any discard-related change on a restitch process younger than
+  ~3 h (standing rule, learned twice — a fresh process always reads clean).
+
+## Progress log
+
+- [x] Scoped: measured internal-vs-external reader split, inventoried every
+      mediamtx role, confirmed the build system and its constraints.
+- [ ] Stage 1.
