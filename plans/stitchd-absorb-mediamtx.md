@@ -59,6 +59,12 @@ direct cause of the still-open "reader is too slow" discards
   on its own. No big-bang cutover.
 - Do NOT bother with `-thread_queue_size` on the audio pump — Stage 1 deletes
   that pump entirely.
+- **Deploy authority (user, 2026-07-30):** free to build/deploy new stitchd
+  binaries and restart the restitch container / streams without asking.
+  **Do NOT reboot sentinel** — other work is running on that box in parallel.
+  So: `docker restart restitch` and stitchd swaps are fine; anything that
+  reboots the host is not, including deploys that could trip the
+  NVIDIA-driver reboot path in the ops repo.
 
 ## The one genuinely risky piece
 
