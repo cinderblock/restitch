@@ -211,6 +211,11 @@ async function main() {
   // Only the native compositor can produce them.
   const hlsDir = nativeCompositor ? `${runtimeDir}/hls` : undefined;
 
+  // stitchd's own RTSP server. mediamtx still owns 8554, so this runs
+  // alongside on 8555 until clients are cut over; both serve the same
+  // encoded packets, so a client can be moved one at a time.
+  const stitchdRtspPort = nativeCompositor ? 8555 : 0;
+
   if (nativeCompositor) {
     // stitchd: ONE process produces every output. Rewrite its config file each
     // (re)spawn (cheap; keeps behavior identical to the ffmpeg factory which
@@ -230,6 +235,7 @@ async function main() {
           "--out",
           config.output.base_url,
           ...(hlsDir ? ["--hls-dir", hlsDir] : []),
+          ...(stitchdRtspPort ? ["--rtsp-port", String(stitchdRtspPort)] : []),
         ],
         onStderr: stderrFilter("stitchd"),
         // Raw interleaved s16le from stitchd's audio mixer. Only meaningful
