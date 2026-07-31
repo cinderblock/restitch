@@ -224,13 +224,22 @@ export interface LiveStats {
   pump_recent_ratio: number;
 }
 
+/**
+ * Build the PCM consumer (max-abs mono mix, per-channel RMS, silence
+ * detection, whisper dispatch) and optionally the ffmpeg that feeds it.
+ *
+ * `spawnPump: false` returns just the consumer, for when stitchd produces the
+ * merged N-channel stream itself — same bytes, same channel order, one fewer
+ * process and ten fewer RTSP readers.
+ */
 function startCombinedPump(
   cameras: Camera[],
   config: Config,
   whisperUrl: string,
   ring: RingBuffer,
-  stats: LiveStats
-): ManagedProcess {
+  stats: LiveStats,
+  spawnPump: boolean = true
+): { proc?: ManagedProcess; onPcm: (chunk: Uint8Array) => void } {
   const t = config.transcription;
   const N = cameras.length;
   const SAMPLE_RATE = 16000;
@@ -585,7 +594,9 @@ function startCombinedPump(
     "-"
   );
 
-  return launchManaged(
+  if (!spawnPump) return { onPcm: onStdout };
+
+  const proc = launchManaged(
     "audio-combined",
     () => ({
       cmd,
@@ -604,6 +615,7 @@ function startCombinedPump(
     }),
     { restartDelayMs: 5000 }
   );
+  return { proc, onPcm: onStdout };
 }
 
 /**
@@ -621,9 +633,18 @@ function startCombinedPump(
  * Returns the ring + stats so the dashboard server can read them
  * in-process (no HTTP proxy across services).
  */
+/** Somewhere for stitchd's merged PCM to land once whisper is ready. */
+export interface PcmSink {
+  write: ((chunk: Uint8Array) => void) | null;
+}
+
 export function startTranscription(
   config: Config,
-  processes: ManagedProcess[]
+  processes: ManagedProcess[],
+  /** When provided, stitchd supplies the merged PCM and NO ffmpeg pump is
+   *  spawned. The sink stays null until whisper is up, so early bytes are
+   *  dropped rather than queued against a server that cannot answer. */
+  pcmSink?: PcmSink
 ): { ring: RingBuffer; stats: LiveStats } {
   const t = config.transcription;
   const ring = new RingBuffer(t.max_entries_per_camera);
@@ -670,13 +691,22 @@ export function startTranscription(
       await waitForServer(whisperUrl);
       console.log(`[transcribe] whisper-server ready at ${whisperUrl}`);
       const skipped = config.cameras.length - cameras.length;
+      const external = pcmSink != null;
       console.log(
-        `[transcribe] starting combined pump for ${cameras.length} camera(s)` +
+        `[transcribe] ${external ? "attaching to stitchd audio" : "starting combined pump"}` +
+          ` for ${cameras.length} camera(s)` +
           (skipped > 0 ? ` (${skipped} excluded via transcribe: false)` : "")
       );
-      processes.push(
-        startCombinedPump(cameras, config, whisperUrl, ring, stats)
+      const pump = startCombinedPump(
+        cameras,
+        config,
+        whisperUrl,
+        ring,
+        stats,
+        !external
       );
+      if (pump.proc) processes.push(pump.proc);
+      if (pcmSink) pcmSink.write = pump.onPcm;
     } catch (err) {
       console.error("[transcribe] whisper-server never came up:", err);
     }

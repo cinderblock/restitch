@@ -18,7 +18,7 @@ import { writeMediaMTXConfig, rawStreamName } from "./mediamtx.ts";
 import { launchManaged, type ManagedProcess } from "./process.ts";
 import { detectHwAccel, suggestEncoder } from "./hwaccel.ts";
 import { startDashboard } from "./dashboard.ts";
-import { startTranscription } from "./transcribe.ts";
+import { startTranscription, type PcmSink } from "./transcribe.ts";
 import { startWatchdog, type WatchedProcess } from "./watchdog.ts";
 
 const { values } = parseArgs({
@@ -199,6 +199,13 @@ async function main() {
   // the baseline per spawn keeps PTS ~0 and the stream live immediately.
   const watched: WatchedProcess[] = [];
 
+  // stitchd emits the merged N-channel PCM on its stdout. The consumer is
+  // installed later (startTranscription, once whisper is up), so this holder
+  // lets the compositor launch first without reordering startup. Bytes before
+  // then are dropped on purpose — queueing audio for a server that cannot
+  // answer just builds a backlog.
+  const pcmSink: PcmSink = { write: null };
+
   if (nativeCompositor) {
     // stitchd: ONE process produces every output. Rewrite its config file each
     // (re)spawn (cheap; keeps behavior identical to the ffmpeg factory which
@@ -219,6 +226,10 @@ async function main() {
           config.output.base_url,
         ],
         onStderr: stderrFilter("stitchd"),
+        // Raw interleaved s16le from stitchd's audio mixer. Only meaningful
+        // when the config declares audio-ch lines; otherwise stitchd writes
+        // nothing here and this is never called.
+        onStdout: (chunk: Uint8Array) => pcmSink.write?.(chunk),
       };
     });
     processes.push(stitchdProc);
@@ -275,7 +286,14 @@ async function main() {
   // Transcription stack (whisper-server + audio fusion pump). Spawns its
   // own supervised subprocesses into `processes`. Returns the ring+stats
   // synchronously; the audio pump attaches once whisper warms up.
-  const transcription = startTranscription(config, processes);
+  // With the native compositor, stitchd already demuxes every camera and now
+  // hands us the merged audio directly — no second ffmpeg, and none of the
+  // RTSP reader sessions mediamtx was discarding for.
+  const transcription = startTranscription(
+    config,
+    processes,
+    nativeCompositor ? pcmSink : undefined
+  );
 
   // Watchdog: restart any ffmpeg whose mediamtx output path stops receiving
   // bytes, OR whose input source reconnects (which wedges the read and freezes

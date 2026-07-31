@@ -1167,7 +1167,13 @@ function stitchdRot(rotation: string, ctx: string): number {
 export function buildStitchdConfig(
   config: Config,
   cameraProbes: Map<string, ProbeResult>
-): { text: string; inputPaths: string[]; outputNames: string[] } {
+): {
+  text: string;
+  inputPaths: string[];
+  outputNames: string[];
+  /** Cameras stitchd will emit audio for, in interleave order. */
+  audioChannels: Camera[];
+} {
   if (config.composite.rotation !== "90") {
     throw new Error(
       `stitchd assumes composite rotation 90 (got "${config.composite.rotation}").`
@@ -1205,6 +1211,17 @@ export function buildStitchdConfig(
   for (const [slug, url] of aux) {
     lines.push(`aux ${slug} ${url}`);
     inputPaths.push(slug);
+  }
+
+  // Transcription channels. Order is load-bearing: stitchd interleaves the
+  // merged PCM in exactly this order and the consumer de-interleaves by index,
+  // so this MUST match startTranscription's `config.cameras.filter(transcribe)`
+  // — same source array, same filter, no sort. A camera already listed above
+  // rides that existing connection; the rest open audio-only inside stitchd.
+  const audioChannels = config.cameras.filter((c) => c.transcribe);
+  for (const cam of audioChannels) {
+    const slug = rawStreamName(cam);
+    lines.push(`audio-ch ${slug} ${base}/${slug}`);
   }
 
   type P = { src: string; cx: number; cy: number; cw: number; ch: number; sw: number; sh: number; rot: number };
@@ -1289,5 +1306,5 @@ export function buildStitchdConfig(
          parseRate(extra.maxrate), pieces);
   }
 
-  return { text: lines.join("\n") + "\n", inputPaths, outputNames };
+  return { text: lines.join("\n") + "\n", inputPaths, outputNames, audioChannels };
 }
