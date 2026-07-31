@@ -113,6 +113,37 @@ discard bug dies in Stage 1.
 
 5. [ ] **Control API + dashboard cutover, then delete mediamtx.**
 
+## Stage 1 shipped (2026-07-31) + a correction to the stage ordering
+
+Stage 1's audio half is live (`503acda` + `7ab2351`). Verified on the box one
+minute after deploy: `attaching to stitchd audio for 10 camera(s)`, **zero**
+amerge audio-pump processes, all 10 channels reporting distinct plausible levels
+(Bay 1 -31.6 ... Doorbell -56.5 dBFS, which is what proves the interleave order
+survives the round trip), lag 0 s / rate 100.0%, all paths ready, readers 24 ->
+14.
+
+### The remaining half of Stage 1 does NOT reduce copying — reordered
+
+The plan assumed "stitchd ingests from the NVR directly" was a win on its own.
+Counting the sessions says otherwise, because mediamtx still needs `raw/*` for
+the dashboard snapshotter and occasional external viewing:
+
+| | NVR | stitchd reads mediamtx | stitchd publishes | total internal |
+| --- | --- | --- | --- | --- |
+| today (post Stage 1) | 10 (mediamtx) | 10 | 6 | ~20 |
+| NVR-direct + republish `raw/*` | 10 (stitchd) | 0 | 6 + 10 | ~20 |
+
+It is a **lateral move**: the 10 reads become 10 publishes. More C++, more risk,
+same copy count — and this project exists to reduce copying.
+
+**The copies only actually disappear when mediamtx is deleted**, because the
+publish path IS the remaining hop. So ingest should move LAST, together with (or
+just before) deleting mediamtx — not first.
+
+Revised order: build the serving side (HLS -> RTSP -> WebRTC), then take ingest
+and delete mediamtx in one step. Stage numbering below is unchanged; only the
+*ingest* portion of Stage 1 is deferred to sit with Stage 5.
+
 ## Findings / gotchas
 
 - stitchd already receives the audio packets it needs — it discards them one
