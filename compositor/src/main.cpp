@@ -51,11 +51,17 @@ extern "C" {
 
 #include "audio.h"
 #include "rtsp.h"
+#if STITCHD_WEBRTC
+#include "webrtc.h"
+#endif
 #include "cuda_composite.h"
 
 static volatile std::sig_atomic_t g_stop = 0;
 // Set once before encoding starts; read-only thereafter.
 static rtsp::Server *g_rtsp = nullptr;
+#if STITCHD_WEBRTC
+static webrtc::Server *g_webrtc = nullptr;
+#endif
 // Force extradata (SPS/PPS) even when the primary muxer would not ask for it.
 // The RTSP server builds its SDP's sprop-parameter-sets from extradata, so
 // without this a `--out null` or raw-stream primary silently yields an SDP
@@ -334,6 +340,11 @@ int drain(Output &out) {
     // directly. Packets stay in the encoder time base; each session's rtp
     // muxer is registered with that same time base.
     AVPacket *rtsp_pkt = g_rtsp ? av_packet_clone(pkt) : nullptr;
+#if STITCHD_WEBRTC
+    // Must be cloned HERE, before the primary write consumes `pkt`. Cloning it
+    // afterwards is a use-after-free (segfault, exit 139).
+    AVPacket *wrtc_pkt = g_webrtc ? av_packet_clone(pkt) : nullptr;
+#endif
 
     av_packet_rescale_ts(pkt, out.enc->time_base, out.stream->time_base);
     pkt->stream_index = out.stream->index;
@@ -344,6 +355,13 @@ int drain(Output &out) {
       g_rtsp->broadcast(out.name, rtsp_pkt);
       av_packet_free(&rtsp_pkt);
     }
+
+#if STITCHD_WEBRTC
+    if (wrtc_pkt) {
+      g_webrtc->broadcast(out.name, wrtc_pkt, out.enc->time_base);
+      av_packet_free(&wrtc_pkt);
+    }
+#endif
 
     if (hls_pkt) {
       av_packet_rescale_ts(hls_pkt, out.enc->time_base,
@@ -552,8 +570,14 @@ struct Src {
   int pY, pUV, w, h;
 };
 
+#if STITCHD_WEBRTC
+int run(const Config &cfg, const char *dest, long long max_frames,
+        bool unpaced, const std::string &hls_dir, int rtsp_port,
+        const webrtc::Options &webrtc_opt) {
+#else
 int run(const Config &cfg, const char *dest, long long max_frames,
         bool unpaced, const std::string &hls_dir, int rtsp_port) {
+#endif
   av_log_set_level(AV_LOG_ERROR);
   Device dev;
   int err = dev.create();
@@ -714,6 +738,20 @@ int run(const Config &cfg, const char *dest, long long max_frames,
   // Serve the outputs over RTSP ourselves. Registered AFTER the encoders exist
   // so each stream advertises real codec parameters (SPS/PPS, profile, size) —
   // a DESCRIBE built from an unopened encoder yields an SDP clients reject.
+#if STITCHD_WEBRTC
+  std::unique_ptr<webrtc::Server> webrtc_srv;
+  if (webrtc_opt.http_port > 0) {
+    webrtc_srv = std::make_unique<webrtc::Server>();
+    for (auto *w : workers) webrtc_srv->add_stream(w->name, w->enc_par());
+    if (webrtc_srv->start(webrtc_opt)) {
+      g_webrtc = webrtc_srv.get();
+    } else {
+      LOGF("webrtc disabled (port %d unavailable)", webrtc_opt.http_port);
+      webrtc_srv.reset();
+    }
+  }
+#endif
+
   std::unique_ptr<rtsp::Server> rtsp_srv;
   if (rtsp_port > 0) {
     rtsp_srv = std::make_unique<rtsp::Server>();
@@ -839,6 +877,8 @@ int main(int argc, char **argv) {
   bool unpaced = false;
   std::string hls_dir;
   int rtsp_port = 0;
+  int webrtc_http = 0, webrtc_udp = 8189;
+  std::vector<std::string> webrtc_hosts, ice_servers;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--config" && i + 1 < argc) config = argv[++i];
@@ -850,6 +890,12 @@ int main(int argc, char **argv) {
     else if (a == "--hls-dir" && i + 1 < argc) hls_dir = argv[++i];
     // Serve the outputs over RTSP directly from stitchd (0 = off).
     else if (a == "--rtsp-port" && i + 1 < argc) rtsp_port = std::atoi(argv[++i]);
+    // WebRTC (WHEP). --webrtc-port 0 disables. --webrtc-udp must match the
+    // WAN forward. --webrtc-host may repeat (advertised ICE candidates).
+    else if (a == "--webrtc-port" && i + 1 < argc) webrtc_http = std::atoi(argv[++i]);
+    else if (a == "--webrtc-udp" && i + 1 < argc) webrtc_udp = std::atoi(argv[++i]);
+    else if (a == "--webrtc-host" && i + 1 < argc) webrtc_hosts.push_back(argv[++i]);
+    else if (a == "--ice-server" && i + 1 < argc) ice_servers.push_back(argv[++i]);
   }
   if (!config || !out) return selftest();
 
@@ -857,5 +903,16 @@ int main(int argc, char **argv) {
   std::signal(SIGTERM, [](int) { g_stop = 1; });
   Config cfg;
   if (!parse_config(config, cfg)) return 2;
+#if STITCHD_WEBRTC
+  webrtc::Options wopt;
+  wopt.http_port = webrtc_http;
+  wopt.udp_mux_port = webrtc_udp;
+  wopt.ice_servers = ice_servers;
+  wopt.additional_hosts = webrtc_hosts;
+  return run(cfg, out, max_frames, unpaced, hls_dir, rtsp_port, wopt);
+#else
+  if (webrtc_http > 0)
+    LOGF("--webrtc-port given but this build has no libdatachannel");
   return run(cfg, out, max_frames, unpaced, hls_dir, rtsp_port);
+#endif
 }

@@ -46,6 +46,13 @@ file(GLOB STITCHD_SOURCES CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cu")
 
+# webrtc.cpp includes <rtc/rtc.hpp>, so it can only be built when
+# libdatachannel was found. Drop it otherwise so a checkout without the
+# dependency still compiles.
+if(NOT LibDataChannel_FOUND)
+  list(REMOVE_ITEM STITCHD_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/webrtc.cpp")
+endif()
+
 add_executable(stitchd ${STITCHD_SOURCES})
 
 target_include_directories(stitchd PRIVATE
