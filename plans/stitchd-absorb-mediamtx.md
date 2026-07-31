@@ -122,8 +122,17 @@ discard bug dies in Stage 1.
        Verified live: `rtsp://sentinel:8555/entry` reports h264 1200x1352 @30
        and decodes cleanly, as does `the-field`.
 
-4. [ ] **WebRTC via libdatachannel** + WHEP. Preserve the three contracts above.
+4. [~] **WebRTC via libdatachannel** + WHEP. Preserve the three contracts above.
    Validate off-LAN on iOS *before* proceeding.
+   - [x] Dependency linked (`26f8dc0`): libdatachannel v0.22.5, static, bundled
+         libjuice backend, `media=1`, proven by the self-check.
+         **Verified up front that libjuice's `enableIceUdpMux` lets many peers
+         share ONE UDP port** — without that the 8189 WAN forward makes this
+         approach impossible, so it had to be checked before writing code.
+   - [ ] WHEP endpoint + SDP exchange.
+   - [ ] H.264 RTP into a peer connection (packetizers exist in libdatachannel).
+   - [ ] Pin the UDP mux to 8189, advertise `stream.tomsawyerlabs.com`, STUN.
+   - [ ] Off-LAN iOS validation.
 
 5. [ ] **Control API + dashboard cutover, then delete mediamtx.**
 
