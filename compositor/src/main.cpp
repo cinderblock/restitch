@@ -46,9 +46,17 @@ extern "C" {
 #include <cuda_runtime.h>
 
 #include "audio.h"
+#include "rtsp.h"
 #include "cuda_composite.h"
 
 static volatile std::sig_atomic_t g_stop = 0;
+// Set once before encoding starts; read-only thereafter.
+static rtsp::Server *g_rtsp = nullptr;
+// Force extradata (SPS/PPS) even when the primary muxer would not ask for it.
+// The RTSP server builds its SDP's sprop-parameter-sets from extradata, so
+// without this a `--out null` or raw-stream primary silently yields an SDP
+// clients cannot decode from ("non-existing PPS 0 referenced").
+static bool g_force_global_header = false;
 
 namespace {
 
@@ -192,6 +200,7 @@ private:
 
 // ---- one output encoder + muxer -------------------------------------------
 struct Output {
+  std::string name; // for the RTSP fan-out
   AVFormatContext *fmt = nullptr;
   AVCodecContext *enc = nullptr;
   AVStream *stream = nullptr;
@@ -283,7 +292,7 @@ int open_output(const char *url, const char *codec_name, int w, int h,
   if ((err = avformat_alloc_output_context2(&out.fmt, nullptr, fmt_name, url)) <
       0)
     return err;
-  if (out.fmt->oformat->flags & AVFMT_GLOBALHEADER)
+  if ((out.fmt->oformat->flags & AVFMT_GLOBALHEADER) || g_force_global_header)
     out.enc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
   if ((err = avcodec_open2(out.enc, enc, nullptr)) < 0) {
     LOGF("open encoder %s: %s", codec_name, av_err(err).c_str());
@@ -317,11 +326,20 @@ int drain(Output &out) {
     // Clone BEFORE writing: av_interleaved_write_frame consumes the packet.
     AVPacket *hls_pkt =
         (out.hls_fmt && out.hls_header) ? av_packet_clone(pkt) : nullptr;
+    // Same encoded packet again for any RTSP clients attached to stitchd
+    // directly. Packets stay in the encoder time base; each session's rtp
+    // muxer is registered with that same time base.
+    AVPacket *rtsp_pkt = g_rtsp ? av_packet_clone(pkt) : nullptr;
 
     av_packet_rescale_ts(pkt, out.enc->time_base, out.stream->time_base);
     pkt->stream_index = out.stream->index;
     err = av_interleaved_write_frame(out.fmt, pkt);
     av_packet_free(&pkt);
+
+    if (rtsp_pkt) {
+      g_rtsp->broadcast(out.name, rtsp_pkt);
+      av_packet_free(&rtsp_pkt);
+    }
 
     if (hls_pkt) {
       av_packet_rescale_ts(hls_pkt, out.enc->time_base,
@@ -374,6 +392,7 @@ public:
     h = height;
     frames = av_buffer_ref(fr);
     max_depth_ = depth;
+    io_.name = nm;
     if (open_output(url.c_str(), codec, w, h, fr, tb, frr, maxrate, io_) < 0)
       return -1;
     // Best-effort: HLS failing to open must not stop the RTSP output.
@@ -397,6 +416,14 @@ public:
     close_output(io_);
     if (frames) av_buffer_unref(&frames);
   }
+  const AVCodecParameters *enc_par() {
+    if (!par_) {
+      par_ = avcodec_parameters_alloc();
+      avcodec_parameters_from_context(par_, io_.enc);
+    }
+    return par_;
+  }
+  AVRational enc_time_base() const { return io_.enc->time_base; }
   void note_pool_drop() { ++dropped_; }
   long long dropped() const { return dropped_; }
 
@@ -429,6 +456,7 @@ private:
   std::thread th_;
   bool running_ = true;
   int max_depth_ = 6;
+  AVCodecParameters *par_ = nullptr;
   std::atomic<long long> dropped_{0};
 };
 
@@ -516,7 +544,7 @@ struct Src {
 };
 
 int run(const Config &cfg, const char *dest, long long max_frames,
-        bool unpaced, const std::string &hls_dir) {
+        bool unpaced, const std::string &hls_dir, int rtsp_port) {
   av_log_set_level(AV_LOG_ERROR);
   Device dev;
   int err = dev.create();
@@ -524,6 +552,8 @@ int run(const Config &cfg, const char *dest, long long max_frames,
   cudaSetDevice(0);
   cudaStream_t stream;
   cudaStreamCreate(&stream);
+
+  g_force_global_header = rtsp_port > 0;
 
   // Which sources are referenced?
   bool need_comp = false;
@@ -672,6 +702,24 @@ int run(const Config &cfg, const char *dest, long long max_frames,
     workers.push_back(w);
   }
 
+  // Serve the outputs over RTSP ourselves. Registered AFTER the encoders exist
+  // so each stream advertises real codec parameters (SPS/PPS, profile, size) —
+  // a DESCRIBE built from an unopened encoder yields an SDP clients reject.
+  std::unique_ptr<rtsp::Server> rtsp_srv;
+  if (rtsp_port > 0) {
+    rtsp_srv = std::make_unique<rtsp::Server>();
+    for (auto *w : workers)
+      rtsp_srv->add_stream(w->name, w->enc_par(), w->enc_time_base());
+    if (rtsp_srv->start(rtsp_port)) {
+      g_rtsp = rtsp_srv.get();
+    } else {
+      // Non-fatal: publishing to mediamtx still works, so a taken port must
+      // not take the whole compositor down.
+      LOGF("rtsp server disabled (port %d unavailable)", rtsp_port);
+      rtsp_srv.reset();
+    }
+  }
+
   const auto t0 = std::chrono::steady_clock::now();
   long long frames_out = 0;
   while (!g_stop && (max_frames <= 0 || frames_out < max_frames)) {
@@ -781,6 +829,7 @@ int main(int argc, char **argv) {
   long long max_frames = 0;
   bool unpaced = false;
   std::string hls_dir;
+  int rtsp_port = 0;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--config" && i + 1 < argc) config = argv[++i];
@@ -790,6 +839,8 @@ int main(int argc, char **argv) {
     // Write HLS (fMP4) for every output under this directory, in addition to
     // the primary RTSP publish. Same encoded packets, no second encode.
     else if (a == "--hls-dir" && i + 1 < argc) hls_dir = argv[++i];
+    // Serve the outputs over RTSP directly from stitchd (0 = off).
+    else if (a == "--rtsp-port" && i + 1 < argc) rtsp_port = std::atoi(argv[++i]);
   }
   if (!config || !out) return selftest();
 
@@ -797,5 +848,5 @@ int main(int argc, char **argv) {
   std::signal(SIGTERM, [](int) { g_stop = 1; });
   Config cfg;
   if (!parse_config(config, cfg)) return 2;
-  return run(cfg, out, max_frames, unpaced, hls_dir);
+  return run(cfg, out, max_frames, unpaced, hls_dir, rtsp_port);
 }
