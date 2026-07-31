@@ -1196,7 +1196,9 @@ export function buildStitchdConfig(
   lines.push(`comp-dim ${comp.width} ${comp.height}`);
   for (const cam of cameras) {
     const slug = rawStreamName(cam);
-    lines.push(`comp-in ${base}/${slug}`);
+    // Straight to the camera. Reading these back out of mediamtx was a
+    // localhost round-trip for data mediamtx had itself just pulled.
+    lines.push(`comp-in ${cam.url}`);
     inputPaths.push(slug);
   }
 
@@ -1206,7 +1208,7 @@ export function buildStitchdConfig(
     for (const ref of extra.inputs)
       if (ref.stream === undefined && ref.name) {
         const cam = cameraByName.get(ref.name);
-        if (cam) aux.set(rawStreamName(cam), `${base}/${rawStreamName(cam)}`);
+        if (cam) aux.set(rawStreamName(cam), cam.url);
       }
   for (const [slug, url] of aux) {
     lines.push(`aux ${slug} ${url}`);
@@ -1221,7 +1223,7 @@ export function buildStitchdConfig(
   const audioChannels = config.cameras.filter((c) => c.transcribe);
   for (const cam of audioChannels) {
     const slug = rawStreamName(cam);
-    lines.push(`audio-ch ${slug} ${base}/${slug}`);
+    lines.push(`audio-ch ${slug} ${cam.url}`);
   }
 
   type P = { src: string; cx: number; cy: number; cw: number; ch: number; sw: number; sh: number; rot: number };

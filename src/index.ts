@@ -158,7 +158,12 @@ async function main() {
   const processes: ManagedProcess[] = [];
   const runtimeDir = process.env.RESTITCH_RUNTIME_DIR || "/tmp";
 
-  if (!values["no-mediamtx"]) {
+  // mediamtx is only started for the legacy ffmpeg compositor. With the native
+  // compositor stitchd serves RTSP, HLS and WebRTC itself and ingests straight
+  // from the cameras, so there is nothing left for mediamtx to do — running it
+  // would just re-introduce the localhost round-trip this replaced.
+  const useMediamtx = !values["no-mediamtx"] && !nativeCompositor;
+  if (useMediamtx) {
     const mtxConfigPath = await writeMediaMTXConfig(
       runtimeDir,
       config,
@@ -214,7 +219,13 @@ async function main() {
   // stitchd's own RTSP server. mediamtx still owns 8554, so this runs
   // alongside on 8555 until clients are cut over; both serve the same
   // encoded packets, so a client can be moved one at a time.
-  const stitchdRtspPort = nativeCompositor ? 8555 : 0;
+  // CUTOVER: stitchd owns the client-facing ports outright. mediamtx is no
+  // longer started for the native compositor, so 8554 (RTSP), 8889 (WHEP) and
+  // 8189 (media UDP mux) are stitchd's. 8189 in particular must not move — the
+  // office WAN forward points at exactly that port.
+  const stitchdRtspPort = nativeCompositor ? 8554 : 0;
+  const stitchdWebrtcPort = nativeCompositor ? 8889 : 0;
+  const stitchdWebrtcUdp = 8189;
 
   if (nativeCompositor) {
     // stitchd: ONE process produces every output. Rewrite its config file each
@@ -233,9 +244,20 @@ async function main() {
           "--config",
           stitchdConfPath,
           "--out",
-          config.output.base_url,
+          // Nothing to publish to any more: stitchd serves RTSP/HLS/WebRTC
+          // itself, so the outputs stay in-process instead of being pushed
+          // back out over localhost RTSP and read in again.
+          nativeCompositor ? "null" : config.output.base_url,
           ...(hlsDir ? ["--hls-dir", hlsDir] : []),
           ...(stitchdRtspPort ? ["--rtsp-port", String(stitchdRtspPort)] : []),
+          ...(stitchdWebrtcPort
+            ? [
+                "--webrtc-port", String(stitchdWebrtcPort),
+                "--webrtc-udp", String(stitchdWebrtcUdp),
+                ...config.webrtc.ice_servers.flatMap((u) => ["--ice-server", u]),
+                ...config.webrtc.additional_hosts.flatMap((h) => ["--webrtc-host", h]),
+              ]
+            : []),
         ],
         onStderr: stderrFilter("stitchd"),
         // Raw interleaved s16le from stitchd's audio mixer. Only meaningful
