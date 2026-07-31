@@ -104,7 +104,15 @@ discard bug dies in Stage 1.
    18 localhost hops for a doubled load on the NVR is a regression, even
    transiently. The NVR must never see more than one connection per camera.
 
-2. [ ] **HLS in stitchd** (libavformat `hls` muxer → disk, HTTP serves it).
+2. [x] **HLS in stitchd** — DONE (`08ea885` + `9baacdab`). stitchd clones the
+       already-encoded packets into an fMP4 HLS muxer (`--hls-dir`); the
+       existing Bun dashboard serves them at `/hls/<output>/index.m3u8`. No
+       second encode, no second HTTP server. Verified live: all 6 outputs
+       segmenting, HTTP 200 with correct MIME types, ffmpeg decodes the
+       HTTP-served playlist (exit 0), path traversal rejected (encoded forms
+       400, unencoded normalized to 404).
+       fMP4 not mpegts because `full` is HEVC. HLS is strictly secondary — an
+       HLS failure logs once and leaves RTSP running.
 
 3. [ ] **RTSP server in stitchd.** VLC / Home Assistant talk to stitchd directly.
 
@@ -177,7 +185,21 @@ and delete mediamtx in one step. Stage numbering below is unchanged; only the
 - [x] Caught a staging flaw while re-checking against the stated goal: the
       original Stage 1/2 split would have doubled NVR connections in between.
       Merged into one step.
-- [ ] Stage 1.
+- [x] Stage 1 (audio half) shipped and verified live.
+- [x] Stage 2 (HLS) shipped and verified live.
+- [ ] Stage 3: RTSP server in stitchd.
+
+## Gotcha for the discard verification
+
+The standing "never judge on a process younger than ~3 h" rule collides with
+active development: **every deploy restarts restitch and resets that clock.**
+Stage 1's structural fix (the discarding reader no longer exists) has therefore
+never had an uninterrupted 3 h window. To actually confirm it, stop deploying
+and leave the box alone for ~4 h, then check:
+
+```bash
+ssh sentinel 'docker inspect restitch --format "{{.State.StartedAt}}";   docker logs restitch --since 30m 2>&1 | grep -c "reader is too slow"'
+```
 
 ## Stream-copy accounting (the actual scoreboard)
 
