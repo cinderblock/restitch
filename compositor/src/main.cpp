@@ -43,6 +43,7 @@ extern "C" {
 
 #include <cuda_runtime.h>
 
+#include "audio.h"
 #include "cuda_composite.h"
 
 static volatile std::sig_atomic_t g_stop = 0;
@@ -79,7 +80,14 @@ struct Device {
 // ---- one threaded decoder; publishes its latest CUDA frame ----------------
 class Decoder {
 public:
-  int open(const char *url, AVBufferRef *device) {
+  // `tap` (optional) captures this input's audio; `need_video` false opens an
+  // audio-only input (a camera that feeds transcription but no composite).
+  // Both share ONE connection to the camera — opening a second one just for
+  // audio would double the load on the NVR, which is the thing this whole
+  // change exists to avoid.
+  int open(const char *url, AVBufferRef *device, audio::Tap *tap = nullptr,
+           bool need_video = true) {
+    tap_ = tap;
     AVDictionary *opt = nullptr;
     av_dict_set(&opt, "rtsp_transport", "tcp", 0);
     av_dict_set(&opt, "fflags", "nobuffer", 0);
@@ -90,6 +98,16 @@ public:
     av_dict_free(&opt);
     if (err < 0) { LOGF("open %s: %s", url, av_err(err).c_str()); return err; }
     if ((err = avformat_find_stream_info(fmt_, nullptr)) < 0) return err;
+
+    if (tap_) {
+      int ai = av_find_best_stream(fmt_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+      // A camera with no usable audio contributes silence rather than failing
+      // the pipeline — video is the primary job.
+      if (ai < 0 || !tap_->open(fmt_->streams[ai])) tap_ = nullptr;
+    }
+
+    if (!need_video) return 0;
+
     stream_ = av_find_best_stream(fmt_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
     if (stream_ < 0) return stream_;
     AVStream *st = fmt_->streams[stream_];
@@ -127,7 +145,15 @@ private:
     while (running_ && !g_stop) {
       int err = av_read_frame(fmt_, pkt);
       if (err < 0) break;
+      // Audio used to be discarded here; it is the same connection, so taking
+      // it costs one decode and no extra network read.
+      if (tap_ && pkt->stream_index == tap_->stream_index()) {
+        tap_->push_packet(pkt);
+        av_packet_unref(pkt);
+        continue;
+      }
       if (pkt->stream_index != stream_) { av_packet_unref(pkt); continue; }
+      if (!dec_) { av_packet_unref(pkt); continue; } // audio-only input
       err = avcodec_send_packet(dec_, pkt);
       av_packet_unref(pkt);
       if (err < 0) continue;
@@ -159,6 +185,7 @@ private:
   std::atomic<bool> running_{true};
   std::mutex mu_;
   AVFrame *latest_ = nullptr;
+  audio::Tap *tap_ = nullptr; // not owned
 };
 
 // ---- one output encoder + muxer -------------------------------------------
@@ -332,6 +359,7 @@ private:
 //   comp-dim <w> <h>          ; resolved composite dimensions
 //   comp-in <url>             ; one per composite (stacked) camera, in order
 //   aux <name> <url>          ; a camera used by extra composites
+//   audio-ch <name> <url>     ; a transcription channel, IN ORDER (see below)
 //   out <name> <codec> <maxrate>   ; begins an output (maxrate 0 = uncapped)
 //   piece <src> <cx> <cy> <cw> <ch> <sw> <sh> <rot>  ; 1+ per out (vstacked)
 // `src` = "composite" | an aux name | a previously-declared output name.
@@ -350,6 +378,10 @@ struct Config {
   std::vector<std::string> comp_in;
   std::vector<std::pair<std::string, std::string>> aux; // name,url
   std::vector<OutCfg> outs;
+  // Transcription channels, IN ORDER. The consumer interleaves by this order,
+  // so it must not be reordered. A URL already opened for video reuses that
+  // connection; anything else opens audio-only.
+  std::vector<std::pair<std::string, std::string>> audio_ch; // name,url
 };
 
 bool parse_config(const char *path, Config &c) {
@@ -365,6 +397,11 @@ bool parse_config(const char *path, Config &c) {
     else if (kw == "comp-dim") ls >> c.comp_w >> c.comp_h;
     else if (kw == "comp-in") { std::string u; ls >> u; c.comp_in.push_back(u); }
     else if (kw == "aux") { std::string n, u; ls >> n >> u; c.aux.push_back({n, u}); }
+    else if (kw == "audio-ch") {
+      std::string n, u;
+      ls >> n >> u;
+      c.audio_ch.push_back({n, u});
+    }
     else if (kw == "out") {
       OutCfg o;
       ls >> o.name >> o.codec >> o.maxrate;
@@ -418,6 +455,25 @@ int run(const Config &cfg, const char *dest, long long max_frames,
         if (p.src == a.first) need_aux[a.first] = true;
     }
 
+  // ---- transcription taps ------------------------------------------------
+  // Built BEFORE any decoder so a channel can ride an existing connection.
+  // Order is config order and defines the interleave the consumer expects.
+  std::vector<std::unique_ptr<audio::Tap>> taps;
+  std::vector<audio::Tap *> tap_order;
+  std::map<std::string, audio::Tap *> tap_by_url;
+  for (auto &ch : cfg.audio_ch) {
+    taps.push_back(std::make_unique<audio::Tap>(ch.first));
+    tap_order.push_back(taps.back().get());
+    tap_by_url[ch.second] = taps.back().get();
+  }
+  auto tap_for = [&](const std::string &url) -> audio::Tap * {
+    auto it = tap_by_url.find(url);
+    if (it == tap_by_url.end()) return nullptr;
+    audio::Tap *t = it->second;
+    tap_by_url.erase(it); // claimed — never attach the same channel twice
+    return t;
+  };
+
   // composite decoders
   const int N = (int)cfg.comp_in.size();
   std::vector<Decoder *> decs;
@@ -425,7 +481,7 @@ int run(const Config &cfg, const char *dest, long long max_frames,
   if (need_comp) {
     for (int i = 0; i < N; ++i) {
       auto *d = new Decoder();
-      if (d->open(cfg.comp_in[i].c_str(), dev.ref) < 0) {
+      if (d->open(cfg.comp_in[i].c_str(), dev.ref, tap_for(cfg.comp_in[i])) < 0) {
         LOGF("comp decoder %d open failed", i);
         return 1;
       }
@@ -440,13 +496,40 @@ int run(const Config &cfg, const char *dest, long long max_frames,
   for (auto &a : cfg.aux) {
     if (!need_aux[a.first]) continue;
     auto *d = new Decoder();
-    if (d->open(a.second.c_str(), dev.ref) < 0) {
+    if (d->open(a.second.c_str(), dev.ref, tap_for(a.second)) < 0) {
       LOGF("aux %s open failed", a.first.c_str());
       return 1;
     }
     d->start();
     auxd[a.first] = d;
     auxf[a.first] = av_frame_alloc();
+  }
+
+  // ---- audio-only inputs + mixer ------------------------------------------
+  // Whatever is left in tap_by_url is a camera nobody decodes video for
+  // (today: blue and bullet). Open those audio-only — no decoder, no GPU.
+  std::vector<Decoder *> audio_only;
+  for (auto &kv : tap_by_url) {
+    auto *d = new Decoder();
+    if (d->open(kv.first.c_str(), dev.ref, kv.second, /*need_video=*/false) < 0) {
+      // Non-fatal: that channel goes silent, the rest of the system is fine.
+      LOGF("audio-only input %s open failed — channel silent",
+           kv.second->name().c_str());
+      delete d;
+      continue;
+    }
+    d->start();
+    audio_only.push_back(d);
+  }
+  std::unique_ptr<audio::Mixer> mixer;
+  if (!tap_order.empty()) {
+    // stdout carries the interleaved PCM; all logging goes to stderr, so the
+    // two never collide. The supervisor pipes this straight into the existing
+    // transcription consumer.
+    mixer = std::make_unique<audio::Mixer>(1, tap_order);
+    mixer->start();
+    LOGF("audio: %zu channels -> stdout (%d Hz s16le interleaved), %zu audio-only inputs",
+         tap_order.size(), audio::kSampleRate, audio_only.size());
   }
   LOGF("decoders: %d composite + %zu aux; cold start...", need_comp ? N : 0,
        auxd.size());
