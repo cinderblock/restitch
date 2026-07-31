@@ -114,7 +114,13 @@ discard bug dies in Stage 1.
        fMP4 not mpegts because `full` is HEVC. HLS is strictly secondary — an
        HLS failure logs once and leaves RTSP running.
 
-3. [ ] **RTSP server in stitchd.** VLC / Home Assistant talk to stitchd directly.
+3. [x] **RTSP server in stitchd** — DONE (`da0e008` + `e860487`). Running on
+       **8555** alongside mediamtx's 8554, both serving the same encoded
+       packets, so clients cut over one at a time instead of in a flag day.
+       libavformat's rtp muxer does packetization; one muxer per client; TCP
+       interleaved only; a busy client is skipped, never queued behind.
+       Verified live: `rtsp://sentinel:8555/entry` reports h264 1200x1352 @30
+       and decodes cleanly, as does `the-field`.
 
 4. [ ] **WebRTC via libdatachannel** + WHEP. Preserve the three contracts above.
    Validate off-LAN on iOS *before* proceeding.
@@ -187,7 +193,21 @@ and delete mediamtx in one step. Stage numbering below is unchanged; only the
       Merged into one step.
 - [x] Stage 1 (audio half) shipped and verified live.
 - [x] Stage 2 (HLS) shipped and verified live.
-- [ ] Stage 3: RTSP server in stitchd.
+- [x] Stage 3 (RTSP) shipped and verified live on 8555.
+- [ ] Stage 4: WebRTC (the hard one — carries the public field stream).
+
+## Cutover still owed (Stages 2-3 run in parallel with mediamtx today)
+
+HLS and RTSP are currently served by BOTH stitchd and mediamtx. That is
+deliberate — it makes cutover incremental — but it is duplicated work until
+consumers are repointed:
+
+| Consumer | today | after cutover |
+| --- | --- | --- |
+| VLC / Home Assistant | `rtsp://sentinel:8554/<name>` | `:8555` |
+| pFMS scoreboard (HLS) | mediamtx `:8890` | dashboard `/hls/<name>/index.m3u8` |
+
+Repointing is an ops-repo config change, not a restitch one.
 
 ## Gotcha for the discard verification
 
