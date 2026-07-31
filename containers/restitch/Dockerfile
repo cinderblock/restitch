@@ -102,8 +102,29 @@ RUN cd /opt/ffmpeg-src && \
 # the static libav*, headers, pkgconfig, nvcc and NPP already in place.
 FROM ffmpeg-builder AS compositor-builder
 RUN apt-get update -qq && \
-    apt-get install -y -qq --no-install-recommends cmake && \
+    apt-get install -y -qq --no-install-recommends cmake git libssl-dev && \
     rm -rf /var/lib/apt/lists/*
+
+# libdatachannel: ICE + DTLS-SRTP + SDP for stitchd's WebRTC output.
+# Deliberately NOT hand-rolled — DTLS-SRTP is the one piece of this project
+# where a subtle mistake is a security bug rather than a glitch.
+# Pinned to a tag so a rebuild can't silently change the transport stack.
+# Static, and with the bundled libjuice ICE backend: libjuice is what provides
+# enableIceUdpMux, i.e. many peers sharing ONE UDP port — required because the
+# office WAN forward points at exactly 8189.
+ARG LIBDATACHANNEL_VERSION=v0.22.5
+RUN git clone --depth 1 --branch "${LIBDATACHANNEL_VERSION}" --recurse-submodules \
+        https://github.com/paullouisageneau/libdatachannel.git /tmp/libdatachannel && \
+    cmake -S /tmp/libdatachannel -B /tmp/libdatachannel/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/opt/libdatachannel \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DNO_EXAMPLES=ON -DNO_TESTS=ON \
+        -DUSE_GNUTLS=OFF -DUSE_NICE=OFF && \
+    cmake --build /tmp/libdatachannel/build -j"$(nproc)" && \
+    cmake --install /tmp/libdatachannel/build && \
+    rm -rf /tmp/libdatachannel
+
 COPY compositor /opt/compositor
 RUN cmake -S /opt/compositor -B /opt/compositor/build \
         -DCMAKE_BUILD_TYPE=Release \

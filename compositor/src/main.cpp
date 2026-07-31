@@ -45,6 +45,10 @@ extern "C" {
 
 #include <cuda_runtime.h>
 
+#if STITCHD_WEBRTC
+#include <rtc/rtc.hpp>
+#endif
+
 #include "audio.h"
 #include "rtsp.h"
 #include "cuda_composite.h"
@@ -533,6 +537,11 @@ int selftest() {
   ok &= av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr,
                                0) >= 0;
   av_buffer_unref(&dev);
+#if STITCHD_WEBRTC
+  std::printf("webrtc: libdatachannel linked (media=%d)\n", RTC_ENABLE_MEDIA);
+#else
+  std::printf("webrtc: NOT COMPILED IN\n");
+#endif
   std::printf("CUDA devices=%d  %s\n", n, ok ? "PHASE-1A OK" : "FAILED");
   return ok ? 0 : 1;
 }
