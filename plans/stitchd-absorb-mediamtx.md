@@ -1,4 +1,45 @@
-# Absorb mediamtx into stitchd
+# Absorb mediamtx into stitchd — DONE (cutover 2026-07-31)
+
+## Status: mediamtx is gone
+
+Verified on sentinel after the cutover deploy (`4b46911`):
+
+```
+mediamtx processes           0
+stitchd processes            1
+NVR connections             10   (exactly one per camera)
+internal localhost RTSP      0   (was ~24)
+```
+
+All six outputs serve from stitchd over RTSP :8554 — full hevc 7560x2688,
+full-low h264 3600x1280, the-field 4096x1216, john 3024x1344, entry 1200x1352,
+all-field h264 3686x3290. HLS 200 at `/hls/<name>/index.m3u8`. Audio 10/10
+channels, lag 0 s. WHEP POST returns 201 with media on :8189 carrying BOTH the
+`stream.tomsawyerlabs.com` host candidate and the STUN srflx candidate.
+
+| Goal | Before | After |
+| --- | --- | --- |
+| single app | 5 processes | 3 (stitchd, whisper-server, bun) |
+| internal stream copies | ~24 | **0** |
+| mediamtx roles | 6 | 0 |
+
+## STILL OWED
+
+1. **Control API / dashboard.** The dashboard reads mediamtx's `/v3/*` for its
+   stream table and snapshots `raw/*` paths that no longer exist, so those
+   panels are degraded. Streams themselves are unaffected.
+2. **Off-LAN iOS validation of WebRTC.** The answer SDP carries the right
+   candidates, but nobody has actually loaded the public field stream from an
+   iPhone on cellular since the cutover. That is the one externally-visible
+   thing that can still be wrong.
+3. **`raw/*` per-camera streams are gone.** Nothing external consumed them
+   (~6 sessions per 6 h) but Home Assistant may want them back; stitchd would
+   have to republish.
+4. **The 4 h discard check** is now moot in its original form — the reader that
+   was "too slow" no longer exists, and neither does the server that complained.
+
+---
+
 
 ## Goal
 
