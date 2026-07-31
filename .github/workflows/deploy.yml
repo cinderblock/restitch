@@ -5,6 +5,10 @@ on:
     branches: [master]
     paths:
       - src/**
+      # stitchd's sources. The Dockerfile builds them into the image, so a
+      # compositor-only change is a real deploy — without this it silently
+      # never ships and the box keeps running the previous binary.
+      - compositor/**
       - containers/restitch/**
       - servers/**
       - package.json
