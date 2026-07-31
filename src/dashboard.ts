@@ -982,7 +982,9 @@ async function grabSnapshot(
 export function startDashboard(
   dashboard: Dashboard,
   transcription?: { ring: RingBuffer; stats: LiveStats },
-  media?: { ffmpegPath: string; baseUrl: string }
+  media?: { ffmpegPath: string; baseUrl: string },
+  /** Directory stitchd writes HLS segments into; served at /hls/<name>/... */
+  hlsDir?: string
 ): Server {
   const apiBase = dashboard.mediamtx_api_url.replace(/\/$/, "");
   const { hostname, port } = parseAddress(dashboard.address);
@@ -1015,6 +1017,35 @@ export function startDashboard(
     port,
     async fetch(req) {
       const url = new URL(req.url);
+
+      // HLS: /hls/<output>/<file>. stitchd writes fMP4 segments to disk and
+      // we serve them from the HTTP server we already run — no second server,
+      // and no extra copy of the media (the files ARE the stream).
+      if (hlsDir && url.pathname.startsWith("/hls/")) {
+        const rel = decodeURIComponent(url.pathname.slice("/hls/".length));
+        // Path traversal guard: reject anything that escapes hlsDir. These
+        // segments are reachable from the LAN, so ".." must not become a
+        // file-read primitive over the whole container.
+        if (rel.includes("..") || rel.startsWith("/")) {
+          return new Response("bad path", { status: 400 });
+        }
+        const file = Bun.file(`${hlsDir}/${rel}`);
+        if (!(await file.exists())) return new Response("not found", { status: 404 });
+        const type = rel.endsWith(".m3u8")
+          ? "application/vnd.apple.mpegurl"
+          : rel.endsWith(".mp4") || rel.endsWith(".m4s")
+            ? "video/mp4"
+            : "application/octet-stream";
+        return new Response(file, {
+          headers: {
+            "content-type": type,
+            // Playlists change every segment; segments are immutable once
+            // written, but the rolling window deletes them, so keep it short.
+            "cache-control": rel.endsWith(".m3u8") ? "no-cache" : "max-age=10",
+            "access-control-allow-origin": "*",
+          },
+        });
+      }
 
       // Snapshot: /api/snapshot/<path> (path may contain a slash)
       if (url.pathname.startsWith("/api/snapshot/")) {

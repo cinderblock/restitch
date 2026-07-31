@@ -206,6 +206,11 @@ async function main() {
   // answer just builds a backlog.
   const pcmSink: PcmSink = { write: null };
 
+  // stitchd writes fMP4 HLS segments here and the dashboard serves them at
+  // /hls/<output>/index.m3u8 — one step toward taking HLS off mediamtx.
+  // Only the native compositor can produce them.
+  const hlsDir = nativeCompositor ? `${runtimeDir}/hls` : undefined;
+
   if (nativeCompositor) {
     // stitchd: ONE process produces every output. Rewrite its config file each
     // (re)spawn (cheap; keeps behavior identical to the ffmpeg factory which
@@ -224,6 +229,7 @@ async function main() {
           stitchdConfPath,
           "--out",
           config.output.base_url,
+          ...(hlsDir ? ["--hls-dir", hlsDir] : []),
         ],
         onStderr: stderrFilter("stitchd"),
         // Raw interleaved s16le from stitchd's audio mixer. Only meaningful
@@ -304,10 +310,15 @@ async function main() {
   // /api/transcriptions + /api/transcription-stats from the in-process
   // ring buffer)
   const dashServer = config.dashboard.enabled
-    ? startDashboard(config.dashboard, transcription, {
-        ffmpegPath: config.ffmpeg_path,
-        baseUrl: config.output.base_url,
-      })
+    ? startDashboard(
+        config.dashboard,
+        transcription,
+        {
+          ffmpegPath: config.ffmpeg_path,
+          baseUrl: config.output.base_url,
+        },
+        hlsDir
+      )
     : null;
   if (dashServer) {
     console.log(
