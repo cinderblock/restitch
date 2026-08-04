@@ -67,6 +67,14 @@ public:
 
   int client_count() const { return clients_.load(); }
 
+  // Snapshot of who is currently playing, for the dashboard.
+  struct SessionInfo {
+    std::string peer;
+    std::string stream;
+    std::string transport; // "tcp" | "udp"
+  };
+  std::vector<SessionInfo> sessions() const;
+
   // Public because the AVIO write callback (a free function, as libavformat
   // requires) needs the complete type.
   struct Session;
@@ -84,7 +92,7 @@ private:
 
   std::map<std::string, StreamInfo> streams_; // built before start(), then read-only
 
-  std::mutex sessions_mu_;
+  mutable std::mutex sessions_mu_;
   std::vector<std::shared_ptr<Session>> sessions_;
 };
 

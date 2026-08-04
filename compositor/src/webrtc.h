@@ -67,6 +67,12 @@ public:
 
   int viewer_count() const { return viewers_.load(); }
 
+  struct ViewerInfo {
+    std::string stream;
+    std::string state;
+  };
+  std::vector<ViewerInfo> viewer_list() const;
+
 private:
   void handle_http(int fd);
 

@@ -354,6 +354,16 @@ void Server::handle_http(int fd) {
   ::close(fd);
 }
 
+std::vector<Server::ViewerInfo> Server::viewer_list() const {
+  std::vector<ViewerInfo> out;
+  std::lock_guard<std::mutex> lk(impl_->viewers_mu);
+  for (const auto &v : impl_->viewers) {
+    if (v->dead) continue;
+    out.push_back({v->stream, v->open ? "playing" : "connecting"});
+  }
+  return out;
+}
+
 void Server::broadcast(const std::string &name, const AVPacket *pkt,
                        AVRational time_base) {
   std::vector<std::shared_ptr<Viewer>> targets;

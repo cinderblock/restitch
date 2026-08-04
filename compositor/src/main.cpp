@@ -761,6 +761,24 @@ int run(const Config &cfg, const char *dest, long long max_frames,
           << "\",\"width\":" << w->w << ",\"height\":" << w->h
           << ",\"dropped\":" << w->dropped() << "}";
       }
+      o << "],\"sessions\":[";
+      bool sfirst = true;
+      if (g_rtsp) {
+        for (const auto &si : g_rtsp->sessions()) {
+          if (!sfirst) o << ",";
+          sfirst = false;
+          o << "{\"peer\":\"" << si.peer << "\",\"stream\":\"" << si.stream
+            << "\",\"via\":\"rtsp/" << si.transport << "\"}";
+        }
+      }
+      if (g_webrtc) {
+        for (const auto &vi : g_webrtc->viewer_list()) {
+          if (!sfirst) o << ",";
+          sfirst = false;
+          o << "{\"peer\":\"webrtc\",\"stream\":\"" << vi.stream
+            << "\",\"via\":\"webrtc/" << vi.state << "\"}";
+        }
+      }
       o << "],\"rtspClients\":" << (g_rtsp ? g_rtsp->client_count() : 0)
         << ",\"webrtcViewers\":" << (g_webrtc ? g_webrtc->viewer_count() : 0)
         << "}";

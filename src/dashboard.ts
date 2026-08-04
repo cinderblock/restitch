@@ -993,15 +993,22 @@ export function startDashboard(
   // status on the WHEP HTTP port. Shaped like mediamtx's /v3/paths/list so the
   // UI reads from a different source without a rewrite.
   const stitchdApi = statusUrl ?? null;
+  // Cache of the last status payload so the sessions endpoint can serve from
+  // the same fetch the paths table already makes, instead of hitting stitchd
+  // twice per poll.
+  let lastSessions: { peer: string; stream: string; via: string }[] = [];
+
   const fetchPaths = async (): Promise<Response> => {
     if (!stitchdApi) return fetch(`${apiBase}/v3/paths/list`);
     const r = await fetch(stitchdApi);
     if (!r.ok) return r;
     const j = (await r.json()) as {
       items?: { name: string; ready?: boolean; codec?: string; width?: number; height?: number; dropped?: number }[];
+      sessions?: { peer: string; stream: string; via: string }[];
       rtspClients?: number;
       webrtcViewers?: number;
     };
+    lastSessions = j.sessions ?? [];
     const items = (j.items ?? []).map((it) => ({
       name: it.name,
       ready: it.ready ?? true,
@@ -1106,10 +1113,23 @@ export function startDashboard(
         case "/api/paths":
           return fetchPaths();
         case "/api/rtsp":
-          // No mediamtx to ask any more. stitchd exposes aggregate counts via
-          // /api/status; per-session detail is not tracked yet, so return an
-          // empty list rather than proxying to a server that is gone.
-          if (stitchdApi) return new Response('{"items":[]}', { headers: { "content-type": "application/json" } });
+          if (stitchdApi) {
+            // Served from the status payload the paths table already fetched.
+            await fetchPaths();
+            return new Response(
+              JSON.stringify({
+                items: lastSessions.map((x) => ({
+                  remoteAddr: x.peer,
+                  state: "read",
+                  path: x.stream,
+                  transport: x.via,
+                  bytesReceived: 0,
+                  bytesSent: 0,
+                })),
+              }),
+              { headers: { "content-type": "application/json" } }
+            );
+          }
           return proxyJson(`${apiBase}/v3/rtspsessions/list`);
         case "/api/webrtc":
           // No mediamtx to ask any more. stitchd exposes aggregate counts via

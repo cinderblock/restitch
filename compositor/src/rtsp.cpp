@@ -63,6 +63,7 @@ struct Server::Session {
   int fd = -1;
   std::string stream;
   int rtp_channel = 0;
+  std::string peer;
   bool interleaved = true;
   int server_rtp_port = 0;
   AVFormatContext *rtp = nullptr;
@@ -268,6 +269,14 @@ void Server::serve_conn(int fd) {
         sess->fd = fd;
         sess->stream = name;
         sess->interleaved = want_tcp;
+        {
+          sockaddr_in pa{};
+          socklen_t pl = sizeof(pa);
+          char ipbuf[INET_ADDRSTRLEN] = "?";
+          if (::getpeername(fd, (sockaddr *)&pa, &pl) == 0)
+            ::inet_ntop(AF_INET, &pa.sin_addr, ipbuf, sizeof(ipbuf));
+          sess->peer = std::string(ipbuf) + ":" + std::to_string(ntohs(pa.sin_port));
+        }
 
         int ch = 0, client_rtp = 0;
         if (want_tcp) {
@@ -374,6 +383,16 @@ void Server::serve_conn(int fd) {
   }
   ::close(fd);
   --clients_;
+}
+
+std::vector<Server::SessionInfo> Server::sessions() const {
+  std::vector<SessionInfo> out;
+  std::lock_guard<std::mutex> lk(sessions_mu_);
+  for (const auto &s : sessions_) {
+    if (s->dead) continue;
+    out.push_back({s->peer, s->stream, s->interleaved ? "tcp" : "udp"});
+  }
+  return out;
 }
 
 void Server::broadcast(const std::string &name, const AVPacket *pkt) {
