@@ -1118,7 +1118,9 @@ export function startDashboard(
             await fetchPaths();
             return new Response(
               JSON.stringify({
-                items: lastSessions.map((x) => ({
+                items: lastSessions
+                  .filter((x) => x.via.startsWith("rtsp"))
+                  .map((x) => ({
                   remoteAddr: x.peer,
                   state: "read",
                   path: x.stream,
@@ -1132,10 +1134,23 @@ export function startDashboard(
           }
           return proxyJson(`${apiBase}/v3/rtspsessions/list`);
         case "/api/webrtc":
-          // No mediamtx to ask any more. stitchd exposes aggregate counts via
-          // /api/status; per-session detail is not tracked yet, so return an
-          // empty list rather than proxying to a server that is gone.
-          if (stitchdApi) return new Response('{"items":[]}', { headers: { "content-type": "application/json" } });
+          if (stitchdApi) {
+            await fetchPaths();
+            return new Response(
+              JSON.stringify({
+                items: lastSessions
+                  .filter((x) => x.via.startsWith("webrtc"))
+                  .map((x) => ({
+                    remoteAddr: x.peer,
+                    state: x.via.split("/")[1] ?? "unknown",
+                    path: x.stream,
+                    bytesReceived: 0,
+                    bytesSent: 0,
+                  })),
+              }),
+              { headers: { "content-type": "application/json" } }
+            );
+          }
           return proxyJson(`${apiBase}/v3/webrtcsessions/list`);
         case "/api/hls":
           // No mediamtx to ask any more. stitchd exposes aggregate counts via
