@@ -41,6 +41,14 @@ bool write_all(int fd, const uint8_t *p, size_t n) {
   return true;
 }
 
+// Even ports for RTP; RTCP conventionally takes the odd one above.
+int next_udp_port() {
+  static std::atomic<int> next{20000};
+  int p = next.fetch_add(2);
+  if (p > 20998) { next = 20000; p = 20000; }
+  return p;
+}
+
 std::string trim(const std::string &s) {
   size_t a = s.find_first_not_of(" \t\r\n");
   if (a == std::string::npos) return "";
@@ -55,6 +63,8 @@ struct Server::Session {
   int fd = -1;
   std::string stream;
   int rtp_channel = 0;
+  bool interleaved = true;
+  int server_rtp_port = 0;
   AVFormatContext *rtp = nullptr;
   AVStream *st = nullptr;
   std::mutex mu;          // serializes writes to fd + muxer
@@ -64,8 +74,12 @@ struct Server::Session {
   ~Session() {
     if (rtp) {
       if (rtp->pb) {
-        av_freep(&rtp->pb->buffer);
-        avio_context_free(&rtp->pb);
+        if (interleaved) {
+          av_freep(&rtp->pb->buffer);
+          avio_context_free(&rtp->pb);
+        } else {
+          avio_closep(&rtp->pb); // libavformat owns the UDP socket
+        }
       }
       avformat_free_context(rtp);
     }
@@ -242,42 +256,88 @@ void Server::serve_conn(int fd) {
       }
 
       if (method == "SETUP") {
-        if (transport.find("TCP") == std::string::npos &&
-            transport.find("interleaved") == std::string::npos) {
-          // UDP would need a second socket and NAT handling for no benefit
-          // here; every client we serve supports interleaved TCP.
-          reply("461 Unsupported Transport", cseq);
-          continue;
-        }
-        int ch = 0;
-        size_t ip = transport.find("interleaved=");
-        if (ip != std::string::npos) ch = std::atoi(transport.c_str() + ip + 12);
+        // VLC and most players ask for plain UDP FIRST and only fall back to
+        // interleaved TCP if the server refuses. mediamtx was configured
+        // tcp-only, so clients never got the choice and always ended up on
+        // TCP; answering 461 here instead made VLC fail outright. Serve both.
+        const bool want_tcp =
+            transport.find("TCP") != std::string::npos ||
+            transport.find("interleaved") != std::string::npos;
 
         sess = std::make_shared<Session>();
         sess->fd = fd;
         sess->stream = name;
-        sess->rtp_channel = ch;
+        sess->interleaved = want_tcp;
 
-        if (avformat_alloc_output_context2(&sess->rtp, nullptr, "rtp", nullptr) < 0) {
+        int ch = 0, client_rtp = 0;
+        if (want_tcp) {
+          size_t ip = transport.find("interleaved=");
+          if (ip != std::string::npos) ch = std::atoi(transport.c_str() + ip + 12);
+          sess->rtp_channel = ch;
+        } else {
+          size_t cp = transport.find("client_port=");
+          client_rtp = cp == std::string::npos
+                           ? 0
+                           : std::atoi(transport.c_str() + cp + 12);
+          if (client_rtp <= 0) {
+            reply("461 Unsupported Transport", cseq);
+            sess.reset();
+            continue;
+          }
+        }
+
+        std::string url;
+        if (!want_tcp) {
+          // Media goes to the peer of THIS control connection.
+          sockaddr_in pa{};
+          socklen_t pl = sizeof(pa);
+          char ipbuf[INET_ADDRSTRLEN] = "127.0.0.1";
+          if (::getpeername(fd, (sockaddr *)&pa, &pl) == 0)
+            ::inet_ntop(AF_INET, &pa.sin_addr, ipbuf, sizeof(ipbuf));
+          sess->server_rtp_port = next_udp_port();
+          url = "rtp://" + std::string(ipbuf) + ":" +
+                std::to_string(client_rtp) +
+                "?localrtpport=" + std::to_string(sess->server_rtp_port) +
+                "&pkt_size=1200";
+        }
+
+        if (avformat_alloc_output_context2(&sess->rtp, nullptr, "rtp",
+                                           want_tcp ? nullptr : url.c_str()) < 0) {
           reply("500 Internal Server Error", cseq); sess.reset(); continue;
         }
         sess->st = avformat_new_stream(sess->rtp, nullptr);
         avcodec_parameters_copy(sess->st->codecpar, it->second.par);
         sess->st->time_base = it->second.time_base;
 
-        const int kBuf = 1500; // one MTU per RTP packet
-        uint8_t *abuf = (uint8_t *)av_malloc(kBuf);
-        sess->rtp->pb = avio_alloc_context(abuf, kBuf, 1, sess.get(), nullptr,
-                                           session_write, nullptr);
-        sess->rtp->pb->max_packet_size = kBuf;
+        if (want_tcp) {
+          const int kBuf = 1500; // one MTU per RTP packet
+          uint8_t *abuf = (uint8_t *)av_malloc(kBuf);
+          sess->rtp->pb = avio_alloc_context(abuf, kBuf, 1, sess.get(), nullptr,
+                                             session_write, nullptr);
+          sess->rtp->pb->max_packet_size = kBuf;
+        } else if (avio_open(&sess->rtp->pb, url.c_str(), AVIO_FLAG_WRITE) < 0) {
+          RLOGF("udp open failed for %s", url.c_str());
+          reply("461 Unsupported Transport", cseq); sess.reset(); continue;
+        }
+
         if (avformat_write_header(sess->rtp, nullptr) < 0) {
           reply("500 Internal Server Error", cseq); sess.reset(); continue;
         }
 
-        reply("200 OK", cseq,
-              "Transport: RTP/AVP/TCP;unicast;interleaved=" +
-                  std::to_string(ch) + "-" + std::to_string(ch + 1) +
-                  "\r\nSession: " + session_id + "\r\n");
+        if (want_tcp) {
+          reply("200 OK", cseq,
+                "Transport: RTP/AVP/TCP;unicast;interleaved=" +
+                    std::to_string(ch) + "-" + std::to_string(ch + 1) +
+                    "\r\nSession: " + session_id + "\r\n");
+        } else {
+          reply("200 OK", cseq,
+                "Transport: RTP/AVP;unicast;client_port=" +
+                    std::to_string(client_rtp) + "-" +
+                    std::to_string(client_rtp + 1) + ";server_port=" +
+                    std::to_string(sess->server_rtp_port) + "-" +
+                    std::to_string(sess->server_rtp_port + 1) +
+                    "\r\nSession: " + session_id + "\r\n");
+        }
         continue;
       }
 
