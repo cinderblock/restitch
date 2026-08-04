@@ -63,6 +63,12 @@ struct Server::Session {
   int fd = -1;
   std::string stream;
   int rtp_channel = 0;
+  // Time base the encoder produces packets in. The rtp muxer REWRITES
+  // st->time_base to 1/90000 inside avformat_write_header, so packets must be
+  // rescaled from this into the stream's base at send time — feeding raw
+  // encoder timestamps makes every frame land ~1 tick apart instead of 3000,
+  // which is exactly the "one frame then dead" symptom in VLC.
+  AVRational src_tb{1, 90000};
   std::string peer;
   bool interleaved = true;
   int server_rtp_port = 0;
@@ -317,6 +323,7 @@ void Server::serve_conn(int fd) {
         sess->st = avformat_new_stream(sess->rtp, nullptr);
         avcodec_parameters_copy(sess->st->codecpar, it->second.par);
         sess->st->time_base = it->second.time_base;
+        sess->src_tb = it->second.time_base;
 
         if (want_tcp) {
           const int kBuf = 1500; // one MTU per RTP packet
@@ -412,6 +419,8 @@ void Server::broadcast(const std::string &name, const AVPacket *pkt) {
     AVPacket *c = av_packet_clone(pkt);
     if (!c) continue;
     c->stream_index = 0;
+    // st->time_base is whatever write_header settled on (1/90000 for RTP).
+    av_packet_rescale_ts(c, s->src_tb, s->st->time_base);
     if (av_write_frame(s->rtp, c) < 0) s->dead = true;
     av_packet_free(&c);
   }
