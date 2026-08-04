@@ -416,9 +416,17 @@ void Server::broadcast(const std::string &name, const AVPacket *pkt) {
     // it. A stuck reader must only ever starve itself.
     if (!lk.owns_lock()) continue;
     if (s->dead) continue;
+    // A packet with no PTS rescales to garbage and lands as one wild RTP
+    // timestamp among otherwise perfect 3000-tick steps — enough of a
+    // discontinuity for a player to give up right after joining. Fall back to
+    // DTS, and drop the packet if neither is set rather than emit a lie.
+    int64_t pts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+    if (pts == AV_NOPTS_VALUE) continue;
+
     AVPacket *c = av_packet_clone(pkt);
     if (!c) continue;
     c->stream_index = 0;
+    c->pts = c->dts = pts;
     // st->time_base is whatever write_header settled on (1/90000 for RTP).
     av_packet_rescale_ts(c, s->src_tb, s->st->time_base);
     if (av_write_frame(s->rtp, c) < 0) s->dead = true;
