@@ -229,12 +229,23 @@ void Server::serve_conn(int fd) {
           size_t sl = x.find_last_of('/');
           return sl == std::string::npos ? x : x.substr(sl + 1);
         };
-        name = last_seg(u);
-        if (name.rfind("streamid=", 0) == 0 || name.rfind("trackID=", 0) == 0 ||
-            name.rfind("track", 0) == 0) {
+        // Drop the SDP control suffix if present, then take EVERYTHING after
+        // the host as the name — stream names can contain slashes
+        // (raw/bay-1), so using only the last segment would look up "bay-1".
+        std::string tail = last_seg(u);
+        if (tail.rfind("streamid=", 0) == 0 || tail.rfind("trackID=", 0) == 0 ||
+            tail.rfind("track", 0) == 0) {
           size_t sl = u.find_last_of('/');
-          if (sl != std::string::npos) name = last_seg(u.substr(0, sl));
+          if (sl != std::string::npos) u = u.substr(0, sl);
         }
+        // Strip scheme://host[:port] if the client sent an absolute URI.
+        size_t sch = u.find("://");
+        if (sch != std::string::npos) {
+          size_t host_end = u.find('/', sch + 3);
+          u = host_end == std::string::npos ? std::string() : u.substr(host_end);
+        }
+        while (!u.empty() && u.front() == '/') u.erase(0, 1);
+        name = u;
       }
 
       if (method == "OPTIONS") {

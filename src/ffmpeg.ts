@@ -1220,6 +1220,14 @@ export function buildStitchdConfig(
   // so this MUST match startTranscription's `config.cameras.filter(transcribe)`
   // — same source array, same filter, no sort. A camera already listed above
   // rides that existing connection; the rest open audio-only inside stitchd.
+  // Republish EVERY camera verbatim at raw/<slug>. Home Assistant (and
+  // anything else) then reads per-camera streams from stitchd instead of
+  // opening a second connection to the NVR, which is the whole point of
+  // pulling each camera exactly once.
+  for (const cam of config.cameras) {
+    lines.push(`raw ${rawStreamName(cam).replace(/^raw\//, "")} ${cam.url}`);
+  }
+
   const audioChannels = config.cameras.filter((c) => c.transcribe);
   for (const cam of audioChannels) {
     const slug = rawStreamName(cam);

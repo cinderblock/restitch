@@ -126,9 +126,18 @@ public:
       if (ai < 0 || !tap_->open(fmt_->streams[ai])) tap_ = nullptr;
     }
 
-    if (!need_video) return 0;
-
+    // Locate the video stream even when we will not decode it: raw/*
+    // passthrough republishes the ORIGINAL packets, so an audio-only input
+    // still needs its video stream index and parameters.
     stream_ = av_find_best_stream(fmt_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (stream_ >= 0) {
+      AVStream *vs = fmt_->streams[stream_];
+      vpar_ = avcodec_parameters_alloc();
+      avcodec_parameters_copy(vpar_, vs->codecpar);
+      vtb_ = vs->time_base;
+    }
+
+    if (!need_video) return 0;
     if (stream_ < 0) return stream_;
     AVStream *st = fmt_->streams[stream_];
     const AVCodec *dec = avcodec_find_decoder(st->codecpar->codec_id);
@@ -173,6 +182,10 @@ private:
         continue;
       }
       if (pkt->stream_index != stream_) { av_packet_unref(pkt); continue; }
+      // raw/* republish: the camera's ORIGINAL packets, no decode, no
+      // re-encode. Lets Home Assistant read per-camera streams from stitchd
+      // instead of opening a second connection to the NVR.
+      if (g_rtsp && !passthrough_.empty()) g_rtsp->broadcast(passthrough_, pkt);
       if (!dec_) { av_packet_unref(pkt); continue; } // audio-only input
       err = avcodec_send_packet(dec_, pkt);
       av_packet_unref(pkt);
@@ -206,6 +219,17 @@ private:
   std::mutex mu_;
   AVFrame *latest_ = nullptr;
   audio::Tap *tap_ = nullptr; // not owned
+
+public:
+  // Republish this input's video packets under `name` on the RTSP server.
+  void set_passthrough(const std::string &name) { passthrough_ = name; }
+  const AVCodecParameters *video_par() const { return vpar_; }
+  AVRational video_time_base() const { return vtb_; }
+
+private:
+  std::string passthrough_;
+  AVCodecParameters *vpar_ = nullptr;
+  AVRational vtb_{1, 90000};
 };
 
 // ---- one output encoder + muxer -------------------------------------------
@@ -490,6 +514,7 @@ private:
 //   comp-in <url>             ; one per composite (stacked) camera, in order
 //   aux <name> <url>          ; a camera used by extra composites
 //   audio-ch <name> <url>     ; a transcription channel, IN ORDER (see below)
+//   raw <name> <url>          ; republish this camera verbatim at raw/<name>
 //   out <name> <codec> <maxrate>   ; begins an output (maxrate 0 = uncapped)
 //   piece <src> <cx> <cy> <cw> <ch> <sw> <sh> <rot>  ; 1+ per out (vstacked)
 // `src` = "composite" | an aux name | a previously-declared output name.
@@ -512,6 +537,10 @@ struct Config {
   // so it must not be reordered. A URL already opened for video reuses that
   // connection; anything else opens audio-only.
   std::vector<std::pair<std::string, std::string>> audio_ch; // name,url
+  // Cameras to republish verbatim as raw/<name>. Lets other consumers (Home
+  // Assistant) read per-camera streams from stitchd rather than opening a
+  // second connection to the NVR.
+  std::vector<std::pair<std::string, std::string>> raw; // name,url
 };
 
 bool parse_config(const char *path, Config &c) {
@@ -527,6 +556,12 @@ bool parse_config(const char *path, Config &c) {
     else if (kw == "comp-dim") ls >> c.comp_w >> c.comp_h;
     else if (kw == "comp-in") { std::string u; ls >> u; c.comp_in.push_back(u); }
     else if (kw == "aux") { std::string n, u; ls >> n >> u; c.aux.push_back({n, u}); }
+    else if (kw == "raw") {
+      // raw <name> <url> — republish this camera's packets at raw/<name>.
+      std::string n, u;
+      ls >> n >> u;
+      c.raw.push_back({n, u});
+    }
     else if (kw == "audio-ch") {
       std::string n, u;
       ls >> n >> u;
@@ -652,6 +687,7 @@ int run(const Config &cfg, const char *dest, long long max_frames,
   // Whatever is left in tap_by_url is a camera nobody decodes video for
   // (today: blue and bullet). Open those audio-only — no decoder, no GPU.
   std::vector<Decoder *> audio_only;
+  std::map<std::string, Decoder *> audio_only_by_url;
   for (auto &kv : tap_by_url) {
     auto *d = new Decoder();
     if (d->open(kv.first.c_str(), dev.ref, kv.second, /*need_video=*/false) < 0) {
@@ -663,6 +699,7 @@ int run(const Config &cfg, const char *dest, long long max_frames,
     }
     d->start();
     audio_only.push_back(d);
+    audio_only_by_url[kv.first] = d;
   }
   std::unique_ptr<audio::Mixer> mixer;
   if (!tap_order.empty()) {
@@ -793,11 +830,29 @@ int run(const Config &cfg, const char *dest, long long max_frames,
   }
 #endif
 
+  // Map every open decoder by URL so a raw/* entry can attach to the
+  // connection that already exists rather than opening another one.
+  std::map<std::string, Decoder *> by_url;
+  for (int i = 0; i < (int)decs.size(); ++i) by_url[cfg.comp_in[i]] = decs[i];
+  for (auto &a : cfg.aux) { auto it = auxd.find(a.first); if (it != auxd.end()) by_url[a.second] = it->second; }
+  for (auto &kv : audio_only_by_url) by_url[kv.first] = kv.second;
+
   std::unique_ptr<rtsp::Server> rtsp_srv;
   if (rtsp_port > 0) {
     rtsp_srv = std::make_unique<rtsp::Server>();
     for (auto *w : workers)
       rtsp_srv->add_stream(w->name, w->enc_par(), w->enc_time_base());
+    // raw/* passthrough streams, one per camera that has an open connection.
+    for (auto &r : cfg.raw) {
+      auto it = by_url.find(r.second);
+      if (it == by_url.end() || !it->second->video_par()) {
+        LOGF("raw/%s: no open input for %s — skipped", r.first.c_str(), r.second.c_str());
+        continue;
+      }
+      const std::string nm = "raw/" + r.first;
+      rtsp_srv->add_stream(nm, it->second->video_par(), it->second->video_time_base());
+      it->second->set_passthrough(nm);
+    }
     if (rtsp_srv->start(rtsp_port)) {
       g_rtsp = rtsp_srv.get();
     } else {
