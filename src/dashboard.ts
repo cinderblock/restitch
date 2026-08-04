@@ -984,9 +984,43 @@ export function startDashboard(
   transcription?: { ring: RingBuffer; stats: LiveStats },
   media?: { ffmpegPath: string; baseUrl: string },
   /** Directory stitchd writes HLS segments into; served at /hls/<name>/... */
-  hlsDir?: string
+  hlsDir?: string,
+  /** stitchd's status endpoint; when set, mediamtx is not consulted at all. */
+  statusUrl?: string
 ): Server {
   const apiBase = dashboard.mediamtx_api_url.replace(/\/$/, "");
+  // With the native compositor there is no mediamtx: stitchd serves its own
+  // status on the WHEP HTTP port. Shaped like mediamtx's /v3/paths/list so the
+  // UI reads from a different source without a rewrite.
+  const stitchdApi = statusUrl ?? null;
+  const fetchPaths = async (): Promise<Response> => {
+    if (!stitchdApi) return fetch(`${apiBase}/v3/paths/list`);
+    const r = await fetch(stitchdApi);
+    if (!r.ok) return r;
+    const j = (await r.json()) as {
+      items?: { name: string; ready?: boolean; codec?: string; width?: number; height?: number; dropped?: number }[];
+      rtspClients?: number;
+      webrtcViewers?: number;
+    };
+    const items = (j.items ?? []).map((it) => ({
+      name: it.name,
+      ready: it.ready ?? true,
+      // stitchd is the only publisher now, and it never leaves a path
+      // sourceless while running.
+      source: { type: "stitchd" },
+      tracks: [it.codec === "hevc" ? "H265" : "H264"],
+      readers: [] as unknown[],
+      bytesReceived: 0,
+      bytesSent: 0,
+      width: it.width,
+      height: it.height,
+      dropped: it.dropped ?? 0,
+    }));
+    return new Response(
+      JSON.stringify({ items, rtspClients: j.rtspClients ?? 0, webrtcViewers: j.webrtcViewers ?? 0 }),
+      { headers: { "content-type": "application/json" } }
+    );
+  };
   const { hostname, port } = parseAddress(dashboard.address);
 
   // Background snapshot pre-warm: every PREWARM_MS, refresh a cached frame
@@ -997,7 +1031,7 @@ export function startDashboard(
     const m = media;
     const prewarm = async () => {
       try {
-        const r = await fetch(`${apiBase}/v3/paths/list`);
+        const r = await fetchPaths();
         if (!r.ok) return;
         const j = (await r.json()) as { items?: { name: string; ready?: boolean }[] };
         for (const p of j.items ?? []) {
@@ -1070,12 +1104,24 @@ export function startDashboard(
             headers: { "content-type": "text/html; charset=utf-8" },
           });
         case "/api/paths":
-          return proxyJson(`${apiBase}/v3/paths/list`);
+          return fetchPaths();
         case "/api/rtsp":
+          // No mediamtx to ask any more. stitchd exposes aggregate counts via
+          // /api/status; per-session detail is not tracked yet, so return an
+          // empty list rather than proxying to a server that is gone.
+          if (stitchdApi) return new Response('{"items":[]}', { headers: { "content-type": "application/json" } });
           return proxyJson(`${apiBase}/v3/rtspsessions/list`);
         case "/api/webrtc":
+          // No mediamtx to ask any more. stitchd exposes aggregate counts via
+          // /api/status; per-session detail is not tracked yet, so return an
+          // empty list rather than proxying to a server that is gone.
+          if (stitchdApi) return new Response('{"items":[]}', { headers: { "content-type": "application/json" } });
           return proxyJson(`${apiBase}/v3/webrtcsessions/list`);
         case "/api/hls":
+          // No mediamtx to ask any more. stitchd exposes aggregate counts via
+          // /api/status; per-session detail is not tracked yet, so return an
+          // empty list rather than proxying to a server that is gone.
+          if (stitchdApi) return new Response('{"items":[]}', { headers: { "content-type": "application/json" } });
           return proxyJson(`${apiBase}/v3/hlsmuxers/list`);
         case "/api/system":
           return Response.json(await readSystemInfo());

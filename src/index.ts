@@ -345,7 +345,11 @@ async function main() {
           ffmpegPath: config.ffmpeg_path,
           baseUrl: config.output.base_url,
         },
-        hlsDir
+        hlsDir,
+        // Native compositor: read stream state from stitchd, not mediamtx.
+        nativeCompositor
+          ? `http://127.0.0.1:${stitchdWebrtcPort}/api/status`
+          : undefined
       )
     : null;
   if (dashServer) {

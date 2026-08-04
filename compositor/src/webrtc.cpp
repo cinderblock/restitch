@@ -57,6 +57,7 @@ struct Server::Viewer {
 
 struct Server::Impl {
   Options opt;
+  std::function<std::string()> status_fn;
   rtc::Configuration rtc_cfg;
 
   std::map<std::string, AVCodecParameters *> streams;
@@ -75,6 +76,10 @@ struct Server::Impl {
 };
 
 Server::Server() : impl_(std::make_unique<Impl>()) {}
+
+void Server::set_status_provider(std::function<std::string()> fn) {
+  impl_->status_fn = std::move(fn);
+}
 Server::~Server() { stop(); }
 
 void Server::add_stream(const std::string &name, const AVCodecParameters *par) {
@@ -236,6 +241,16 @@ void Server::handle_http(int fd) {
   };
 
   if (method == "OPTIONS") { respond("204 No Content", "", "", ""); ::close(fd); return; }
+
+  // Status for the dashboard. Served here because this is the only HTTP
+  // server stitchd already runs; standing up a second one for a few counters
+  // would be silly.
+  if (uri.rfind("/api/status", 0) == 0) {
+    std::string body = impl_->status_fn ? impl_->status_fn() : std::string("{}");
+    respond("200 OK", "", body, "application/json");
+    ::close(fd);
+    return;
+  }
 
   // /whep/<stream>
   std::string name;

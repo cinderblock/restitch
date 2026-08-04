@@ -743,6 +743,29 @@ int run(const Config &cfg, const char *dest, long long max_frames,
   if (webrtc_opt.http_port > 0) {
     webrtc_srv = std::make_unique<webrtc::Server>();
     for (auto *w : workers) webrtc_srv->add_stream(w->name, w->enc_par());
+    // Deliberately mediamtx-shaped ({items:[{name,ready,tracks,readers}]}) so
+    // the existing dashboard keeps working against a different source rather
+    // than needing a rewrite alongside the cutover.
+    // Captures the globals, not the locals: rtsp_srv is declared below this
+    // point, and both globals are set before any HTTP request can arrive.
+    webrtc_srv->set_status_provider([&workers]() {
+      std::ostringstream o;
+      o << "{\"items\":[";
+      bool first = true;
+      for (auto *w : workers) {
+        if (!first) o << ",";
+        first = false;
+        const AVCodecParameters *p = w->enc_par();
+        o << "{\"name\":\"" << w->name << "\",\"ready\":true"
+          << ",\"codec\":\"" << (p->codec_id == AV_CODEC_ID_HEVC ? "hevc" : "h264")
+          << "\",\"width\":" << w->w << ",\"height\":" << w->h
+          << ",\"dropped\":" << w->dropped() << "}";
+      }
+      o << "],\"rtspClients\":" << (g_rtsp ? g_rtsp->client_count() : 0)
+        << ",\"webrtcViewers\":" << (g_webrtc ? g_webrtc->viewer_count() : 0)
+        << "}";
+      return o.str();
+    });
     if (webrtc_srv->start(webrtc_opt)) {
       g_webrtc = webrtc_srv.get();
     } else {

@@ -23,6 +23,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -52,6 +53,10 @@ public:
   // Register a servable stream. Only H.264 is accepted; anything else is
   // ignored with a log line rather than silently producing a dead endpoint.
   void add_stream(const std::string &name, const AVCodecParameters *par);
+
+  // Serves GET /api/status. Set before start(). Lets the dashboard read
+  // stream state from stitchd instead of from mediamtx's control API.
+  void set_status_provider(std::function<std::string()> fn);
 
   bool start(const Options &opt);
   void stop();
