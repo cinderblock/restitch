@@ -23,20 +23,54 @@ channels, lag 0 s. WHEP POST returns 201 with media on :8189 carrying BOTH the
 | internal stream copies | ~24 | **0** |
 | mediamtx roles | 6 | 0 |
 
+## Client verification
+
+VLC confirmed **smooth** by the user on 2026-08-03 after two RTSP bugs were
+fixed:
+
+1. **UDP transport refused.** VLC requests plain UDP on SETUP first and only
+   falls back to interleaved TCP if refused. mediamtx had been configured
+   `rtspTransports:[tcp]` so clients never got the choice; answering 461 made
+   VLC fail outright. SETUP now serves both (`4c61cb6`).
+2. **RTP clock wrong.** `avformat_write_header` rewrites `st->time_base` to
+   1/90000 for the rtp muxer, but packets were still being fed in the encoder's
+   time base — consecutive frames landed 1 tick apart instead of 3000, so a
+   player's clock collapsed right after the first frame. **ffmpeg tolerates this
+   and VLC does not**, which is why every earlier ffmpeg-based test passed while
+   VLC showed one frame and died (`d2ecd15`). Packets with no PTS now fall back
+   to DTS or are dropped rather than emitting garbage (`137fd89`).
+
+**Testing lesson worth keeping:** ffmpeg re-derives timing and masks broken RTP
+timestamps. Validating an RTSP server with ffmpeg alone is not sufficient —
+parse the RTP headers, or test with a strict client.
+`/tmp/rtpcheck.py` on sentinel captures interleaved RTP and prints frame deltas.
+
+## Own UI — done
+
+The dashboard no longer touches mediamtx. stitchd serves `GET /api/status` on
+the port it already runs for WHEP (no second HTTP server), reporting per-output
+codec/geometry/drops plus live RTSP and WebRTC sessions. The payload is
+deliberately mediamtx-shaped so the existing UI reads a new source without a
+rewrite. Verified: `/api/paths` 6 streams, `/api/rtsp` real peers, `/api/webrtc`
+viewers, `/api/snapshot/*` real JPEGs, dashboard 200.
+
 ## STILL OWED
 
-1. **Control API / dashboard.** The dashboard reads mediamtx's `/v3/*` for its
-   stream table and snapshots `raw/*` paths that no longer exist, so those
-   panels are degraded. Streams themselves are unaffected.
-2. **Off-LAN iOS validation of WebRTC.** The answer SDP carries the right
-   candidates, but nobody has actually loaded the public field stream from an
-   iPhone on cellular since the cutover. That is the one externally-visible
-   thing that can still be wrong.
-3. **`raw/*` per-camera streams are gone.** Nothing external consumed them
-   (~6 sessions per 6 h) but Home Assistant may want them back; stitchd would
-   have to republish.
-4. **The 4 h discard check** is now moot in its original form — the reader that
-   was "too slow" no longer exists, and neither does the server that complained.
+1. **Off-LAN iOS validation of WebRTC.** The answer SDP carries the mux port,
+   the `stream.tomsawyerlabs.com` host candidate and the STUN srflx candidate,
+   but no iPhone on cellular has loaded the public field stream since the
+   cutover. This is the one externally-visible thing that could still be wrong.
+2. **Three unexplained RTP timestamp anomalies per ~160 frames**, roughly +/-1
+   hour, consistent across all five H.264 outputs. ffmpeg reports no
+   discontinuities, libav logs nothing, and VLC now plays smoothly — so this may
+   be benign. Measure in ARRIVAL order with modular arithmetic; sorting is wrong
+   for a wrapping 32-bit counter (that mistake produced a false "BAD" verdict
+   once already).
+3. **`raw/*` per-camera streams are gone.** Almost nothing consumed them (~6
+   sessions per 6 h) but Home Assistant may want them back; stitchd would have
+   to republish.
+4. **Caddy still fronts `/webrtc/*` with the mediamtx endpoint layout** in the
+   ops repo. Worth a look since it gates the public stream.
 
 ---
 
