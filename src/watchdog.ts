@@ -44,6 +44,9 @@ interface PathState {
 export interface WatchdogOptions {
   /** mediamtx control API base URL. Default: http://localhost:9997 */
   mediamtxApi?: string;
+  /** stitchd's status endpoint. When set, mediamtx is not polled at all and
+   *  stall detection uses each output's encoded-frame counter. */
+  statusUrl?: string;
   /** Poll interval in ms. Default: 15_000 */
   pollMs?: number;
   /** Considered stalled if bytesReceived hasn't grown in this many ms.
@@ -59,6 +62,11 @@ export function startWatchdog(
   opts: WatchdogOptions = {}
 ): { stop: () => void } {
   const apiBase = (opts.mediamtxApi ?? "http://localhost:9997").replace(/\/$/, "");
+  // With the native compositor there is no mediamtx: stitchd reports its own
+  // liveness. Polling the dead :9997 API left the watchdog permanently
+  // erroring, which meant a wedged output was never restarted — the safety net
+  // was silently gone from the cutover until 2026-08-05.
+  const statusUrl = opts.statusUrl ?? null;
   const pollMs = opts.pollMs ?? 15_000;
   const stallMs = opts.stallMs ?? 60_000;
   const graceMs = opts.postRestartGraceMs ?? 45_000;
@@ -81,18 +89,56 @@ export function startWatchdog(
       readyTime?: string | null;
     }[];
   };
+  // stitchd's /api/status, shaped into what the stall check needs. A stream is
+  // "receiving bytes" when its encoded-frame counter advances; that is a
+  // stronger signal than mediamtx's bytesReceived, which also ticked for a
+  // stream nobody was watching.
+  const fetchStitchd = async (): Promise<PathsList | null> => {
+    try {
+      const r = await fetch(statusUrl!);
+      if (!r.ok) {
+        console.warn(`[watchdog] stitchd status ${r.status}`);
+        return null;
+      }
+      const j = (await r.json()) as {
+        items?: { name: string; ready?: boolean; frames?: number }[];
+      };
+      return {
+        items: (j.items ?? []).map((it) => ({
+          name: it.name,
+          ready: it.ready ?? true,
+          // Frames stand in for bytes: monotonic while encoding, frozen when
+          // the output wedges.
+          bytesReceived: it.frames ?? 0,
+          // stitchd has no per-input readyTime; the reconnect check below is
+          // simply inactive, and the stall check carries the load.
+          readyTime: null,
+        })),
+      } as PathsList;
+    } catch (e) {
+      console.warn(`[watchdog] stitchd status fetch failed:`, e);
+      return null;
+    }
+  };
+
   const tick = async () => {
     let paths: PathsList;
-    try {
-      const r = await fetch(`${apiBase}/v3/paths/list`);
-      if (!r.ok) {
-        console.warn(`[watchdog] paths/list ${r.status}`);
+    if (statusUrl) {
+      const p = await fetchStitchd();
+      if (!p) return;
+      paths = p;
+    } else {
+      try {
+        const r = await fetch(`${apiBase}/v3/paths/list`);
+        if (!r.ok) {
+          console.warn(`[watchdog] paths/list ${r.status}`);
+          return;
+        }
+        paths = (await r.json()) as PathsList;
+      } catch (e) {
+        console.warn(`[watchdog] paths/list fetch failed:`, e);
         return;
       }
-      paths = (await r.json()) as PathsList;
-    } catch (e) {
-      console.warn(`[watchdog] paths/list fetch failed:`, e);
-      return;
     }
 
     const byName = new Map<

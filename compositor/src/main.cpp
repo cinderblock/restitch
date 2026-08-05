@@ -235,6 +235,10 @@ private:
 // ---- one output encoder + muxer -------------------------------------------
 struct Output {
   std::string name; // for the RTSP fan-out
+  // Encoded packets emitted. The supervisor's watchdog polls this to tell a
+  // live output from a wedged one — without it, a stalled encoder looks
+  // identical to an idle one and nothing ever restarts the compositor.
+  std::atomic<long long> encoded{0};
   AVFormatContext *fmt = nullptr;
   AVCodecContext *enc = nullptr;
   AVStream *stream = nullptr;
@@ -357,6 +361,7 @@ int drain(Output &out) {
       return 0;
     }
     if (err < 0) { av_packet_free(&pkt); return err; }
+    ++out.encoded;
     // Clone BEFORE writing: av_interleaved_write_frame consumes the packet.
     AVPacket *hls_pkt =
         (out.hls_fmt && out.hls_header) ? av_packet_clone(pkt) : nullptr;
@@ -470,6 +475,7 @@ public:
     return par_;
   }
   AVRational enc_time_base() const { return io_.enc->time_base; }
+  long long encoded() const { return io_.encoded.load(); }
   void note_pool_drop() { ++dropped_; }
   long long dropped() const { return dropped_; }
 
@@ -796,7 +802,8 @@ int run(const Config &cfg, const char *dest, long long max_frames,
         o << "{\"name\":\"" << w->name << "\",\"ready\":true"
           << ",\"codec\":\"" << (p->codec_id == AV_CODEC_ID_HEVC ? "hevc" : "h264")
           << "\",\"width\":" << w->w << ",\"height\":" << w->h
-          << ",\"dropped\":" << w->dropped() << "}";
+          << ",\"dropped\":" << w->dropped()
+          << ",\"frames\":" << w->encoded() << "}";
       }
       o << "],\"sessions\":[";
       bool sfirst = true;

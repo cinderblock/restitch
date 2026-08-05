@@ -332,7 +332,14 @@ async function main() {
   // Watchdog: restart any ffmpeg whose mediamtx output path stops receiving
   // bytes, OR whose input source reconnects (which wedges the read and freezes
   // a composite half). Catches stuck-but-alive ffmpegs the supervisor can't see.
-  const watchdog = startWatchdog(watched);
+  // Point the watchdog at stitchd's own status; mediamtx's API is gone, and
+  // polling it left the watchdog dead so nothing restarted a wedged output.
+  const watchdog = startWatchdog(
+    watched,
+    nativeCompositor
+      ? { statusUrl: `http://127.0.0.1:${stitchdWebrtcPort}/api/status` }
+      : {}
+  );
 
   // Dashboard HTTP server (proxies mediamtx API + exposes /api/system +
   // /api/transcriptions + /api/transcription-stats from the in-process
