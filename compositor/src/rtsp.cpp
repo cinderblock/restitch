@@ -25,17 +25,18 @@ namespace {
     std::fprintf(stderr, "\n");                                                \
   } while (0)
 
-// Max bytes we will buffer for one client before declaring it too slow and
-// dropping it. A 7560x2688 HEVC keyframe is multiple MB, so this must clear
-// several of them — the same reasoning behind mediamtx's writeQueueSize 65536.
-// Undersizing this shreds keyframes; oversizing only costs idle memory.
-constexpr size_t kMaxClientBacklog = 32u * 1024 * 1024;
+// How long a single send may stall before the client is declared gone. Long
+// enough to ride out a multi-megabyte keyframe on a slow link, short enough
+// that a dead client is reaped rather than starving its own session forever.
+constexpr int kSendTimeoutSec = 10;
 
 bool write_all(int fd, const uint8_t *p, size_t n) {
   while (n > 0) {
     ssize_t w = ::send(fd, p, n, MSG_NOSIGNAL);
     if (w > 0) { p += w; n -= (size_t)w; continue; }
     if (w < 0 && errno == EINTR) continue;
+    // EAGAIN/EWOULDBLOCK here means SO_SNDTIMEO expired: the peer has stopped
+    // draining. Treat it as a dead client rather than retrying forever.
     return false;
   }
   return true;
@@ -155,6 +156,15 @@ void Server::accept_loop() {
     }
     int on = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+    // Bound how long a send may block. Without this a client that stops
+    // reading (VLC killed, laptop slept, Wi-Fi dropped) leaves send() blocked
+    // forever holding the session mutex: every later broadcast skips that
+    // session, the socket sits at Send-Q 0 receiving nothing, and the session
+    // is never marked dead — it looks connected and playing while delivering
+    // no video. Observed in production 2026-08-05.
+    timeval tv{};
+    tv.tv_sec = kSendTimeoutSec;
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     std::thread([this, fd] { serve_conn(fd); }).detach();
   }
 }
@@ -167,7 +177,11 @@ static int session_write(void *opaque, const uint8_t *buf, int size) {
   uint8_t hdr[4] = {0x24, (uint8_t)s->rtp_channel, (uint8_t)(size >> 8),
                     (uint8_t)(size & 0xff)};
   if (!write_all(s->fd, hdr, 4) || !write_all(s->fd, buf, (size_t)size)) {
+    // Shut the socket down so the connection thread's blocking recv() returns
+    // and cleans up; otherwise it parks forever on a socket nobody reads.
     s->dead = true;
+    ::shutdown(s->fd, SHUT_RDWR);
+    RLOGF("client on '%s' stopped reading — dropped", s->stream.c_str());
   }
   return size;
 }
