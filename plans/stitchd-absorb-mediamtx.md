@@ -101,6 +101,39 @@ broken: the dashboard builds LAN HLS links against the dead `:8890`
 (`src/dashboard.ts:183`) and `/api/hls` still proxies mediamtx's
 `/v3/hlsmuxers/list` (`src/dashboard.ts:1160`).
 
+### Status 2026-08-05: backends DONE and verified, Caddy still pending
+
+Measured baseline before any change (curl on sentinel, real SNI):
+
+```
+GET /all-field                 502   (Caddy proxying to the dead :8890)
+GET /all-field/index.m3u8      502
+GET /webrtc/all-field?token=   404   (gate passes; strip_prefix lands on nothing)
+GET /webrtc/all-field          401   (gate itself works)
+```
+
+Backends after `5d333a6` + `2be5a94` (deployed, image rebuilt, container up):
+
+```
+stitchd  GET  /whep/all-field   200 html, has RTCPeerConnection + query-preserving POST
+stitchd  POST /whep/all-field   400 on a garbage offer — WHEP still reached, not
+                                shadowed by the new GET handler
+stitchd  GET  /whep/nosuch      404 — unknown streams still rejected
+dash     GET  /hls/all-field    200 html referencing index.m3u8
+dash     GET  /hls/.../hls.js   543036 bytes, text/javascript
+```
+
+Playlist segment references are **relative** (`seg523.m4s`, `init.mp4`), so a
+prefix rewrite in front of them is safe.
+
+Route tests live in `plans/tmp-hls-routes.ts` (`bun run` it) — they start a real
+dashboard against a temp segment dir and hit every path. Two things that test
+taught, both of which had me briefly believing the traversal guard was broken:
+`fetch` and every browser resolve a literal `..` client-side, so it never
+reaches the server; and `%2e%2e` as a whole path segment is resolved by URL
+normalization before the handler sees it. Only the `%2f`-joined form
+(`%2e%2e%2f%2e%2e%2f`) actually exercises the guard, and it returns 400.
+
 ### Chosen fix
 
 Serve our own player pages so the **public URL contract is unchanged** and the
