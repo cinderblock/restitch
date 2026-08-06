@@ -1,5 +1,7 @@
 #include "webrtc.h"
 
+#include "player.h"
+
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
@@ -264,8 +266,24 @@ void Server::handle_http(int fd) {
   }
 
   auto it = impl_->streams.find(name);
-  if (method != "POST" || name.empty() || it == impl_->streams.end()) {
+  if (name.empty() || it == impl_->streams.end()) {
     respond("404 Not Found", "", "no such stream\n", "text/plain");
+    ::close(fd);
+    return;
+  }
+
+  // Same URL serves the player page (GET) and the WHEP exchange (POST), which
+  // is the contract mediamtx had and the public Caddy mount still assumes.
+  // Without this a browser pointed at the stream URL gets a 404 even though
+  // the stream is fine.
+  if (method == "GET") {
+    respond("200 OK", "", kPlayerHtml, "text/html; charset=utf-8");
+    ::close(fd);
+    return;
+  }
+  if (method != "POST") {
+    respond("405 Method Not Allowed", "Allow: GET, POST, OPTIONS\r\n",
+            "use GET for the player or POST for WHEP\n", "text/plain");
     ::close(fd);
     return;
   }
