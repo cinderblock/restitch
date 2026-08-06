@@ -177,10 +177,13 @@ const slugToCameraName = slug => slug
   .join(' ');
 
 const HOST = location.hostname;
+// stitchd's layout, not mediamtx's: WHEP lives under /whep/ on the WebRTC port
+// (same URL serves the player on GET), and HLS is served by this dashboard
+// rather than by a separate :8890.
 const streamUrls = name => ({
   rtsp: 'rtsp://' + HOST + ':8554/' + name,
-  webrtc: 'http://' + HOST + ':8889/' + name + '/',
-  hls: 'http://' + HOST + ':8890/' + name + '/',
+  webrtc: 'http://' + HOST + ':8889/whep/' + name,
+  hls: location.origin + '/hls/' + name + '/',
 });
 
 // navigator.clipboard requires a secure context (HTTPS or localhost). The
@@ -979,6 +982,72 @@ async function grabSnapshot(
   return inflight;
 }
 
+/**
+ * Player page for an HLS stream, served at /hls/<name> (and, through the public
+ * Caddy mount, at /all-field). mediamtx served an equivalent page and the
+ * scoreboard embed points at that URL, so we owe one.
+ *
+ * Every URL is derived from location.pathname at runtime rather than baked in,
+ * so the same page works mounted at /hls/<name> on the LAN or at /<name>
+ * behind the reverse proxy. That is also why hls.js is injected by script
+ * rather than a static <script src>: a relative src resolves differently under
+ * the two mounts, and an absolute one would be wrong under at least one.
+ */
+const hlsPlayerHtml = `<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>restitch</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: contain; display: block; }
+  #msg {
+    position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
+    text-align: center; pointer-events: none; color: #999;
+    font: 13px system-ui, sans-serif;
+  }
+</style>
+<video id="v" autoplay muted playsinline controls></video>
+<div id="msg">loading…</div>
+<script>
+const v = document.getElementById('v');
+const msg = document.getElementById('msg');
+const base = location.pathname.replace(/\\/+$/, '');
+const src = base + '/index.m3u8';
+const say = t => { msg.textContent = t || ''; };
+
+// Safari (and iOS in general) plays HLS natively and does it better than
+// hls.js can through MSE, so prefer it and only pull the 500 KB library down
+// for the browsers that actually need it.
+if (v.canPlayType('application/vnd.apple.mpegurl')) {
+  v.src = src;
+  v.addEventListener('loadeddata', () => say(''));
+  v.addEventListener('error', () => say('stream unavailable — retrying'));
+  setInterval(() => { if (v.error || v.readyState === 0) v.src = src; }, 5000);
+} else {
+  const s = document.createElement('script');
+  s.src = base + '/hls.js';
+  s.onerror = () => say('could not load player');
+  s.onload = () => {
+    if (!window.Hls || !Hls.isSupported()) return say('HLS not supported here');
+    const hls = new Hls({ lowLatencyMode: true, backBufferLength: 10 });
+    hls.on(Hls.Events.MANIFEST_PARSED, () => say(''));
+    // A scoreboard runs unattended for hours: recover from network and media
+    // errors in place instead of leaving a dead black frame on screen.
+    hls.on(Hls.Events.ERROR, (_e, data) => {
+      if (!data.fatal) return;
+      say(data.details || 'error');
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+      else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+      else { hls.destroy(); setTimeout(() => location.reload(), 5000); }
+    });
+    hls.loadSource(src);
+    hls.attachMedia(v);
+  };
+  document.head.appendChild(s);
+}
+</script>
+`;
+
 export function startDashboard(
   dashboard: Dashboard,
   transcription?: { ring: RingBuffer; stats: LiveStats },
@@ -1070,6 +1139,45 @@ export function startDashboard(
         if (rel.includes("..") || rel.startsWith("/")) {
           return new Response("bad path", { status: 400 });
         }
+
+        // The hls.js bundle, requested by the player page below as
+        // <base>/hls.js so it resolves under whatever prefix we're mounted at
+        // (/hls/<name>/ on the LAN, /all-field/ through the public Caddy
+        // mount). Served from node_modules rather than vendored into the repo
+        // or pulled from a CDN — the public scoreboard should not depend on a
+        // third party being reachable.
+        if (rel === "hls.js" || rel.endsWith("/hls.js")) {
+          // Anchored to this module, not the process CWD: the container runs
+          // from /opt/restitch today but nothing guarantees that.
+          const lib = Bun.file(
+            `${import.meta.dir}/../node_modules/hls.js/dist/hls.min.js`
+          );
+          if (!(await lib.exists())) {
+            return new Response("hls.js not installed", { status: 500 });
+          }
+          return new Response(lib, {
+            headers: {
+              "content-type": "text/javascript",
+              "cache-control": "max-age=86400",
+              "access-control-allow-origin": "*",
+            },
+          });
+        }
+
+        // A bare stream name (no file component) is a browser asking to watch,
+        // not to fetch a segment. mediamtx served a player page here and the
+        // public mount still points at it; without this the URL 404s because
+        // Bun.file() on a directory is not a readable file.
+        const bare = rel.replace(/\/+$/, "");
+        if (bare && !bare.includes("/")) {
+          return new Response(hlsPlayerHtml, {
+            headers: {
+              "content-type": "text/html; charset=utf-8",
+              "cache-control": "no-cache",
+            },
+          });
+        }
+
         const file = Bun.file(`${hlsDir}/${rel}`);
         if (!(await file.exists())) return new Response("not found", { status: 404 });
         const type = rel.endsWith(".m3u8")
