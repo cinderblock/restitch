@@ -66,11 +66,72 @@ viewers, `/api/snapshot/*` real JPEGs, dashboard 200.
    be benign. Measure in ARRIVAL order with modular arithmetic; sorting is wrong
    for a wrapping 32-bit counter (that mistake produced a false "BAD" verdict
    once already).
-3. **`raw/*` per-camera streams are gone.** Almost nothing consumed them (~6
-   sessions per 6 h) but Home Assistant may want them back; stitchd would have
-   to republish.
-4. **Caddy still fronts `/webrtc/*` with the mediamtx endpoint layout** in the
-   ops repo. Worth a look since it gates the public stream.
+3. ~~**`raw/*` per-camera streams are gone.**~~ DONE — stitchd republishes every
+   camera verbatim at `raw/<name>` (`3083396`).
+4. **The public stream is still down. Caddy fronts `/webrtc/*` and `/all-field`
+   with the mediamtx endpoint layout.** A prefix-rewrite patch was staged in the
+   ops repo and then found insufficient — see below.
+
+## Public endpoint (`stream.tomsawyerlabs.com`) — BROKEN, fix in progress
+
+The staged ops patch only rewrites paths (`/webrtc/` → `/whep/`, `/all-field` →
+`/hls/all-field`). Reviewed against what stitchd and the dashboard actually
+serve, that is **not enough** — three separate breaks, all verified by reading
+the serving code, none by hitting the box (sentinel was rebooting):
+
+1. **No player page anywhere.** mediamtx served an HTML player at both
+   `/all-field` (hls.js) and `/webrtc/all-field`. stitchd's WHEP handler is
+   POST-only — `method != "POST"` returns 404 (`compositor/src/webrtc.cpp:267`).
+   The dashboard's HLS route calls `Bun.file()` on the path and 404s when it
+   isn't a regular file, so a bare directory `/hls/all-field` 404s too
+   (`src/dashboard.ts:1073`). Path rewriting alone therefore turns one 404 into
+   a different 404 for any browser that loads the page URL.
+2. **`header_down Location ^/ /webrtc/` now produces a dead URL.** It was
+   written for mediamtx, which emitted `/all-field/whep/session/<id>`. stitchd
+   emits `Location: /whep/all-field` (`compositor/src/webrtc.cpp:352`), so the
+   rule rewrites it to `/webrtc/whep/all-field` — which does not match
+   `@webrtc_authed` (`path /webrtc/all-field*`), falls through to
+   `handle /webrtc/*`, and **401s** on the session PATCH/DELETE. Correct rule is
+   `header_down Location ^/whep/ /webrtc/`.
+3. **`@webrtc_static` (`/webrtc/all-field/reader.js`) is dead weight.** That was
+   mediamtx's player library. stitchd has no such asset; the block can go.
+
+Two more mediamtx leftovers found in the same read, not public-facing but
+broken: the dashboard builds LAN HLS links against the dead `:8890`
+(`src/dashboard.ts:183`) and `/api/hls` still proxies mediamtx's
+`/v3/hlsmuxers/list` (`src/dashboard.ts:1160`).
+
+### Chosen fix
+
+Serve our own player pages so the **public URL contract is unchanged** and the
+Caddy rules stay path-rewrites only:
+
+- stitchd: `GET /whep/<stream>` returns an embedded HTML WebRTC player (POST
+  still does WHEP). The page forwards `location.search` onto its own POST so the
+  single `?token=` in the iframe URL covers the whole exchange, exactly as
+  mediamtx's page did.
+- dashboard: `GET /hls/<name>` (directory, no file) returns an embedded hls.js
+  player; `/hls/<name>/index.m3u8` and segments keep working as today.
+- Caddy: the staged path rewrites, plus the corrected `Location` rule, minus the
+  `reader.js` block.
+
+**Open question blocking the shape of this:** nobody has confirmed what the pFMS
+scoreboard actually iframes — the player *page* (`/all-field`) or the playlist
+(`/all-field/index.m3u8`) straight into its own player. If it is the playlist,
+the HLS player page is unnecessary and the staged rewrite is already enough for
+that transport. Check Caddy's access log for `stream.tomsawyerlabs.com` once
+sentinel is back up.
+
+### Do not
+
+- Do not push the currently-staged `stream.tomsawyerlabs.com.caddy` as-is. It
+  ships breaks 1 and 2 above.
+- Do not validate this endpoint with `curl -o /dev/null -w %{http_code}` alone —
+  a 200 on `index.m3u8` says nothing about whether a browser can play it, and
+  this project has already been burned three times by checks that passed on
+  something other than the thing under test (ffmpeg masking broken RTP
+  timestamps, `ffprobe` answering from the SDP with zero frames flowing,
+  `strings` being absent so deployed code looked missing).
 
 ---
 
