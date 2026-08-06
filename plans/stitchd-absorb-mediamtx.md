@@ -134,6 +134,32 @@ reaches the server; and `%2e%2e` as a whole path segment is resolved by URL
 normalization before the handler sees it. Only the `%2f`-joined form
 (`%2e%2e%2f%2e%2e%2f`) actually exercises the guard, and it returns 400.
 
+### PARKED 2026-08-05 — user wants the public stream down for now
+
+User directive: *"public stream is not important right now - in fact it should
+probably be down, at least temporarily."* So the Caddy change was **never
+pushed**, and no further work on the public endpoint should happen until that
+is reversed.
+
+It is already down, by accident rather than by design: `/all-field` returns 502
+(Caddy proxying to a mediamtx that no longer exists) and `/webrtc/all-field`
+returns 404 with a valid token, 401 without. Nothing needs to be done to keep
+it down.
+
+The completed Caddy change is saved at `plans/caddy-public-stream-fix.patch`
+(`git apply` it from the ops repo root). It is reviewed and believed correct
+but has **never been applied or tested against a running Caddy** — treat it as
+unverified. If the public stream is wanted again, apply it, then re-run the
+baseline probes above and confirm 200s where there are now 502/404.
+
+If it should be *deliberately* down rather than incidentally broken, the honest
+version is a `respond 503` on both routes — but that is a server config change
+and needs its own authorization.
+
+The backend work (`5d333a6`, `2be5a94`) is deployed and independently useful:
+those player pages are what the sub-second HA dashboard player needs, and they
+are reachable on the LAN regardless of what the public mount does.
+
 ### Chosen fix
 
 Serve our own player pages so the **public URL contract is unchanged** and the

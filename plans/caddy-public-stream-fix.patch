@@ -1,0 +1,107 @@
+diff --git a/servers/sentinel/sites.d/stream.tomsawyerlabs.com.caddy b/servers/sentinel/sites.d/stream.tomsawyerlabs.com.caddy
+index 149f9f1..ed44e19 100644
+--- a/servers/sentinel/sites.d/stream.tomsawyerlabs.com.caddy
++++ b/servers/sentinel/sites.d/stream.tomsawyerlabs.com.caddy
+@@ -1,12 +1,13 @@
+-# Public video stream endpoint — restitch (MediaMTX) on this box.
+-# Exposes ONLY the approved stream (all-field); every other stream, the
+-# control API (:9997), and the dashboard (:9000) stay LAN-only.
++# Public video stream endpoint — restitch (stitchd) on this box.
++# Exposes ONLY the approved stream (all-field); every other stream and the
++# dashboard's own UI (:9000) stay LAN-only.
+ #
+-# Two transports:
+-#   /all-field            — HLS (:8890), open to the public. MediaMTX's
+-#                           built-in hls.js player page (what the pFMS
+-#                           scoreboard iframes); /all-field/index.m3u8 +
+-#                           segments feed it. Few seconds of latency.
++# Two transports, both served by stitchd since it replaced mediamtx:
++#   /all-field            — HLS, open to the public. What the pFMS scoreboard
++#                           iframes. Proxied to the restitch dashboard on
++#                           :9000, which serves a player page at /hls/all-field
++#                           and stitchd's fMP4 segments under it. Few seconds
++#                           of latency.
+ #   /webrtc/all-field     — WebRTC (:8889), token-gated, sub-second latency.
+ #                           Gate is a query token (?token=...) because the
+ #                           scoreboard embeds this in a cross-origin iframe,
+@@ -14,9 +15,12 @@
+ #                           WHEP signaling flows through here — media is
+ #                           ICE/DTLS on UDP 8189 (WAN forward at the office,
+ #                           usable only with the ICE credentials negotiated
+-#                           via this gated signaling). MediaMTX's player page
+-#                           forwards its query params to the WHEP request, so
+-#                           one token in the URL covers the whole exchange.
++#                           via this gated signaling). stitchd serves the
++#                           player page on GET and the WHEP exchange on POST at
++#                           the same URL; the page forwards its query string
++#                           onto that POST, so one token in the URL covers the
++#                           whole exchange (mediamtx's player behaved the same
++#                           way, which is why this contract is worth keeping).
+ #
+ # STREAM_WEBRTC_TOKEN comes from the sentinel GitHub environment secret via
+ # deploy.sh → .env → container env. If the secret is missing, deploy.sh
+@@ -33,41 +37,42 @@ stream.tomsawyerlabs.com {
+ 		query token={env.STREAM_WEBRTC_TOKEN}
+ 	}
+ 
+-	# The player page loads ./reader.js as a bare <script> tag — no query
+-	# string, so it can't carry the token. It's a static JS library (nothing
+-	# sensitive); serve it ungated. (mediamtx 1.16.3 read_index.html:40)
+-	@webrtc_static {
+-		path /webrtc/all-field/reader.js
+-	}
+-
+ 	route {
+ 		handle @webrtc_authed {
+-			uri strip_prefix /webrtc
+-			# mediamtx emits ABSOLUTE-path Location headers built from the
+-			# backend path it sees (no /webrtc prefix): the trailing-slash
+-			# 301 and, critically, the WHEP session URL that the player's
+-			# ICE PATCH + teardown DELETE target (http_server.go
+-			# sessionLocation). Re-add the prefix so those follow-ups stay
+-			# inside this gated mount. mediamtx preserves the raw query in
+-			# both, so the token rides along.
++			# stitchd serves WHEP at /whep/<stream>, not at /<stream>, so a
++			# bare strip_prefix 404s — that is what broke this endpoint at the
++			# mediamtx cutover. Bounded to one substitution so a stream name
++			# that ever contains the prefix cannot be rewritten twice.
++			uri replace /webrtc/ /whep/ 1
++			# stitchd returns an ABSOLUTE-path Location on the 201 built from
++			# the backend path it sees (/whep/all-field), which the WHEP
++			# session teardown targets. Map it back into this gated mount, or
++			# the follow-up lands outside @webrtc_authed and 401s.
++			#
++			# NOTE this rewrites the /whep/ prefix, NOT a bare leading slash.
++			# mediamtx emitted /all-field/whep/session/<id>, so the old rule
++			# prepended /webrtc to a path that already started with the stream
++			# name; against stitchd the same rule produces
++			# /webrtc/whep/all-field, which matches nothing here.
+ 			reverse_proxy localhost:8889 {
+-				header_down Location ^/ /webrtc/
++				header_down Location ^/whep/ /webrtc/
+ 			}
+ 		}
+ 
+-		handle @webrtc_static {
+-			uri strip_prefix /webrtc
+-			reverse_proxy localhost:8889
+-		}
+-
+ 		# Wrong/missing token, or a non-approved stream under /webrtc
+ 		handle /webrtc/* {
+ 			respond "unauthorized" 401
+ 		}
+ 
++		# HLS moved off mediamtx (:8890) onto the restitch dashboard (:9000),
++		# which serves a player page at /hls/all-field, stitchd's fMP4 segments
++		# at /hls/all-field/{index.m3u8,init.mp4,seg*.m4s}, and the hls.js
++		# bundle at /hls/all-field/hls.js. The player derives every URL from
++		# location.pathname, so it works unchanged under this /all-field mount.
+ 		@hls path /all-field /all-field/*
+ 		handle @hls {
+-			reverse_proxy localhost:8890
++			uri replace /all-field /hls/all-field 1
++			reverse_proxy localhost:9000
+ 		}
+ 
+ 		handle {
