@@ -18,6 +18,7 @@
 //
 // See plans/custom-compositor.md.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -107,6 +108,21 @@ public:
   // change exists to avoid.
   int open(const char *url, AVBufferRef *device, audio::Tap *tap = nullptr,
            bool need_video = true) {
+    // Remembered so loop() can reopen this input after a drop. Without them a
+    // decode thread that lost its connection had nothing to reconnect to and
+    // simply exited, freezing that region of every composite it feeds.
+    url_ = url;
+    device_ = device;
+    need_video_ = need_video;
+    tap_orig_ = tap;
+    return open_input(tap);
+  }
+
+private:
+  int open_input(audio::Tap *tap) {
+    const char *url = url_.c_str();
+    AVBufferRef *device = device_;
+    const bool need_video = need_video_;
     tap_ = tap;
     AVDictionary *opt = nullptr;
     av_dict_set(&opt, "rtsp_transport", "tcp", 0);
@@ -122,15 +138,22 @@ public:
     if (tap_) {
       int ai = av_find_best_stream(fmt_, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
       // A camera with no usable audio contributes silence rather than failing
-      // the pipeline — video is the primary job.
-      if (ai < 0 || !tap_->open(fmt_->streams[ai])) tap_ = nullptr;
+      // the pipeline — video is the primary job. rebind() on a reconnect, since
+      // open() would leak the previous decoder.
+      const bool ok = ai >= 0 && (tap_->bound() ? tap_->rebind(fmt_->streams[ai])
+                                                : tap_->open(fmt_->streams[ai]));
+      if (!ok) tap_ = nullptr;
     }
 
     // Locate the video stream even when we will not decode it: raw/*
     // passthrough republishes the ORIGINAL packets, so an audio-only input
     // still needs its video stream index and parameters.
     stream_ = av_find_best_stream(fmt_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-    if (stream_ >= 0) {
+    if (stream_ >= 0 && !vpar_) {
+      // First open only. The RTSP server has built this stream's SDP from these
+      // parameters, so a reconnect must not swap them out underneath live
+      // clients — they would be decoding against a description that no longer
+      // matches. Same camera, so they should be identical anyway.
       AVStream *vs = fmt_->streams[stream_];
       vpar_ = avcodec_parameters_alloc();
       avcodec_parameters_copy(vpar_, vs->codecpar);
@@ -149,6 +172,18 @@ public:
     if ((err = avcodec_open2(dec_, dec, nullptr)) < 0) return err;
     return 0;
   }
+
+  // Release everything open_input() acquired, leaving the object reusable.
+  // vpar_/vtb_ deliberately survive (see above), as does latest_ — the
+  // compositor keeps painting the last good frame while we reconnect, which is
+  // better than a black hole in the middle of the composite.
+  void close_input() {
+    if (dec_) avcodec_free_context(&dec_);
+    if (fmt_) avformat_close_input(&fmt_);
+    stream_ = -1;
+  }
+
+public:
   void start() { thread_ = std::thread([this] { loop(); }); }
   bool latest(AVFrame *dst) {
     std::lock_guard<std::mutex> lk(mu_);
@@ -171,9 +206,45 @@ private:
   void loop() {
     AVPacket *pkt = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
+    // Outer loop = one connection attempt. Inner loop = reading that
+    // connection. Previously there was no outer loop: any read error broke out
+    // and the thread ENDED, so a camera reboot or a momentary network blip
+    // killed that input until the whole process was restarted, while the
+    // compositor happily kept painting its last frame. That is how the
+    // Doorbell froze the top half of `entry` for ~15 minutes on 2026-08-10
+    // with the camera itself perfectly healthy.
+    int backoff_ms = kReconnectMinMs;
     while (running_ && !g_stop) {
       int err = av_read_frame(fmt_, pkt);
-      if (err < 0) break;
+      if (err < 0) {
+        if (!running_ || g_stop) break;
+        LOGF("input '%s' dropped (%s) — reconnecting", log_name().c_str(),
+             av_err(err).c_str());
+        close_input();
+        // Reopen until it takes. Backoff is capped so a camera that is down
+        // for hours costs one attempt every kReconnectMaxMs rather than a
+        // spin, and so a flapping camera can't hammer the NVR.
+        while (running_ && !g_stop) {
+          // Sliced rather than one long sleep: stop() joins this thread, and a
+          // 30 s nap would hold up shutdown long enough for the supervisor's
+          // SIGTERM to be followed by a SIGKILL.
+          for (int slept = 0; slept < backoff_ms && running_ && !g_stop;
+               slept += 100)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          if (!running_ || g_stop) break;
+          int rerr = open_input(tap_orig_);
+          if (rerr >= 0) {
+            LOGF("input '%s' reconnected", log_name().c_str());
+            ++reconnects_;
+            backoff_ms = kReconnectMinMs;
+            break;
+          }
+          close_input(); // a partial open leaves contexts behind
+          backoff_ms = std::min(backoff_ms * 2, kReconnectMaxMs);
+        }
+        continue;
+      }
+      backoff_ms = kReconnectMinMs;
       // Audio used to be discarded here; it is the same connection, so taking
       // it costs one decode and no extra network read.
       if (tap_ && pkt->stream_index == tap_->stream_index()) {
@@ -205,12 +276,45 @@ private:
     if (latest_) av_frame_free(&latest_);
     latest_ = copy;
     ++count_;
+    last_frame_ms_.store(now_ms());
   }
 
 public:
   std::atomic<long long> count_{0};
 
+  // How long since this input produced a frame, in ms; -1 before its first.
+  // The compositor keeps painting the last frame of a dead input, so a frozen
+  // region is invisible in the output — this is the only thing that makes it
+  // detectable. Surfaced in /api/status.
+  long long frame_age_ms() const {
+    const long long t = last_frame_ms_.load();
+    return t ? now_ms() - t : -1;
+  }
+  long long reconnects() const { return reconnects_.load(); }
+  // A name safe to print and to serve from /api/status. The bare URL is not:
+  // a UniFi RTSP path is a bearer token in all but name, and the status JSON
+  // reaches the dashboard.
+  std::string log_name() const {
+    if (!passthrough_.empty()) return passthrough_;
+    const size_t s = url_.find("://");
+    const size_t h = (s == std::string::npos) ? 0 : s + 3;
+    const size_t e = url_.find('/', h);
+    return e == std::string::npos ? url_ : url_.substr(0, e) + "/...";
+  }
+
 private:
+  // Reconnect backoff bounds. Min is short so an ordinary blip is invisible;
+  // max keeps a camera that is down for hours to one attempt per interval
+  // instead of hammering the NVR.
+  static constexpr int kReconnectMinMs = 1000;
+  static constexpr int kReconnectMaxMs = 30000;
+
+  static long long now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
   AVFormatContext *fmt_ = nullptr;
   AVCodecContext *dec_ = nullptr;
   int stream_ = -1;
@@ -219,6 +323,13 @@ private:
   std::mutex mu_;
   AVFrame *latest_ = nullptr;
   audio::Tap *tap_ = nullptr; // not owned
+  // Reconnect state: what open() was originally called with.
+  std::string url_;
+  AVBufferRef *device_ = nullptr; // not owned
+  bool need_video_ = true;
+  audio::Tap *tap_orig_ = nullptr; // not owned; tap_ is nulled when unusable
+  std::atomic<long long> reconnects_{0};
+  std::atomic<long long> last_frame_ms_{0};
 
 public:
   // Republish this input's video packets under `name` on the RTSP server.
@@ -778,6 +889,22 @@ int run(const Config &cfg, const char *dest, long long max_frames,
     workers.push_back(w);
   }
 
+  // Every input, deduplicated by pointer (one Decoder can appear as both a
+  // composite input and an aux/audio source). Reported in /api/status so a
+  // frozen input is visible: the compositor keeps painting a dead input's last
+  // frame, so nothing in the OUTPUT stats can ever reveal one.
+  std::vector<Decoder *> all_inputs;
+  {
+    auto add = [&all_inputs](Decoder *d) {
+      if (d && std::find(all_inputs.begin(), all_inputs.end(), d) ==
+                   all_inputs.end())
+        all_inputs.push_back(d);
+    };
+    for (auto *d : decs) add(d);
+    for (auto &kv : auxd) add(kv.second);
+    for (auto *d : audio_only) add(d);
+  }
+
   // Serve the outputs over RTSP ourselves. Registered AFTER the encoders exist
   // so each stream advertises real codec parameters (SPS/PPS, profile, size) —
   // a DESCRIBE built from an unopened encoder yields an SDP clients reject.
@@ -791,7 +918,7 @@ int run(const Config &cfg, const char *dest, long long max_frames,
     // than needing a rewrite alongside the cutover.
     // Captures the globals, not the locals: rtsp_srv is declared below this
     // point, and both globals are set before any HTTP request can arrive.
-    webrtc_srv->set_status_provider([&workers]() {
+    webrtc_srv->set_status_provider([&workers, &all_inputs]() {
       std::ostringstream o;
       o << "{\"items\":[";
       bool first = true;
@@ -822,6 +949,15 @@ int run(const Config &cfg, const char *dest, long long max_frames,
           o << "{\"peer\":\"webrtc\",\"stream\":\"" << vi.stream
             << "\",\"via\":\"webrtc/" << vi.state << "\"}";
         }
+      }
+      o << "],\"inputs\":[";
+      bool ifirst = true;
+      for (auto *d : all_inputs) {
+        if (!ifirst) o << ",";
+        ifirst = false;
+        o << "{\"name\":\"" << d->log_name() << "\",\"frames\":" << d->count_
+          << ",\"ageMs\":" << d->frame_age_ms()
+          << ",\"reconnects\":" << d->reconnects() << "}";
       }
       o << "],\"rtspClients\":" << (g_rtsp ? g_rtsp->client_count() : 0)
         << ",\"webrtcViewers\":" << (g_webrtc ? g_webrtc->viewer_count() : 0)

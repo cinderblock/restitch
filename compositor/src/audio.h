@@ -61,6 +61,12 @@ public:
   // rather than failing the whole pipeline.
   bool open(AVStream *st);
 
+  // Re-bind to the audio stream of a REOPENED input. open() allocates
+  // unconditionally, so calling it twice would leak the previous decoder,
+  // resampler and frame — an input that reconnects a few times a day would
+  // leak steadily. Releases first, then opens.
+  bool rebind(AVStream *st);
+
   bool bound() const { return dec_ != nullptr; }
   int stream_index() const { return stream_index_; }
 

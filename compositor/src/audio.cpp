@@ -32,6 +32,20 @@ constexpr size_t kMaxBufferedSamples = kSampleRate * 2;
 
 // ---------------------------------------------------------------- Tap -----
 
+bool Tap::rebind(AVStream *st) {
+  // Same frees as the destructor. Buffered samples are deliberately kept: the
+  // mixer is still pulling from this tap, and dropping them would punch an
+  // extra hole in the audio on every reconnect.
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (swr_) swr_free(&swr_);
+    if (dec_) avcodec_free_context(&dec_);
+    if (frame_) av_frame_free(&frame_);
+    stream_index_ = -1;
+  }
+  return open(st);
+}
+
 Tap::~Tap() {
   if (swr_) swr_free(&swr_);
   if (dec_) avcodec_free_context(&dec_);
