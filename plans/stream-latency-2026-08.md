@@ -176,6 +176,74 @@ drop is logged (`not draining … — dropping to next keyframe` /
 `resynced at keyframe (N packets dropped, resync #M)`) and counted per session
 in `/api/status`.
 
+## REVERTED 2026-08-10 — the fix was worse than the bug
+
+All of it is backed out (`6517c4c`, compositor identical to `08ee127`). Live
+and verified healthy after the revert: 6 outputs, 0 encoder drops, ~2 s
+latency, healthy client shows **0 decode errors and zero drop/reap events**.
+
+**What happened.** Overnight the user's VLC froze and only came back when they
+reconnected it by hand. The logs showed 6002 "not draining" / 5683 "resynced"
+events cycling forever.
+
+**Why it was unfixable as designed.** Once a client falls behind, its backlog
+sits *pinned at the drop threshold*. The keyframe that would resync it has to
+fit in the same buffer — and it doesn't, because the buffer is full of the
+backlog. So the client never receives one complete frame and never recovers.
+Every mechanism added on top made it worse:
+
+- Clearing `resync` per keyframe re-stamped the "behind since" clock every GOP,
+  so the stall reaper never fired.
+- Fixing that made the reaper fire correctly — and then it disconnected a
+  *healthy* client every 10 s.
+
+**The threshold was the root flaw.** Half of a 2 MB socket buffer is ~1 s of
+slack on full-low. A normal client does not read that smoothly: plain ffmpeg
+decoding 3600x1280 reads in bursts. Measured on the deployed build, a
+full-speed **local** reader went `behind=true` within 5 s, took 11 h264 decode
+errors, and was reaped at 10 s. `john` and `all-field` behaved the same.
+
+**The load-bearing lesson:** with TCP you cannot un-send what is already in the
+kernel socket buffer. Every "drop to catch up" scheme that queues in the kernel
+is really a "drop and stay behind anyway" scheme. Latency can only be bounded
+where frames are still discardable — in userspace, before the socket.
+
+### What a correct fix would look like
+
+A per-session **userspace queue** with a small socket buffer beneath it, which
+is how mediamtx and go2rtc do this and why their reader queues are configurable:
+
+- Each session gets a bounded queue of whole encoded frames and its own writer
+  thread draining it into the socket.
+- `broadcast()` enqueues and returns — it never touches the socket, so the
+  encoder can never block (and `broadcast()`'s existing `try_lock` skip finally
+  means something, since a real second thread now holds the lock).
+- When the queue is full, discard from it — **stale frames are still in our
+  hands**, so a client genuinely returns to live instead of pinning at a
+  threshold it can never get under.
+- Size the queue in seconds of that stream's measured bitrate (~5 s), not in
+  bytes, and reap only after a long continuous stall (~60 s), so a client that
+  hiccups and recovers is never punished.
+
+### Things not to do (learned the hard way)
+
+- Do not bound latency with `SO_SNDBUF` alone — it makes the blocking `send()`
+  stall the *encoder*, since `broadcast()` writes inline on the producer thread.
+- Do not rely on `broadcast()`'s `try_lock` skip as a drop mechanism as the code
+  stands: the producer IS the writer, so nothing ever contends and it never
+  fires.
+- Do not predict a blocking send from `TIOCOUTQ` vs `SO_SNDBUF` — the kernel
+  budgets by skb truesize, not payload bytes.
+- Do not treat `MSG_DONTWAIT` + EAGAIN as the "client is behind" signal — a
+  nearly-full buffer returns a *short count* instead, and finishing the torn
+  remainder blocks.
+- Do not measure staleness by "when did a byte last move" — a wedged client's
+  small packets keep squeezing under the threshold and reset the clock.
+- **Verify against the encoder's drop counters, not the client.** Every wrong
+  version above looked fine from the client side. `full-low dropped=N` while
+  siblings sit at 0 is the tell, and a *healthy* client must be part of every
+  test — three of these bugs only appear when a normal reader is present.
+
 ## Progress log
 
 - [x] Confirmed ingest, compositing and RTSP output are all ~1-2 s.
@@ -183,12 +251,16 @@ in `/api/status`.
 - [x] Located the mechanism in `rtsp.cpp` and proved it with a slow reader.
 - [x] Implemented the per-client lateness bound (three attempts, see above).
 - [x] Re-ran the slow-reader experiment: Send-Q plateaus, resyncs log, encoder
-      untouched, healthy clients unaffected.
-- [ ] **Confirm with the user's real VLC session.** A server-side bound cannot
-      retract backlog VLC has already buffered internally, so if VLC still
-      drifts, check `ss -tn 'sport = :8554'` for its peer while it is late:
-      large Send-Q → still ours; ~0 → the backlog is inside VLC and the answer
-      is a lighter stream or VLC's own caching settings.
+      untouched — but this test used only a *slow* client, which is exactly why
+      it passed while the build was broken for healthy ones.
+- [x] **REVERTED** (`6517c4c`) after it froze the user's VLC overnight. Verified
+      healthy: 0 encoder drops, ~2 s latency, 0 decode errors for a normal
+      client.
+- [ ] Decide whether to build the userspace-queue version above, or accept the
+      original slow drift. **Open question for the user.**
+- [ ] The original symptom is still unfixed: a long-lived RTSP session drifts
+      late over many hours. It is real but mild — a restart of the viewer
+      clears it.
 
 ## Still open, found along the way (not latency)
 
