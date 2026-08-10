@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <netinet/in.h>
@@ -57,6 +58,30 @@ constexpr int kSendTimeoutSec = 10;
 // above the LAN bandwidth-delay product (~4 KB at 100 Mbps / 0.3 ms), so a
 // healthy client is unaffected.
 constexpr int kSendBufBytes = 1 << 20; // 1 MiB (kernel doubles it)
+
+// How long a client may deliver NOTHING before it is dropped so it can
+// reconnect. This restores the reaping that SO_SNDTIMEO used to provide: that
+// only ever fired because writes blocked, and writes no longer block, so
+// without this a stuck client is never noticed at all.
+//
+// It also breaks a genuine deadlock. Once a client stops draining, outq pins at
+// the drop threshold and stays there — so every keyframe clears the resync
+// flag, then re-trips the threshold on that keyframe's own first packet and
+// loses the rest of it. The client never receives one complete frame and never
+// recovers, while the server cheerfully logs a "resync" each time. Observed
+// overnight 2026-08-09: 6002 drop / 5683 "resync" events on a frozen VLC that
+// only came back when the user reconnected it by hand.
+//
+// Dropping is the recovery. A player pointed at a looping single-item playlist
+// reconnects on EOF and lands back at the live edge, which is exactly the
+// manual fix, automated.
+constexpr int kMaxStallSec = 10;
+
+int64_t now_us() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 bool write_all(int fd, const uint8_t *p, size_t n) {
   while (n > 0) {
@@ -116,6 +141,10 @@ struct Server::Session {
   std::atomic<uint64_t> skipped{0}; // packets dropped for this client, lifetime
   uint64_t resyncs = 0;             // times it recovered at a keyframe (under mu)
   int sndbuf = 0;                   // kernel's real SO_SNDBUF (it doubles ours)
+  // Last time a packet actually reached the socket. Not "last time we tried" —
+  // a wedged client is one we keep trying and failing to write, so only real
+  // progress may reset the stall clock.
+  std::atomic<int64_t> last_progress_us{0};
 
   ~Session() {
     if (rtp) {
@@ -307,6 +336,8 @@ static int session_write(void *opaque, const uint8_t *buf, int size) {
     }
   }
 
+  if (ok) s->last_progress_us.store(now_us());
+
   if (!ok) {
     // Shut the socket down so the connection thread's blocking recv() returns
     // and cleans up; otherwise it parks forever on a socket nobody reads.
@@ -431,6 +462,9 @@ void Server::serve_conn(int fd) {
         sess->fd = fd;
         sess->stream = name;
         sess->interleaved = want_tcp;
+        // Start the stall clock now, not on the first successful write — a
+        // client that never manages a single packet still has to be reaped.
+        sess->last_progress_us.store(now_us());
         // The kernel's real buffer, not what we asked for — Linux doubles the
         // SO_SNDBUF request. session_write budgets against this.
         {
@@ -593,16 +627,32 @@ void Server::broadcast(const std::string &name, const AVPacket *pkt) {
     }
     if (s->dead) continue;
 
+    // A client we have written nothing to for kMaxStallSec is not slow, it is
+    // stuck — either it stopped reading, or its backlog is pinned at the drop
+    // threshold so even keyframes can't get through. Either way it will never
+    // recover on this connection. Drop it; a looping player reconnects and
+    // lands back at live.
+    const int64_t last = s->last_progress_us.load();
+    if (last && now_us() - last > (int64_t)kMaxStallSec * 1000000) {
+      RLOGF("client on '%s' delivered nothing for %ds — dropping so it can "
+            "reconnect (%llu packets dropped)",
+            s->stream.c_str(), kMaxStallSec,
+            (unsigned long long)s->skipped.load());
+      s->dead = true;
+      ::shutdown(s->fd, SHUT_RDWR);
+      continue;
+    }
+
     // Resume only on a keyframe, so the client resumes on a decodable stream
-    // rather than mid-GOP.
+    // rather than mid-GOP. Clearing the flag only lets the keyframe *try* —
+    // session_write re-sets it if the keyframe doesn't fit either, so success
+    // is confirmed after the write, not assumed before it. Claiming a resync
+    // that never happened is how a wedged client looked healthy in the log.
+    bool trying_resync = false;
     if (s->resync.load()) {
       if (!(pkt->flags & AV_PKT_FLAG_KEY)) { ++s->skipped; continue; }
       s->resync.store(false);
-      ++s->resyncs;
-      RLOGF("client on '%s' resynced at keyframe (%llu packets dropped, "
-            "resync #%llu)",
-            s->stream.c_str(), (unsigned long long)s->skipped.load(),
-            (unsigned long long)s->resyncs);
+      trying_resync = true;
     }
     // A packet with no PTS rescales to garbage and lands as one wild RTP
     // timestamp among otherwise perfect 3000-tick steps — enough of a
@@ -619,6 +669,16 @@ void Server::broadcast(const std::string &name, const AVPacket *pkt) {
     av_packet_rescale_ts(c, s->src_tb, s->st->time_base);
     if (av_write_frame(s->rtp, c) < 0) s->dead = true;
     av_packet_free(&c);
+
+    // Only now is a recovery real: if session_write re-raised the flag, the
+    // keyframe didn't fit either and the client is still behind.
+    if (trying_resync && !s->resync.load()) {
+      ++s->resyncs;
+      RLOGF("client on '%s' resynced at keyframe (%llu packets dropped, "
+            "resync #%llu)",
+            s->stream.c_str(), (unsigned long long)s->skipped.load(),
+            (unsigned long long)s->resyncs);
+    }
   }
 }
 
