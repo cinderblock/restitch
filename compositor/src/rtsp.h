@@ -72,6 +72,12 @@ public:
     std::string peer;
     std::string stream;
     std::string transport; // "tcp" | "udp"
+    // Frames discarded for this client because it could not keep up. Non-zero
+    // means the viewer is losing video to stay near live — the thing to look
+    // at when someone reports stuttering, and the only outward sign that a
+    // particular client (not the server) is the problem.
+    uint64_t dropped = 0;
+    size_t queued = 0; // frames waiting to go out right now
   };
   std::vector<SessionInfo> sessions() const;
 
@@ -83,6 +89,9 @@ private:
 
   void accept_loop();
   void serve_conn(int fd);
+  // Drains one session's queue on its own thread; stop_writer joins it.
+  void session_writer(Session *s);
+  void stop_writer(Session &s);
 
   int listen_fd_ = -1;
   int port_ = 0;

@@ -291,6 +291,10 @@ public:
     return t ? now_ms() - t : -1;
   }
   long long reconnects() const { return reconnects_.load(); }
+  // Audio-only inputs never publish a video frame, so their age is permanently
+  // -1. Flag them, or anything watching for a stale input reads them as frozen
+  // forever — a false positive that would make the whole signal useless.
+  bool has_video() const { return need_video_; }
   // A name safe to print and to serve from /api/status. The bare URL is not:
   // a UniFi RTSP path is a bearer token in all but name, and the status JSON
   // reaches the dashboard.
@@ -939,7 +943,9 @@ int run(const Config &cfg, const char *dest, long long max_frames,
           if (!sfirst) o << ",";
           sfirst = false;
           o << "{\"peer\":\"" << si.peer << "\",\"stream\":\"" << si.stream
-            << "\",\"via\":\"rtsp/" << si.transport << "\"}";
+            << "\",\"via\":\"rtsp/" << si.transport
+            << "\",\"dropped\":" << si.dropped
+            << ",\"queued\":" << si.queued << "}";
         }
       }
       if (g_webrtc) {
@@ -957,7 +963,8 @@ int run(const Config &cfg, const char *dest, long long max_frames,
         ifirst = false;
         o << "{\"name\":\"" << d->log_name() << "\",\"frames\":" << d->count_
           << ",\"ageMs\":" << d->frame_age_ms()
-          << ",\"reconnects\":" << d->reconnects() << "}";
+          << ",\"reconnects\":" << d->reconnects()
+          << ",\"video\":" << (d->has_video() ? "true" : "false") << "}";
       }
       o << "],\"rtspClients\":" << (g_rtsp ? g_rtsp->client_count() : 0)
         << ",\"webrtcViewers\":" << (g_webrtc ? g_webrtc->viewer_count() : 0)

@@ -4,7 +4,9 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstdio>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sstream>
@@ -29,6 +31,24 @@ namespace {
 // enough to ride out a multi-megabyte keyframe on a slow link, short enough
 // that a dead client is reaped rather than starving its own session forever.
 constexpr int kSendTimeoutSec = 10;
+
+// Per-client queue bound. Whichever trips first wins: frames bound the
+// LATENCY (at 30 fps this is ~3 s), bytes bound the MEMORY so a fat stream
+// like `full` (7560x2688 hevc) cannot hoard hundreds of MB per viewer.
+//
+// Sized generously on purpose. An earlier attempt bounded a client to ~1 s and
+// dropped frames the moment it exceeded that; real clients do not read that
+// smoothly (ffmpeg decoding 3600x1280 reads in bursts) and healthy viewers
+// were mangled. A few seconds of slack absorbs an ordinary hiccup and still
+// bounds drift to something far short of the ~20 s that started all this.
+constexpr size_t kMaxQueueFrames = 90;
+constexpr size_t kMaxQueueBytes = 24u << 20; // 24 MiB
+
+// Keep the kernel's own buffer modest so it cannot become a second, INVISIBLE
+// queue underneath ours — anything sitting there is beyond our reach and is
+// pure latency. Total client latency is roughly this plus the queue above.
+// Far above the LAN bandwidth-delay product, so throughput is unaffected.
+constexpr int kSendBufBytes = 512 << 10; // 512 KiB
 
 bool write_all(int fd, const uint8_t *p, size_t n) {
   while (n > 0) {
@@ -79,7 +99,27 @@ struct Server::Session {
   std::atomic<bool> dead{false};
   size_t pending = 0;     // bytes handed to the muxer for the current packet
 
+  // --- per-client send queue -------------------------------------------
+  // The encoder thread enqueues here and returns; a writer thread owns the
+  // muxer and the socket. This is the whole point: frames sitting in THIS
+  // queue are still ours to discard, so a client that falls behind can be
+  // dropped forward to live. Bytes already handed to the kernel cannot be
+  // recalled, which is why bounding the socket buffer alone could never fix
+  // the drift and instead wedged clients (plans/stream-latency-2026-08.md).
+  std::mutex qmu;
+  std::condition_variable qcv;
+  std::deque<AVPacket *> queue; // owned clones, in send order
+  size_t queue_bytes = 0;
+  // Set when the queue was flushed: the client's GOP now has a hole, so send
+  // nothing until the next keyframe rather than a stream it cannot decode.
+  bool need_key = false;
+  std::atomic<uint64_t> dropped{0};
+  std::thread writer;
+  std::atomic<bool> writer_run{false};
+
   ~Session() {
+    for (auto *p : queue) { AVPacket *q = p; av_packet_free(&q); }
+    queue.clear();
     if (rtp) {
       if (rtp->pb) {
         if (interleaved) {
@@ -138,9 +178,26 @@ void Server::stop() {
   if (!running_.exchange(false)) return;
   if (listen_fd_ >= 0) { ::shutdown(listen_fd_, SHUT_RDWR); ::close(listen_fd_); listen_fd_ = -1; }
   if (accept_thread_.joinable()) accept_thread_.join();
+
+  // Take a snapshot and release the lock: joining a writer while holding
+  // sessions_mu_ would deadlock against anything that needs it, and a writer
+  // parked in send() can take until SO_SNDTIMEO to notice.
+  std::vector<std::shared_ptr<Session>> snapshot;
+  {
+    std::lock_guard<std::mutex> lk(sessions_mu_);
+    snapshot.swap(sessions_);
+  }
+  for (auto &s : snapshot) {
+    s->dead = true;
+    // shutdown(), not close(): it unblocks a writer parked in send() straight
+    // away, and the connection thread still owns this fd and will close it.
+    // Closing here raced that thread into a double close.
+    if (s->fd >= 0) ::shutdown(s->fd, SHUT_RDWR);
+    stop_writer(*s);
+  }
+  snapshot.clear();
+
   std::lock_guard<std::mutex> lk(sessions_mu_);
-  for (auto &s : sessions_) { s->dead = true; if (s->fd >= 0) ::close(s->fd); }
-  sessions_.clear();
   for (auto &kv : streams_) if (kv.second.par) avcodec_parameters_free(&kv.second.par);
 }
 
@@ -165,6 +222,10 @@ void Server::accept_loop() {
     timeval tv{};
     tv.tv_sec = kSendTimeoutSec;
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    // See kSendBufBytes: keep the kernel from hoarding a second queue we
+    // cannot see into or discard from.
+    int sndbuf = kSendBufBytes;
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     std::thread([this, fd] { serve_conn(fd); }).detach();
   }
 }
@@ -385,6 +446,10 @@ void Server::serve_conn(int fd) {
       if (method == "PLAY") {
         if (!sess) { reply("455 Method Not Valid In This State", cseq); continue; }
         reply("200 OK", cseq, "Session: " + session_id + "\r\n");
+        // Start the writer BEFORE the session is visible to broadcast(), so
+        // no packet can be enqueued with nobody to drain it.
+        sess->writer_run = true;
+        sess->writer = std::thread([this, s = sess.get()] { session_writer(s); });
         {
           std::lock_guard<std::mutex> lk(sessions_mu_);
           sessions_.push_back(sess);
@@ -413,6 +478,10 @@ void Server::serve_conn(int fd) {
                                    }),
                     sessions_.end());
   }
+  // Join the writer BEFORE closing the fd: it is mid-send on this descriptor,
+  // and closing underneath it would at best fail the write and at worst write
+  // into whatever the number gets recycled for.
+  if (sess) stop_writer(*sess);
   ::close(fd);
   --clients_;
 }
@@ -422,9 +491,68 @@ std::vector<Server::SessionInfo> Server::sessions() const {
   std::lock_guard<std::mutex> lk(sessions_mu_);
   for (const auto &s : sessions_) {
     if (s->dead) continue;
-    out.push_back({s->peer, s->stream, s->interleaved ? "tcp" : "udp"});
+    size_t q = 0;
+    {
+      std::lock_guard<std::mutex> qlk(s->qmu);
+      q = s->queue.size();
+    }
+    out.push_back({s->peer, s->stream, s->interleaved ? "tcp" : "udp",
+                   s->dropped.load(), q});
   }
   return out;
+}
+
+// Drain one client's queue onto its socket. Runs on its OWN thread, so a
+// blocking send here costs only this client. The encoder thread never gets
+// here — that was the defect behind every earlier attempt, where broadcast()
+// wrote inline and one slow viewer stalled the whole output.
+void Server::stop_writer(Session &s) {
+  if (!s.writer.joinable()) return;
+  {
+    std::lock_guard<std::mutex> lk(s.qmu);
+    s.writer_run = false;
+  }
+  s.qcv.notify_all();
+  s.writer.join();
+}
+
+void Server::session_writer(Session *s) {
+  for (;;) {
+    AVPacket *p = nullptr;
+    {
+      std::unique_lock<std::mutex> lk(s->qmu);
+      s->qcv.wait(lk, [s] {
+        return !s->queue.empty() || s->dead.load() || !s->writer_run.load();
+      });
+      if (s->queue.empty()) {
+        if (s->dead.load() || !s->writer_run.load()) break;
+        continue;
+      }
+      p = s->queue.front();
+      s->queue.pop_front();
+      s->queue_bytes -= (size_t)p->size;
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(s->mu);
+      if (!s->dead.load()) {
+        p->stream_index = 0;
+        // st->time_base is whatever write_header settled on (1/90000 for RTP).
+        av_packet_rescale_ts(p, s->src_tb, s->st->time_base);
+        // Blocking, bounded by SO_SNDTIMEO. A client that stops reading
+        // entirely trips that and is marked dead by session_write — which is
+        // how a frozen viewer gets reaped now that it cannot simply rot in an
+        // ever-growing buffer.
+        if (av_write_frame(s->rtp, p) < 0) s->dead = true;
+      }
+    }
+    av_packet_free(&p);
+  }
+
+  std::lock_guard<std::mutex> lk(s->qmu);
+  for (auto *q : s->queue) { AVPacket *r = q; av_packet_free(&r); }
+  s->queue.clear();
+  s->queue_bytes = 0;
 }
 
 void Server::broadcast(const std::string &name, const AVPacket *pkt) {
@@ -435,27 +563,47 @@ void Server::broadcast(const std::string &name, const AVPacket *pkt) {
     for (auto &s : sessions_)
       if (!s->dead && s->stream == name) targets.push_back(s);
   }
+  // A packet with no PTS rescales to garbage and lands as one wild RTP
+  // timestamp among otherwise perfect 3000-tick steps — enough of a
+  // discontinuity for a player to give up right after joining. Fall back to
+  // DTS, and drop the packet if neither is set rather than emit a lie.
+  const int64_t pts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+  if (pts == AV_NOPTS_VALUE) return;
+  const bool key = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
+
   for (auto &s : targets) {
-    std::unique_lock<std::mutex> lk(s->mu, std::try_to_lock);
-    // If this client's writer is still busy, skip it rather than queue behind
-    // it. A stuck reader must only ever starve itself.
-    if (!lk.owns_lock()) continue;
+    std::unique_lock<std::mutex> lk(s->qmu);
     if (s->dead) continue;
-    // A packet with no PTS rescales to garbage and lands as one wild RTP
-    // timestamp among otherwise perfect 3000-tick steps — enough of a
-    // discontinuity for a player to give up right after joining. Fall back to
-    // DTS, and drop the packet if neither is set rather than emit a lie.
-    int64_t pts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
-    if (pts == AV_NOPTS_VALUE) continue;
+
+    // After a flush, wait for a keyframe. Sending the tail of a GOP whose
+    // start we discarded just hands the client garbage to decode.
+    if (s->need_key && !key) { ++s->dropped; continue; }
+
+    if (s->queue.size() >= kMaxQueueFrames ||
+        s->queue_bytes >= kMaxQueueBytes) {
+      // This client is not keeping up. Throw away what it has not received
+      // yet and restart it at the next keyframe: it loses a couple of seconds
+      // of video and comes back LIVE, instead of falling permanently behind.
+      size_t n = s->queue.size();
+      for (auto *q : s->queue) { AVPacket *r = q; av_packet_free(&r); }
+      s->queue.clear();
+      s->queue_bytes = 0;
+      s->dropped += n;
+      s->need_key = true;
+      RLOGF("client on '%s' behind — flushed %zu queued frames, resuming at "
+            "next keyframe (%llu dropped)",
+            s->stream.c_str(), n, (unsigned long long)s->dropped.load());
+      if (!key) continue;
+    }
 
     AVPacket *c = av_packet_clone(pkt);
     if (!c) continue;
-    c->stream_index = 0;
     c->pts = c->dts = pts;
-    // st->time_base is whatever write_header settled on (1/90000 for RTP).
-    av_packet_rescale_ts(c, s->src_tb, s->st->time_base);
-    if (av_write_frame(s->rtp, c) < 0) s->dead = true;
-    av_packet_free(&c);
+    s->queue.push_back(c);
+    s->queue_bytes += (size_t)c->size;
+    s->need_key = false;
+    lk.unlock();
+    s->qcv.notify_one();
   }
 }
 
