@@ -812,9 +812,7 @@ int run(const Config &cfg, const char *dest, long long max_frames,
           if (!sfirst) o << ",";
           sfirst = false;
           o << "{\"peer\":\"" << si.peer << "\",\"stream\":\"" << si.stream
-            << "\",\"via\":\"rtsp/" << si.transport
-            << "\",\"dropped\":" << si.dropped
-            << ",\"behind\":" << (si.behind ? "true" : "false") << "}";
+            << "\",\"via\":\"rtsp/" << si.transport << "\"}";
         }
       }
       if (g_webrtc) {

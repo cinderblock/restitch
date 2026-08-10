@@ -17,12 +17,9 @@
 // * TCP interleaved transport only ($-framed on the RTSP socket). Every client
 //   we care about supports it, mediamtx was already configured
 //   `rtspTransports: [tcp]`, and it traverses NAT without a second socket.
-// * A slow client LOSES FRAMES, never latency, and never blocks the encoder.
-//   This is the same lesson as the audio pump: back-pressure from one consumer
-//   must not propagate into the pipeline. Note this requires a capped
-//   SO_SNDBUF to work at all — with an autotuned buffer the kernel silently
-//   absorbs megabytes and the client goes stale instead of dropping. See
-//   kSendBufBytes in rtsp.cpp and plans/stream-latency-2026-08.md.
+// * A slow client is DROPPED, never allowed to block the encoder. This is the
+//   same lesson as the audio pump: back-pressure from one consumer must not
+//   propagate into the pipeline.
 
 #pragma once
 
@@ -75,11 +72,6 @@ public:
     std::string peer;
     std::string stream;
     std::string transport; // "tcp" | "udp"
-    // Packets dropped for this client because it wasn't draining. Non-zero
-    // means the viewer is losing frames to keep its latency bounded — the
-    // thing to look at when someone says a stream is stuttering.
-    uint64_t dropped = 0;
-    bool behind = false; // currently waiting for a keyframe to resync
   };
   std::vector<SessionInfo> sessions() const;
 
