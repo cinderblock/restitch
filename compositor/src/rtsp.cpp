@@ -77,6 +77,16 @@ constexpr int kSendBufBytes = 1 << 20; // 1 MiB (kernel doubles it)
 // manual fix, automated.
 constexpr int kMaxStallSec = 10;
 
+// Stamp when a client FIRST fell behind, and leave it alone after that. Each
+// keyframe clears the resync flag to let the keyframe try, so a client that is
+// still stuck re-enters the "just went behind" path once per GOP — plain
+// assignment there would reset the clock every 2 s and the stall reaper would
+// never fire. Only a confirmed resync clears it.
+void mark_behind(std::atomic<int64_t> &behind_since, int64_t now) {
+  int64_t expected = 0;
+  behind_since.compare_exchange_strong(expected, now);
+}
+
 int64_t now_us() {
   return std::chrono::duration_cast<std::chrono::microseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
@@ -288,12 +298,11 @@ static int session_write(void *opaque, const uint8_t *buf, int size) {
     int outq = 0;
     if (::ioctl(s->fd, TIOCOUTQ, &outq) == 0 &&
         outq + 4 + size > s->sndbuf / 2) {
-      if (!s->resync.exchange(true)) {
-        s->behind_since_us.store(now_us());
+      mark_behind(s->behind_since_us, now_us());
+      if (!s->resync.exchange(true))
         RLOGF("client on '%s' not draining (%d KB queued) — dropping to next "
               "keyframe",
               s->stream.c_str(), outq / 1024);
-      }
       ++s->skipped;
       return size;
     }
@@ -618,11 +627,10 @@ void Server::broadcast(const std::string &name, const AVPacket *pkt) {
       // hole means everything up to the next keyframe would decode as garbage,
       // so flag a resync. Log only the transition — a client that is
       // persistently slow must not spam a line per frame.
-      if (!s->resync.exchange(true)) {
-        s->behind_since_us.store(now_us());
+      mark_behind(s->behind_since_us, now_us());
+      if (!s->resync.exchange(true))
         RLOGF("client on '%s' not draining — dropping to next keyframe",
               s->stream.c_str());
-      }
       ++s->skipped;
       continue;
     }
