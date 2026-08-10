@@ -93,7 +93,20 @@ side instance, and make the healthy case part of every test.
 - [x] Attributed the freeze to a dead stitchd input, camera proven healthy.
 - [x] Found the root cause and confirmed no reconnect logic exists.
 - [x] Restored service by restarting the container.
-- [ ] Implement reconnect + frame-age tracking + status exposure.
+- [x] Implemented reconnect + frame-age tracking + status exposure (`67875de`).
+      Capped backoff 1 s → 30 s, sliced so `stop()` still joins promptly.
+      `Tap::rebind()` avoids leaking the audio decoder on every retry.
+- [x] Validated on the side instance (`plans/tmp-side-instance.sh`): input
+      killed → logged, siblings kept running at 0 drops, output kept encoding;
+      source restored → age 62695 ms → 15 ms, reconnects 0 → 1; 5 retries over
+      ~50 s of downtime; clean stop in 305 ms while parked in backoff.
+- [x] Deployed. Production reports all 10 inputs healthy with ages in ms.
+- [x] Flagged audio-only inputs `"video": false` — `raw/blue` and `raw/bullet`
+      never publish a video frame, so they read as permanently stale otherwise
+      and would poison any staleness alert with false positives.
+- [ ] Optional follow-up: have the supervisor's watchdog alert on a video
+      input whose `ageMs` exceeds a threshold. The data is now exposed; nothing
+      consumes it yet, so a freeze is *visible* but still not *announced*.
 
 ## Things not to do
 

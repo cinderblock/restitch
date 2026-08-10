@@ -225,6 +225,60 @@ is how mediamtx and go2rtc do this and why their reader queues are configurable:
   bytes, and reap only after a long continuous stall (~60 s), so a client that
   hiccups and recovers is never punished.
 
+## The userspace queue — built and validated 2026-08-10
+
+Implemented as designed above. Each session gets a bounded queue of whole
+encoded packets plus its own writer thread; `broadcast()` clones into the queue
+and returns, so the encoder thread never touches a socket. On overflow the
+queue is **flushed** and the client resumes at the next keyframe — possible
+only because those frames are still in our memory, which is the exact thing the
+kernel-buffer approach could never do.
+
+Key sizes: `kMaxQueueFrames = 90` (~3 s at 30 fps) and `kMaxQueueBytes = 24 MiB`
+(whichever trips first — frames bound latency, bytes bound memory so `full`
+can't hoard hundreds of MB per viewer), with `SO_SNDBUF` at 512 KiB so the
+kernel can't become a second invisible queue.
+
+**Sized deliberately generously.** The reverted attempt bounded a client to
+~1 s and dropped the moment it exceeded that, which mangled healthy viewers.
+
+Reaping came back for free: the writer thread does a blocking send, so
+`SO_SNDTIMEO` fires on a client that stops reading and marks it dead — the
+mechanism that existed before, working again now that blocking costs only the
+one client.
+
+### The test rig (reusable — use it before touching this code again)
+
+Kept in `plans/`, because every bad version of this change looked fine until it
+was tested with a healthy client present:
+
+- `tmp-rtsp-relay.py` — dumb TCP relay. A side stitchd reads production's RTSP
+  *through* it, so killing the relay simulates an input dying without touching
+  production.
+- `tmp-side-instance.sh` — brings up two relays plus a side stitchd on ports
+  8556 (RTSP) / 8891 (status), reading production's `entry` as its inputs.
+- `tmp-client-matrix.sh`, `tmp-client-matrix2.sh` — the four client cases below.
+
+Build the binary with the `stitchd-test:latest` image (= `stitchd-dev` plus
+`libssl-dev` and libdatachannel; the plain dev image cannot configure, because
+`find_package(OpenSSL REQUIRED)` is unconditional). Note a side instance reading
+full-res bays hit `CUDA_ERROR_MAP_FAILED` on NVDEC while production was running
+— use production's smaller outputs (`entry`) as test inputs instead.
+
+### Validation (side instance, ports 8556/8891, production untouched)
+
+| Case | Result |
+| --- | --- |
+| Healthy client alone, 32 s | 0 client drops, 0 queued, **0 decode errors**, 0 encoder drops |
+| Healthy + 40 %-speed client | healthy stays `dropped=0 queued=0`, **0 decode errors**; slow one absorbs 229 drops; `out_dropped=0` throughout |
+| Frozen client (reads nothing) | flushed, then **reaped** (`rtspClients` 2 → 1); healthy sibling **0 decode errors**; `out_dropped=0` |
+| 25 connect/disconnect cycles | threads 12 → **12** (no writer-thread leak), `rtspClients` back to 0 |
+| 4 min healthy soak | see progress log |
+
+The slow client took **0 decode errors** — resuming at a keyframe gives it a
+decodable stream. The reverted attempt produced 11 decode errors on a *healthy*
+client.
+
 ### Things not to do (learned the hard way)
 
 - Do not bound latency with `SO_SNDBUF` alone — it makes the blocking `send()`
@@ -256,11 +310,17 @@ is how mediamtx and go2rtc do this and why their reader queues are configurable:
 - [x] **REVERTED** (`6517c4c`) after it froze the user's VLC overnight. Verified
       healthy: 0 encoder drops, ~2 s latency, 0 decode errors for a normal
       client.
-- [ ] Decide whether to build the userspace-queue version above, or accept the
-      original slow drift. **Open question for the user.**
-- [ ] The original symptom is still unfixed: a long-lived RTSP session drifts
-      late over many hours. It is real but mild — a restart of the viewer
-      clears it.
+- [x] User chose to build it ("do it all", 2026-08-10). Implemented as designed
+      below and validated on an isolated side instance before deploying.
+- [x] Shipped the userspace queue (`8b38317`) and verified in production:
+      6 outputs 0 drops, sessions `dropped=0 queued=0`, a 30 s healthy client
+      with **0 decode errors**, **0 flushes**, latency ~1-2 s against the
+      camera OSD.
+- [ ] **Confirm against the user's real VLC over days.** A long-lived session
+      should now stay near live: if it falls behind it loses a few seconds of
+      video and resumes at a keyframe, and if it wedges entirely it is reaped
+      and a looping player reconnects. Watch `dropped`/`queued` per session in
+      `/api/status`.
 
 ## Still open, found along the way (not latency)
 
