@@ -30,6 +30,26 @@ namespace {
 // that a dead client is reaped rather than starving its own session forever.
 constexpr int kSendTimeoutSec = 10;
 
+// Cap the kernel send buffer per client. THIS IS A LATENCY BOUND, not a memory
+// tuning knob, and it is the whole reason a slow reader can't silently rot.
+//
+// Left to autotune, SO_SNDBUF grows into the tens of megabytes. A client that
+// reads even slightly slower than realtime then never makes send() block, so
+// it is never reaped by SO_SNDTIMEO and the broadcast writer is never "busy" —
+// every packet is accepted into the buffer and the client's *latency* grows
+// without bound instead. Measured 2026-08-09 with a reader at 90% of realtime:
+// Send-Q climbed 15 KB → 3.28 MB in 100 s, monotonic, never dropped. A 1% read
+// deficit accumulates ~36 s of lag per hour. That is the "streams are 20s late"
+// bug, and it presents as a perfectly clean stream that is simply stale.
+//
+// Capping the buffer converts backlog into back-pressure: send() blocks, the
+// writer stays busy, and broadcast() skips that session (drop) instead of
+// queueing behind it. Sized in bytes, so it bounds a fat stream to less time
+// than a thin one, which is the behaviour we want. Far above the LAN
+// bandwidth-delay product (~4 KB at 100 Mbps / 0.3 ms), so throughput is
+// unaffected.
+constexpr int kSendBufBytes = 1 << 20; // 1 MiB
+
 bool write_all(int fd, const uint8_t *p, size_t n) {
   while (n > 0) {
     ssize_t w = ::send(fd, p, n, MSG_NOSIGNAL);
@@ -78,6 +98,15 @@ struct Server::Session {
   std::mutex mu;          // serializes writes to fd + muxer
   std::atomic<bool> dead{false};
   size_t pending = 0;     // bytes handed to the muxer for the current packet
+  // Set when a packet had to be skipped because this client's writer was still
+  // blocked (i.e. it is not draining fast enough). Once any packet is skipped
+  // the client's bitstream has a hole, so nothing more is sent to it until the
+  // next keyframe lets it start clean. Atomic because it is set from
+  // broadcast() without holding `mu` — that is the whole point: the writer
+  // thread owns the lock precisely when we need to record the skip.
+  std::atomic<bool> resync{false};
+  std::atomic<uint64_t> skipped{0}; // packets dropped for this client, lifetime
+  uint64_t resyncs = 0;             // times it recovered at a keyframe (under mu)
 
   ~Session() {
     if (rtp) {
@@ -165,6 +194,12 @@ void Server::accept_loop() {
     timeval tv{};
     tv.tv_sec = kSendTimeoutSec;
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    // Bound queued-but-unsent video (see kSendBufBytes). Must be set before
+    // the connection is used; on Linux the kernel doubles the requested value
+    // for bookkeeping, which is fine — we only need it to stay O(1 MB) rather
+    // than autotuning into seconds of backlog.
+    int sndbuf = kSendBufBytes;
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     std::thread([this, fd] { serve_conn(fd); }).detach();
   }
 }
@@ -422,7 +457,8 @@ std::vector<Server::SessionInfo> Server::sessions() const {
   std::lock_guard<std::mutex> lk(sessions_mu_);
   for (const auto &s : sessions_) {
     if (s->dead) continue;
-    out.push_back({s->peer, s->stream, s->interleaved ? "tcp" : "udp"});
+    out.push_back({s->peer, s->stream, s->interleaved ? "tcp" : "udp",
+                   s->skipped.load(), s->resync.load()});
   }
   return out;
 }
@@ -439,8 +475,31 @@ void Server::broadcast(const std::string &name, const AVPacket *pkt) {
     std::unique_lock<std::mutex> lk(s->mu, std::try_to_lock);
     // If this client's writer is still busy, skip it rather than queue behind
     // it. A stuck reader must only ever starve itself.
-    if (!lk.owns_lock()) continue;
+    if (!lk.owns_lock()) {
+      // Record the skip. With a bounded send buffer this is how a slow reader
+      // is throttled: it loses frames instead of accumulating latency. The
+      // hole means everything up to the next keyframe would decode as garbage,
+      // so flag a resync. Log only the transition — a client that is
+      // persistently slow must not spam a line per frame.
+      if (!s->resync.exchange(true))
+        RLOGF("client on '%s' not draining — dropping to next keyframe",
+              s->stream.c_str());
+      ++s->skipped;
+      continue;
+    }
     if (s->dead) continue;
+
+    // Resume only on a keyframe, so the client resumes on a decodable stream
+    // rather than mid-GOP.
+    if (s->resync.load()) {
+      if (!(pkt->flags & AV_PKT_FLAG_KEY)) { ++s->skipped; continue; }
+      s->resync.store(false);
+      ++s->resyncs;
+      RLOGF("client on '%s' resynced at keyframe (%llu packets dropped, "
+            "resync #%llu)",
+            s->stream.c_str(), (unsigned long long)s->skipped.load(),
+            (unsigned long long)s->resyncs);
+    }
     // A packet with no PTS rescales to garbage and lands as one wild RTP
     // timestamp among otherwise perfect 3000-tick steps — enough of a
     // discontinuity for a player to give up right after joining. Fall back to
