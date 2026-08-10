@@ -10,6 +10,7 @@
 #include <sstream>
 #include <sys/ioctl.h> // TIOCOUTQ: unsent bytes, i.e. this client's backlog
 #include <sys/socket.h>
+#include <sys/uio.h> // iovec, for writing the $-header and payload as one frame
 #include <unistd.h>
 
 extern "C" {
@@ -114,7 +115,6 @@ struct Server::Session {
   std::atomic<bool> resync{false};
   std::atomic<uint64_t> skipped{0}; // packets dropped for this client, lifetime
   uint64_t resyncs = 0;             // times it recovered at a keyframe (under mu)
-  int sndbuf = 0;                   // kernel's real SO_SNDBUF for this fd
 
   ~Session() {
     if (rtp) {
@@ -225,30 +225,62 @@ static int session_write(void *opaque, const uint8_t *buf, int size) {
   // framing permanently, which is unrecoverable in a way a missing frame is not.
   if (s->resync.load()) { ++s->skipped; return size; }
 
+  uint8_t hdr[4] = {0x24, (uint8_t)s->rtp_channel, (uint8_t)(size >> 8),
+                    (uint8_t)(size & 0xff)};
+
   // Never block the producer. broadcast() runs on the encoder thread and writes
   // inline, so a blocking send() here is back-pressure straight into the
-  // pipeline: measured 2026-08-09, one reader at 90% of realtime cost full-low
-  // 2744 of 7070 frames while its sibling outputs dropped none. The client that
-  // can't keep up must lose frames by itself.
+  // pipeline: measured 2026-08-09, one slow reader cost full-low 2744 of 7070
+  // frames while its sibling outputs dropped none. The client that can't keep
+  // up must lose frames by itself.
   //
-  // So: only write when the whole $-frame demonstrably fits in the socket
-  // buffer. Whole packets or nothing, checked before committing to any of it.
-  if (s->interleaved && s->sndbuf > 0) {
-    int outq = 0;
-    if (::ioctl(s->fd, TIOCOUTQ, &outq) == 0 &&
-        outq + 4 + size > s->sndbuf) {
-      if (!s->resync.exchange(true))
-        RLOGF("client on '%s' not draining (%d KB queued) — dropping to next "
-              "keyframe",
-              s->stream.c_str(), outq / 1024);
-      ++s->skipped;
-      return size;
+  // Comparing TIOCOUTQ against SO_SNDBUF is NOT enough to predict that — the
+  // kernel charges per-skb overhead against the buffer, so "it fits" by that
+  // arithmetic can still block (measured: still cost full-low 1535 frames).
+  // Ask the kernel instead: try the write non-blocking and let EAGAIN be the
+  // signal.
+  iovec iov[2] = {{hdr, 4}, {const_cast<uint8_t *>(buf), (size_t)size}};
+  msghdr mh{};
+  mh.msg_iov = iov;
+  mh.msg_iovlen = 2;
+  ssize_t w = ::sendmsg(s->fd, &mh, MSG_NOSIGNAL | MSG_DONTWAIT);
+
+  if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+    // Buffer full and nothing written, so the framing is still intact and this
+    // packet can simply vanish. EINTR lands here too: nothing was sent, and
+    // resyncing at the next keyframe is a cheaper answer to a rare signal than
+    // dropping the client.
+    if (!s->resync.exchange(true)) {
+      int outq = 0;
+      ::ioctl(s->fd, TIOCOUTQ, &outq);
+      RLOGF("client on '%s' not draining (%d KB queued) — dropping to next "
+            "keyframe",
+            s->stream.c_str(), outq / 1024);
+    }
+    ++s->skipped;
+    return size;
+  }
+
+  // A partial write commits us: an interleaved frame is length-prefixed, so
+  // stopping halfway desynchronises the client's framing permanently. Finish
+  // it with the blocking path — at most one RTP packet (~1.5 KB) remains, so
+  // this cannot stall the encoder in any meaningful way.
+  bool ok = w >= 0;
+  if (ok) {
+    size_t sent = (size_t)w, total = 4 + (size_t)size;
+    if (sent < total) {
+      uint8_t rest[4];
+      if (sent < 4) { // header itself was torn
+        std::memcpy(rest, hdr + sent, 4 - sent);
+        ok = write_all(s->fd, rest, 4 - sent) &&
+             write_all(s->fd, buf, (size_t)size);
+      } else {
+        ok = write_all(s->fd, buf + (sent - 4), total - sent);
+      }
     }
   }
 
-  uint8_t hdr[4] = {0x24, (uint8_t)s->rtp_channel, (uint8_t)(size >> 8),
-                    (uint8_t)(size & 0xff)};
-  if (!write_all(s->fd, hdr, 4) || !write_all(s->fd, buf, (size_t)size)) {
+  if (!ok) {
     // Shut the socket down so the connection thread's blocking recv() returns
     // and cleans up; otherwise it parks forever on a socket nobody reads.
     s->dead = true;
@@ -372,15 +404,6 @@ void Server::serve_conn(int fd) {
         sess->fd = fd;
         sess->stream = name;
         sess->interleaved = want_tcp;
-        // The kernel's actual buffer, not what we asked for — Linux doubles the
-        // SO_SNDBUF request. session_write needs the real number to decide when
-        // a packet would block.
-        {
-          int v = 0;
-          socklen_t vl = sizeof(v);
-          if (::getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &v, &vl) == 0 && v > 0)
-            sess->sndbuf = v;
-        }
         {
           sockaddr_in pa{};
           socklen_t pl = sizeof(pa);
