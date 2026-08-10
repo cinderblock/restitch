@@ -141,10 +141,12 @@ struct Server::Session {
   std::atomic<uint64_t> skipped{0}; // packets dropped for this client, lifetime
   uint64_t resyncs = 0;             // times it recovered at a keyframe (under mu)
   int sndbuf = 0;                   // kernel's real SO_SNDBUF (it doubles ours)
-  // Last time a packet actually reached the socket. Not "last time we tried" —
-  // a wedged client is one we keep trying and failing to write, so only real
-  // progress may reset the stall clock.
-  std::atomic<int64_t> last_progress_us{0};
+  // When this client last went from caught-up to behind, or 0 if it is fine.
+  // Deliberately NOT "last time a byte moved": a wedged client's backlog sits
+  // just under the drop threshold, so small packets keep squeezing through and
+  // would refresh a byte-based clock forever while the viewer sees nothing.
+  // Only a confirmed keyframe resync clears this.
+  std::atomic<int64_t> behind_since_us{0};
 
   ~Session() {
     if (rtp) {
@@ -286,10 +288,12 @@ static int session_write(void *opaque, const uint8_t *buf, int size) {
     int outq = 0;
     if (::ioctl(s->fd, TIOCOUTQ, &outq) == 0 &&
         outq + 4 + size > s->sndbuf / 2) {
-      if (!s->resync.exchange(true))
+      if (!s->resync.exchange(true)) {
+        s->behind_since_us.store(now_us());
         RLOGF("client on '%s' not draining (%d KB queued) — dropping to next "
               "keyframe",
               s->stream.c_str(), outq / 1024);
+      }
       ++s->skipped;
       return size;
     }
@@ -335,8 +339,6 @@ static int session_write(void *opaque, const uint8_t *buf, int size) {
       }
     }
   }
-
-  if (ok) s->last_progress_us.store(now_us());
 
   if (!ok) {
     // Shut the socket down so the connection thread's blocking recv() returns
@@ -462,9 +464,6 @@ void Server::serve_conn(int fd) {
         sess->fd = fd;
         sess->stream = name;
         sess->interleaved = want_tcp;
-        // Start the stall clock now, not on the first successful write — a
-        // client that never manages a single packet still has to be reaped.
-        sess->last_progress_us.store(now_us());
         // The kernel's real buffer, not what we asked for — Linux doubles the
         // SO_SNDBUF request. session_write budgets against this.
         {
@@ -619,9 +618,11 @@ void Server::broadcast(const std::string &name, const AVPacket *pkt) {
       // hole means everything up to the next keyframe would decode as garbage,
       // so flag a resync. Log only the transition — a client that is
       // persistently slow must not spam a line per frame.
-      if (!s->resync.exchange(true))
+      if (!s->resync.exchange(true)) {
+        s->behind_since_us.store(now_us());
         RLOGF("client on '%s' not draining — dropping to next keyframe",
               s->stream.c_str());
+      }
       ++s->skipped;
       continue;
     }
@@ -632,10 +633,10 @@ void Server::broadcast(const std::string &name, const AVPacket *pkt) {
     // threshold so even keyframes can't get through. Either way it will never
     // recover on this connection. Drop it; a looping player reconnects and
     // lands back at live.
-    const int64_t last = s->last_progress_us.load();
-    if (last && now_us() - last > (int64_t)kMaxStallSec * 1000000) {
-      RLOGF("client on '%s' delivered nothing for %ds — dropping so it can "
-            "reconnect (%llu packets dropped)",
+    const int64_t behind = s->behind_since_us.load();
+    if (behind && now_us() - behind > (int64_t)kMaxStallSec * 1000000) {
+      RLOGF("client on '%s' behind for %ds with no clean resync — dropping so "
+            "it can reconnect (%llu packets dropped)",
             s->stream.c_str(), kMaxStallSec,
             (unsigned long long)s->skipped.load());
       s->dead = true;
@@ -673,6 +674,7 @@ void Server::broadcast(const std::string &name, const AVPacket *pkt) {
     // Only now is a recovery real: if session_write re-raised the flag, the
     // keyframe didn't fit either and the client is still behind.
     if (trying_resync && !s->resync.load()) {
+      s->behind_since_us.store(0); // genuinely caught up again
       ++s->resyncs;
       RLOGF("client on '%s' resynced at keyframe (%llu packets dropped, "
             "resync #%llu)",
