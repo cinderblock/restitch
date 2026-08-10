@@ -131,14 +131,75 @@ Distinguish by checking Send-Q for the VLC peer while it is visibly late:
 large Send-Q → ours to fix; ~0 → the backlog is inside VLC and the answer is a
 lighter stream or VLC caching settings.
 
+## The fix, and the two wrong versions before it
+
+Shipped as `7c8fe76` → `1bd79dc` → `c5713eb` → `b2658ae`. The last one is the
+keeper; the first three are recorded because each failed in a way that was
+invisible without measuring the *encoder*, not just the client.
+
+1. **Cap `SO_SNDBUF` alone** (`7c8fe76`). Bounded the client's backlog, but
+   `broadcast()` writes inline on the encoder thread, so a full buffer blocked
+   the *producer*. `broadcast()`'s `try_lock` skip can never fire for media —
+   the producer IS the writer, so nothing ever contends. Cost full-low **2744
+   of 7070 frames** while every sibling output dropped none: one slow viewer
+   degraded the stream for all of them.
+2. **`sendmsg(MSG_DONTWAIT)`, treat EAGAIN as "behind"** (`c5713eb`). EAGAIN
+   almost never fires — a nearly-full buffer accepts a few bytes and returns a
+   *short count*. So the "finish the torn remainder, it's only ~1.5 KB" path
+   ran constantly, and finishing it meant blocking on a slow client. Cost
+   full-low **1585 of 3937 frames with zero EAGAIN logged**.
+3. **Check room before writing** (`b2658ae`, current). Refuse the packet up
+   front unless `outq + 4 + size <= sndbuf/2`. The half-buffer margin is
+   load-bearing: `TIOCOUTQ` counts payload bytes while the kernel budgets by
+   skb truesize (several KB for a ~1.5 KB packet), so a bare `outq + size`
+   comparison was tried and still stalled.
+
+Two invariants have to hold simultaneously, and each wrong version satisfied
+only one: **never tear a frame** (the `$`-framing is length-prefixed, so a
+short write desynchronises the client permanently — far worse than a lost
+frame) and **never block the producer**.
+
+## Verified live (2026-08-09 22:19, deploy `b2658ae`)
+
+With a deliberately pathological reader (`-readrate 0.4`, i.e. 40 % of
+realtime) on `full-low`:
+
+| | result |
+| --- | --- |
+| Encoder drops, all 6 outputs | **0**, frame counts identical (2538 each) |
+| The slow client itself | **3988 packets dropped**, resyncing at keyframes |
+| Send-Q ceiling | **1,048,223 B** — exactly half the 2 MB buffer |
+| A healthy client on the same stream | OSD 22:19:30-31, captured 22:19:32 → **~1-2 s, unchanged** |
+
+The cost is now borne entirely by the client that can't keep up, and every
+drop is logged (`not draining … — dropping to next keyframe` /
+`resynced at keyframe (N packets dropped, resync #M)`) and counted per session
+in `/api/status`.
+
 ## Progress log
 
 - [x] Confirmed ingest, compositing and RTSP output are all ~1-2 s.
 - [x] Confirmed HLS ~7-8 s, inherent to 2 s segments, not a regression.
 - [x] Located the mechanism in `rtsp.cpp` and proved it with a slow reader.
-- [ ] Implement the per-client lateness bound.
-- [ ] Re-run the slow-reader experiment; Send-Q must plateau and resyncs log.
-- [ ] Confirm with the user's real VLC session.
+- [x] Implemented the per-client lateness bound (three attempts, see above).
+- [x] Re-ran the slow-reader experiment: Send-Q plateaus, resyncs log, encoder
+      untouched, healthy clients unaffected.
+- [ ] **Confirm with the user's real VLC session.** A server-side bound cannot
+      retract backlog VLC has already buffered internally, so if VLC still
+      drifts, check `ss -tn 'sport = :8554'` for its peer while it is late:
+      large Send-Q → still ours; ~0 → the backlog is inside VLC and the answer
+      is a lighter stream or VLC's own caching settings.
+
+## Still open, found along the way (not latency)
+
+- `stream.tomsawyerlabs.com/all-field` proxies to `localhost:8890`, where
+  nothing listens — the parked, unpushed fix from `3f2fefc`. Public stream page
+  is broken, independently of this work.
+- `raw/field-centered` reports a mixer underrun of 139,355,910 ms, longer than
+  the process uptime. Counter bug, not real missing audio.
+- `bun run check` has two pre-existing typecheck errors (`src/config.ts:332`,
+  `src/dashboard.ts:1059`) unrelated to the compositor.
+- `Session::pending` in `rtsp.cpp` is declared and never used.
 
 ## Things not to do
 
