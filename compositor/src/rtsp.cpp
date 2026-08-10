@@ -115,6 +115,7 @@ struct Server::Session {
   std::atomic<bool> resync{false};
   std::atomic<uint64_t> skipped{0}; // packets dropped for this client, lifetime
   uint64_t resyncs = 0;             // times it recovered at a keyframe (under mu)
+  int sndbuf = 0;                   // kernel's real SO_SNDBUF (it doubles ours)
 
   ~Session() {
     if (rtp) {
@@ -234,11 +235,37 @@ static int session_write(void *opaque, const uint8_t *buf, int size) {
   // frames while its sibling outputs dropped none. The client that can't keep
   // up must lose frames by itself.
   //
-  // Comparing TIOCOUTQ against SO_SNDBUF is NOT enough to predict that — the
-  // kernel charges per-skb overhead against the buffer, so "it fits" by that
-  // arithmetic can still block (measured: still cost full-low 1535 frames).
-  // Ask the kernel instead: try the write non-blocking and let EAGAIN be the
-  // signal.
+  // Two things have to be true at once, and getting only one of them is what
+  // made the first two attempts at this fail:
+  //
+  //  1. We must not TEAR a frame. The $-framing is length-prefixed, so a short
+  //     write desynchronises the client permanently — unrecoverable, unlike a
+  //     missing frame. That rules out simply writing non-blocking and moving on.
+  //  2. We must not BLOCK finishing a torn frame either. MSG_DONTWAIT almost
+  //     never reports EAGAIN — a nearly-full buffer accepts a few bytes and
+  //     returns a short count instead — so "finish the remainder, it's only
+  //     ~1.5 KB" quietly became a blocking wait on a client draining at 40% of
+  //     realtime. At ~22 RTP packets per frame that blew the frame budget and
+  //     cost full-low 1585 of 3937 frames, siblings at zero.
+  //
+  // So refuse the write BEFORE starting it unless there is comfortable room.
+  // Compare against half the buffer: TIOCOUTQ counts payload bytes while the
+  // kernel budgets by skb truesize (several KB for a ~1.5 KB packet), so a
+  // margin this large is what makes "it fits" actually mean it. Halving the
+  // effective bound also halves the worst-case latency, which is the point.
+  if (s->sndbuf > 0) {
+    int outq = 0;
+    if (::ioctl(s->fd, TIOCOUTQ, &outq) == 0 &&
+        outq + 4 + size > s->sndbuf / 2) {
+      if (!s->resync.exchange(true))
+        RLOGF("client on '%s' not draining (%d KB queued) — dropping to next "
+              "keyframe",
+              s->stream.c_str(), outq / 1024);
+      ++s->skipped;
+      return size;
+    }
+  }
+
   iovec iov[2] = {{hdr, 4}, {const_cast<uint8_t *>(buf), (size_t)size}};
   msghdr mh{};
   mh.msg_iov = iov;
@@ -404,6 +431,14 @@ void Server::serve_conn(int fd) {
         sess->fd = fd;
         sess->stream = name;
         sess->interleaved = want_tcp;
+        // The kernel's real buffer, not what we asked for — Linux doubles the
+        // SO_SNDBUF request. session_write budgets against this.
+        {
+          int v = 0;
+          socklen_t vl = sizeof(v);
+          if (::getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &v, &vl) == 0 && v > 0)
+            sess->sndbuf = v;
+        }
         {
           sockaddr_in pa{};
           socklen_t pl = sizeof(pa);
