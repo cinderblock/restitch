@@ -8,6 +8,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sstream>
+#include <sys/ioctl.h> // TIOCOUTQ: unsent bytes, i.e. this client's backlog
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -42,13 +43,19 @@ constexpr int kSendTimeoutSec = 10;
 // deficit accumulates ~36 s of lag per hour. That is the "streams are 20s late"
 // bug, and it presents as a perfectly clean stream that is simply stale.
 //
-// Capping the buffer converts backlog into back-pressure: send() blocks, the
-// writer stays busy, and broadcast() skips that session (drop) instead of
-// queueing behind it. Sized in bytes, so it bounds a fat stream to less time
-// than a thin one, which is the behaviour we want. Far above the LAN
-// bandwidth-delay product (~4 KB at 100 Mbps / 0.3 ms), so throughput is
-// unaffected.
-constexpr int kSendBufBytes = 1 << 20; // 1 MiB
+// Capping the buffer gives session_write a concrete "is this client keeping
+// up?" test: if the next packet doesn't fit, the client is behind and loses
+// frames. Note the cap alone is NOT the fix — with a blocking send() a full
+// buffer stalls the encoder thread instead (measured: full-low lost 2744 of
+// 7070 frames to one slow reader while its siblings lost none). The buffer
+// bound and the explicit fit-check in session_write only work together.
+//
+// Sized in bytes, so it bounds a fat stream to less time than a thin one,
+// which is the behaviour we want. Linux doubles the request, so the effective
+// bound is ~2 MiB — about 2 s on full-low, well under a second on `full`. Far
+// above the LAN bandwidth-delay product (~4 KB at 100 Mbps / 0.3 ms), so a
+// healthy client is unaffected.
+constexpr int kSendBufBytes = 1 << 20; // 1 MiB (kernel doubles it)
 
 bool write_all(int fd, const uint8_t *p, size_t n) {
   while (n > 0) {
@@ -107,6 +114,7 @@ struct Server::Session {
   std::atomic<bool> resync{false};
   std::atomic<uint64_t> skipped{0}; // packets dropped for this client, lifetime
   uint64_t resyncs = 0;             // times it recovered at a keyframe (under mu)
+  int sndbuf = 0;                   // kernel's real SO_SNDBUF for this fd
 
   ~Session() {
     if (rtp) {
@@ -209,6 +217,35 @@ void Server::accept_loop() {
 static int session_write(void *opaque, const uint8_t *buf, int size) {
   auto *s = static_cast<Server::Session *>(opaque);
   if (s->dead) return size; // swallow; the connection thread will clean up
+
+  // Already dropping for this client: swallow everything until broadcast()
+  // clears the flag at the next keyframe. Critically, this also swallows the
+  // REST of the frame we bailed out of below — an interleaved frame is
+  // length-prefixed, so emitting half of one desynchronises the client's RTSP
+  // framing permanently, which is unrecoverable in a way a missing frame is not.
+  if (s->resync.load()) { ++s->skipped; return size; }
+
+  // Never block the producer. broadcast() runs on the encoder thread and writes
+  // inline, so a blocking send() here is back-pressure straight into the
+  // pipeline: measured 2026-08-09, one reader at 90% of realtime cost full-low
+  // 2744 of 7070 frames while its sibling outputs dropped none. The client that
+  // can't keep up must lose frames by itself.
+  //
+  // So: only write when the whole $-frame demonstrably fits in the socket
+  // buffer. Whole packets or nothing, checked before committing to any of it.
+  if (s->interleaved && s->sndbuf > 0) {
+    int outq = 0;
+    if (::ioctl(s->fd, TIOCOUTQ, &outq) == 0 &&
+        outq + 4 + size > s->sndbuf) {
+      if (!s->resync.exchange(true))
+        RLOGF("client on '%s' not draining (%d KB queued) — dropping to next "
+              "keyframe",
+              s->stream.c_str(), outq / 1024);
+      ++s->skipped;
+      return size;
+    }
+  }
+
   uint8_t hdr[4] = {0x24, (uint8_t)s->rtp_channel, (uint8_t)(size >> 8),
                     (uint8_t)(size & 0xff)};
   if (!write_all(s->fd, hdr, 4) || !write_all(s->fd, buf, (size_t)size)) {
@@ -335,6 +372,15 @@ void Server::serve_conn(int fd) {
         sess->fd = fd;
         sess->stream = name;
         sess->interleaved = want_tcp;
+        // The kernel's actual buffer, not what we asked for — Linux doubles the
+        // SO_SNDBUF request. session_write needs the real number to decide when
+        // a packet would block.
+        {
+          int v = 0;
+          socklen_t vl = sizeof(v);
+          if (::getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &v, &vl) == 0 && v > 0)
+            sess->sndbuf = v;
+        }
         {
           sockaddr_in pa{};
           socklen_t pl = sizeof(pa);
