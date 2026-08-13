@@ -316,6 +316,48 @@ client.
       6 outputs 0 drops, sessions `dropped=0 queued=0`, a 30 s healthy client
       with **0 decode errors**, **0 flushes**, latency ~1-2 s against the
       camera OSD.
+## 2026-08-12 17:00 freeze — a restart, not the queue
+
+User's VLC froze at 17:00:07 PDT. Cause, established from timestamps:
+
+- An **ops deploy** ran at 23:56:56Z ("labels: serve the label printer at
+  labels.tomsawyerlabs.com"), which restarted the docker daemon
+  (`Daemon has completed initialization` 17:00:14) and recreated the containers.
+- caddy started 00:00:09Z, restitch **00:00:21Z** — restitch exited cleanly
+  (status 0, `hasBeenManuallyStopped=true`, so not a crash and not the restart
+  policy).
+- VLC froze at 17:00:07 PDT = 00:00:07Z: the exact moment stitchd went down.
+  It then never reconnected during the ~14 s outage, and sat on its last frame.
+
+**The queue was healthy through all of it:** 386,184 frames with 0 drops on all
+six outputs, every session `dropped=0 queued=0`, and only 2 flushes in 4 hours.
+
+**The input reconnect fix earned its keep, twice**, both recovering in 2.0 s:
+
+```
+12:35:36 input 'raw/field-centered' dropped (End of file) — reconnecting
+12:35:38 input 'raw/field-centered' reconnected
+03:28:35 input 'raw/field-centered' dropped (End of file) — reconnecting
+03:28:37 input 'raw/field-centered' reconnected
+```
+
+Under the old code each of those would have frozen that camera's region until a
+human noticed — the Doorbell incident, twice, silently.
+
+**The remaining gap is the player, not the server.** Restarts are normal and
+expected here (deploys, ops runs, docker upgrades: the daemon restarted Aug 6,
+7 and 12). Nothing server-side can make VLC reconnect — VLC treats a mid-stream
+disconnect as a fatal error rather than end-of-item, so a single-item loop does
+not restart it. `compositor/src/player.h` (the WHEP page) already does the right
+thing: backoff retry capped at 30 s, written for a page that "sits unattended on
+a scoreboard for hours". The HLS player page recovers similarly.
+
+Follow-up worth doing: `stopped reading — dropped` fired **1447 times in 4
+hours** — that is the dashboard snapshotter connecting, taking one frame and
+closing, ~6/min across 6 streams. Benign, but it buries a genuine client reap in
+noise. The snapshotter should close cleanly (TEARDOWN) or that path should not
+log at INFO.
+
 - [ ] **Confirm against the user's real VLC over days.** A long-lived session
       should now stay near live: if it falls behind it loses a few seconds of
       video and resumes at a keyframe, and if it wedges entirely it is reaped
