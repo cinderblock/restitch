@@ -63,7 +63,14 @@ async function connect() {
     });
     const self = pc;
     pc.addTransceiver('video', { direction: 'recvonly' });
-    pc.ontrack = e => { v.srcObject = e.streams[0]; };
+    pc.ontrack = e => {
+      v.srcObject = e.streams[0];
+      // The element is muted+autoplay, but a hidden or backgrounded tab still
+      // defers playback. Ask explicitly and swallow the rejection — an
+      // autoplay-blocked page then starts on the first user gesture instead of
+      // sitting on a black rectangle with the stream arriving behind it.
+      v.play().catch(() => {});
+    };
     pc.onconnectionstatechange = () => {
       if (pc !== self) return;
       if (pc.connectionState === 'connected') { attempts = 0; say(''); }

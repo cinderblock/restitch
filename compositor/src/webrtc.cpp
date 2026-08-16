@@ -11,6 +11,7 @@
 #include <cstring>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <optional>
 #include <sstream>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -63,6 +64,11 @@ struct Server::Impl {
   rtc::Configuration rtc_cfg;
 
   std::map<std::string, AVCodecParameters *> streams;
+  // Annex-B SPS/PPS per stream, ready to prepend to each keyframe. See
+  // annexb_parameter_sets().
+  std::map<std::string, std::vector<std::byte>> psets;
+  // fmtp line per stream, describing the profile we actually encode.
+  std::map<std::string, std::string> profiles;
 
   int listen_fd = -1;
   std::thread accept_thread;
@@ -84,6 +90,76 @@ void Server::set_status_provider(std::function<std::string()> fn) {
 }
 Server::~Server() { stop(); }
 
+// SPS/PPS as Annex-B, ready to prepend to a keyframe.
+//
+// The encoder runs with AV_CODEC_FLAG_GLOBAL_HEADER, which keeps the parameter
+// sets in extradata and OUT of the bitstream. RTSP does not care — libavformat
+// puts them in the SDP — but a browser needs them IN BAND. Without them a
+// WebRTC viewer receives megabytes of slices it cannot decode and floods PLIs:
+// measured 9180 packets / 8.5 MB received, framesDecoded 0, pliCount 278.
+//
+// Handles both extradata shapes: Annex-B (start codes, what nvenc emits) and an
+// AVCDecoderConfigurationRecord (leading 0x01), so this cannot silently break
+// if the encoder or a muxer hands us the other one.
+static std::vector<std::byte> annexb_parameter_sets(const AVCodecParameters *par) {
+  std::vector<std::byte> out;
+  const uint8_t *e = par->extradata;
+  const int n = par->extradata_size;
+  if (!e || n < 4) return out;
+
+  auto append_start_code = [&out] {
+    for (uint8_t b : {0, 0, 0, 1}) out.push_back(std::byte{b});
+  };
+  auto append = [&out](const uint8_t *p, size_t len) {
+    for (size_t i = 0; i < len; ++i) out.push_back(std::byte{p[i]});
+  };
+
+  if (e[0] == 1) { // AVCDecoderConfigurationRecord
+    if (n < 7) return out;
+    int pos = 5;
+    for (int round = 0; round < 2 && pos < n; ++round) {
+      // SPS count is 5 bits; PPS count is a full byte.
+      int count = round == 0 ? (e[pos++] & 0x1F) : e[pos++];
+      for (int i = 0; i < count && pos + 2 <= n; ++i) {
+        const int len = (e[pos] << 8) | e[pos + 1];
+        pos += 2;
+        if (len < 0 || pos + len > n) return out;
+        append_start_code();
+        append(e + pos, (size_t)len);
+        pos += len;
+      }
+    }
+    return out;
+  }
+
+  // Already Annex-B: the whole blob is start-code-delimited parameter sets.
+  append(e, (size_t)n);
+  return out;
+}
+
+// The fmtp profile-level-id a viewer must be offered, read from the SPS we
+// actually send.
+//
+// libdatachannel's default is 42e01f — constrained baseline. Our encoder emits
+// Main (profile=Main, level 3.0), so Chrome negotiated baseline, received a
+// Main SPS and refused to decode a single frame: packets arrived, framesDecoded
+// stayed 0, and it flooded PLIs asking for a keyframe it would never accept.
+// The three bytes after the SPS NAL header are exactly profile_idc,
+// constraint_set_flags and level_idc — which is what profile-level-id encodes.
+static std::string h264_profile_level_id(const std::vector<std::byte> &psets) {
+  auto at = [&psets](size_t i) { return std::to_integer<uint8_t>(psets[i]); };
+  for (size_t i = 0; i + 6 < psets.size(); ++i) {
+    if (at(i) != 0 || at(i + 1) != 0 || at(i + 2) != 1) continue;
+    const size_t nal = i + 3;
+    if ((at(nal) & 0x1F) != 7) continue; // want the SPS
+    char buf[16];
+    std::snprintf(buf, sizeof buf, "%02x%02x%02x", at(nal + 1), at(nal + 2),
+                  at(nal + 3));
+    return buf;
+  }
+  return "";
+}
+
 void Server::add_stream(const std::string &name, const AVCodecParameters *par) {
   if (par->codec_id != AV_CODEC_ID_H264) {
     // Not an error: `full` is HEVC on purpose. Browsers do not reliably decode
@@ -94,6 +170,19 @@ void Server::add_stream(const std::string &name, const AVCodecParameters *par) {
   AVCodecParameters *copy = avcodec_parameters_alloc();
   avcodec_parameters_copy(copy, par);
   impl_->streams[name] = copy;
+  auto psets = annexb_parameter_sets(copy);
+  if (psets.empty())
+    WLOGF("stream '%s' has no usable SPS/PPS in extradata — browsers will not "
+          "decode it",
+          name.c_str());
+  const std::string plid = h264_profile_level_id(psets);
+  if (!plid.empty()) {
+    impl_->profiles[name] = "profile-level-id=" + plid +
+                            ";packetization-mode=1;level-asymmetry-allowed=1";
+    WLOGF("stream '%s': offering H.264 profile-level-id=%s", name.c_str(),
+          plid.c_str());
+  }
+  impl_->psets[name] = std::move(psets);
 }
 
 bool Server::start(const Options &opt) {
@@ -301,14 +390,98 @@ void Server::handle_http(int fd) {
     return;
   }
 
+  // Answer on the OFFER'S OWN m-line. libdatachannel matches media by mid, so a
+  // track added under any other mid does not reconcile with the offer — it
+  // becomes a SECOND m-line, and a browser rejects the whole answer with "The
+  // order of m-lines in answer doesn't match order in offer". Hardcoding "video"
+  // here meant no browser could ever play a WHEP stream: Chrome offers mid "0",
+  // and the answer came back with m-lines [video/0, video/video].
+  //
+  // This survived because the endpoint was only ever checked for "201 with
+  // candidates" — the same mistake as validating RTSP with ffmpeg, which
+  // tolerated timestamps VLC would not.
+  std::optional<rtc::Description> parsed;
+  try {
+    parsed.emplace(body, "offer");
+  } catch (const std::exception &e) {
+    WLOGF("unparseable offer for '%s': %s", name.c_str(), e.what());
+    respond("400 Bad Request", "", "bad offer\n", "text/plain");
+    ::close(fd);
+    return;
+  }
+  rtc::Description &offer_desc = *parsed;
+  std::string video_mid = "0";
+  for (int i = 0; i < offer_desc.mediaCount(); ++i) {
+    const auto entry = offer_desc.media(i);
+    if (!std::holds_alternative<rtc::Description::Media *>(entry)) continue;
+    auto *md = std::get<rtc::Description::Media *>(entry);
+    if (md->type() == "video") { video_mid = md->mid(); break; }
+  }
+
+  // Take the payload type FROM THE OFFER. An answer may not redefine what a
+  // payload type means, and 96 — which this used to hardcode — is normally VP8
+  // in a Chrome offer. The browser then mapped our H.264 packets to its VP8
+  // depacketizer and assembled nothing: 6529 packets received, framesReceived 0,
+  // no codec stats at all, and a PLI flood.
+  //
+  // Prefer an H.264 entry whose profile matches what we actually encode, then
+  // any H.264 with packetization-mode=1.
+  int pt = -1;
+  std::string pt_fmtp;
+  {
+    const std::string want = impl_->profiles.count(name)
+                                 ? impl_->profiles[name].substr(
+                                       std::strlen("profile-level-id="), 6)
+                                 : std::string();
+    int best_score = -1;
+    for (int i = 0; i < offer_desc.mediaCount(); ++i) {
+      const auto entry = offer_desc.media(i);
+      if (!std::holds_alternative<rtc::Description::Media *>(entry)) continue;
+      auto *md = std::get<rtc::Description::Media *>(entry);
+      if (md->type() != "video") continue;
+      for (int p : md->payloadTypes()) {
+        const rtc::Description::Media::RtpMap *map = nullptr;
+        try {
+          map = md->rtpMap(p);
+        } catch (const std::exception &) {
+          continue;
+        }
+        if (!map) continue;
+        std::string fmt = map->format;
+        std::transform(fmt.begin(), fmt.end(), fmt.begin(), ::toupper);
+        if (fmt != "H264") continue;
+        std::string f;
+        for (const auto &x : map->fmtps) f += x + ";";
+        int score = 0;
+        if (f.find("packetization-mode=1") != std::string::npos) score += 2;
+        if (!want.empty() && f.find(want) != std::string::npos) score += 8;
+        else if (f.find("profile-level-id=4d") != std::string::npos) score += 4;
+        if (score > best_score) { best_score = score; pt = p; pt_fmtp = f; }
+      }
+      break;
+    }
+  }
+  if (pt < 0) {
+    WLOGF("offer for '%s' has no H.264 payload type — refusing", name.c_str());
+    respond("406 Not Acceptable", "", "no h264 in offer\n", "text/plain");
+    ::close(fd);
+    return;
+  }
+  if (!pt_fmtp.empty() && pt_fmtp.back() == ';') pt_fmtp.pop_back();
+
   const uint32_t ssrc = 42000u + (uint32_t)(impl_->viewers.size() + 1);
-  rtc::Description::Video media("video", rtc::Description::Direction::SendOnly);
-  media.addH264Codec(96);
+  rtc::Description::Video media(video_mid,
+                                rtc::Description::Direction::SendOnly);
+  // Echo the offer's own fmtp for this payload type, so its meaning is
+  // unchanged between offer and answer.
+  if (!pt_fmtp.empty()) media.addH264Codec(pt, pt_fmtp);
+  else media.addH264Codec(pt);
   media.addSSRC(ssrc, "stitchd-video");
   v->track = v->pc->addTrack(media);
 
   v->rtp_cfg = std::make_shared<rtc::RtpPacketizationConfig>(
-      ssrc, "stitchd-video", 96, rtc::H264RtpPacketizer::defaultClockRate);
+      ssrc, "stitchd-video", (uint8_t)pt,
+      rtc::H264RtpPacketizer::defaultClockRate);
   auto packetizer = std::make_shared<rtc::H264RtpPacketizer>(
       rtc::NalUnit::Separator::LongStartSequence, v->rtp_cfg);
   v->track->setMediaHandler(packetizer);
@@ -337,7 +510,7 @@ void Server::handle_http(int fd) {
   });
 
   try {
-    v->pc->setRemoteDescription(rtc::Description(body, "offer"));
+    v->pc->setRemoteDescription(offer_desc);
   } catch (const std::exception &e) {
     WLOGF("bad offer for '%s': %s", name.c_str(), e.what());
     respond("400 Bad Request", "", "bad offer\n", "text/plain");
@@ -402,14 +575,44 @@ void Server::broadcast(const std::string &name, const AVPacket *pkt,
   if (targets.empty()) return;
 
   // RTP runs at 90 kHz regardless of the encoder's time base.
-  const int64_t ts90k =
-      av_rescale_q(pkt->pts, time_base, AVRational{1, 90000});
+  //
+  // Same hazard rtsp.cpp already guards: a packet with no PTS rescales to
+  // garbage, and one wild timestamp among otherwise even steps stops a receiver
+  // assembling frames at all. Fall back to DTS; drop rather than emit a lie.
+  const int64_t src_pts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+  if (src_pts == AV_NOPTS_VALUE) return;
+  const int64_t ts90k = av_rescale_q(src_pts, time_base, AVRational{1, 90000});
+
+
+  // Put SPS/PPS in front of every keyframe. They live in extradata, not in the
+  // bitstream, and a browser cannot decode a single frame without them — nor
+  // can a viewer that joins mid-stream ever recover, since the parameter sets
+  // would otherwise have gone out before it connected.
+  const std::byte *data = reinterpret_cast<const std::byte *>(pkt->data);
+  size_t len = (size_t)pkt->size;
+  std::vector<std::byte> with_psets;
+  if (pkt->flags & AV_PKT_FLAG_KEY) {
+    std::vector<std::byte> *ps = nullptr;
+    {
+      std::lock_guard<std::mutex> lk(impl_->viewers_mu);
+      auto it = impl_->psets.find(name);
+      if (it != impl_->psets.end() && !it->second.empty()) ps = &it->second;
+      if (ps) {
+        with_psets.reserve(ps->size() + len);
+        with_psets.insert(with_psets.end(), ps->begin(), ps->end());
+      }
+    }
+    if (ps) {
+      with_psets.insert(with_psets.end(), data, data + len);
+      data = with_psets.data();
+      len = with_psets.size();
+    }
+  }
 
   for (auto &v : targets) {
     try {
       v->rtp_cfg->timestamp = (uint32_t)ts90k;
-      v->track->send(reinterpret_cast<const std::byte *>(pkt->data),
-                     (size_t)pkt->size);
+      v->track->send(data, len);
     } catch (const std::exception &) {
       // A send failure means this peer is gone; never let it affect the
       // encoder or any other viewer.
