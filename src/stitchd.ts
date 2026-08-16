@@ -117,8 +117,8 @@ function stitchdRot(rotation: string, ctx: string): number {
   if (rotation === "0" || rotation === "180")
     return rotation === "180" ? 180 : 0;
   throw new Error(
-    `stitchd (compositor: native) supports rotation 0 or 180 only; ` +
-      `${ctx} uses "${rotation}". Use the ffmpeg compositor for this config.`
+    `stitchd supports piece rotation 0 or 180 only; ${ctx} uses "${rotation}". ` +
+      `Rotating by 90 needs a new CUDA gather kernel.`
   );
 }
 

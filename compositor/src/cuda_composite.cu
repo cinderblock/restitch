@@ -133,3 +133,50 @@ extern "C" void launch_crop_scale_rot180(
       srcY, srcPitchY, srcUV, srcPitchUV, srcW, srcH, cropX, cropY, cropW,
       cropH, dstY, dstPitchY, dstUV, dstPitchUV, dstW, dstH, rot180);
 }
+
+// ---- snapshot: NV12 -> planar YUV420, downscaled ---------------------------
+__global__ void k_nv12_to_yuv420p_scaled(
+    const uint8_t *srcY, int srcPitchY, const uint8_t *srcUV, int srcPitchUV,
+    int srcW, int srcH, uint8_t *dstY, int dstStrideY, uint8_t *dstU,
+    int dstStrideU, uint8_t *dstV, int dstStrideV, int dstW, int dstH) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= dstW || y >= dstH) return;
+
+  // Box filter: average the source rect this destination pixel covers. Point
+  // sampling a 2688-wide frame down to 320 aliases badly on the shop's fine
+  // detail (racking, floor markings) and looks like noise in the thumbnail.
+  const int x0 = x * srcW / dstW, x1 = max(x0 + 1, (x + 1) * srcW / dstW);
+  const int y0 = y * srcH / dstH, y1 = max(y0 + 1, (y + 1) * srcH / dstH);
+  int sum = 0, n = 0;
+  for (int sy = y0; sy < y1 && sy < srcH; ++sy)
+    for (int sx = x0; sx < x1 && sx < srcW; ++sx) {
+      sum += srcY[(size_t)sy * srcPitchY + sx];
+      ++n;
+    }
+  dstY[(size_t)y * dstStrideY + x] = (uint8_t)(n ? sum / n : 16);
+
+  // Chroma is quarter-resolution in both planes; one thread per 2x2 luma block
+  // writes it, sampling the source's interleaved UV at the matching position.
+  if ((x & 1) || (y & 1)) return;
+  const int cx = x >> 1, cy = y >> 1;
+  const int cw = dstW >> 1, chh = dstH >> 1;
+  if (cx >= cw || cy >= chh) return;
+  const int scx = min(srcW / 2 - 1, x * (srcW / 2) / dstW);
+  const int scy = min(srcH / 2 - 1, y * (srcH / 2) / dstH);
+  const uint8_t *uv = srcUV + (size_t)scy * srcPitchUV + scx * 2;
+  dstU[(size_t)cy * dstStrideU + cx] = uv[0];
+  dstV[(size_t)cy * dstStrideV + cx] = uv[1];
+}
+
+extern "C" void launch_nv12_to_yuv420p_scaled(
+    const uint8_t *srcY, int srcPitchY, const uint8_t *srcUV, int srcPitchUV,
+    int srcW, int srcH, uint8_t *dstY, int dstStrideY, uint8_t *dstU,
+    int dstStrideU, uint8_t *dstV, int dstStrideV, int dstW, int dstH,
+    cudaStream_t stream) {
+  const dim3 block(16, 16);
+  const dim3 grid((dstW + block.x - 1) / block.x, (dstH + block.y - 1) / block.y);
+  k_nv12_to_yuv420p_scaled<<<grid, block, 0, stream>>>(
+      srcY, srcPitchY, srcUV, srcPitchUV, srcW, srcH, dstY, dstStrideY, dstU,
+      dstStrideU, dstV, dstStrideV, dstW, dstH);
+}

@@ -943,8 +943,7 @@ const snapCache = new Map<string, SnapEntry>();
 const snapInflight = new Map<string, Promise<Uint8Array | null>>();
 
 async function grabSnapshot(
-  ffmpegPath: string,
-  baseUrl: string,
+  snapshotBase: string,
   path: string,
   force = false
 ): Promise<Uint8Array | null> {
@@ -958,29 +957,21 @@ async function grabSnapshot(
 
   let inflight = snapInflight.get(path);
   if (!inflight) {
+    // stitchd renders this from the frame it already holds on the GPU. This
+    // used to spawn an ffmpeg per stream, which reconnected over RTSP and
+    // decoded a full frame (up to 2688x1512) to produce a 320px thumbnail —
+    // 16 processes a minute once the raw cameras were listed.
     inflight = (async () => {
-      const url = `${baseUrl}/${path}`;
-      const proc = Bun.spawn(
-        [
-          ffmpegPath,
-          "-nostdin",
-          "-loglevel", "error",
-          "-rtsp_transport", "tcp",
-          "-allowed_media_types", "video",
-          "-timeout", "10000000",
-          "-i", url,
-          "-frames:v", "1",
-          "-vf", "scale=320:-1",
-          "-f", "mjpeg",
-          "-",
-        ],
-        { stdout: "pipe", stderr: "pipe" }
-      );
-      const buf = new Uint8Array(await new Response(proc.stdout).arrayBuffer());
-      const code = await proc.exited;
-      if (code !== 0 || buf.length === 0) return null;
-      snapCache.set(path, { jpeg: buf, ts: Date.now() });
-      return buf;
+      try {
+        const r = await fetch(snapshotBase + path);
+        if (!r.ok) return null;
+        const buf = new Uint8Array(await r.arrayBuffer());
+        if (buf.length === 0) return null;
+        snapCache.set(path, { jpeg: buf, ts: Date.now() });
+        return buf;
+      } catch {
+        return null;
+      }
     })();
     snapInflight.set(path, inflight);
     inflight.finally(() => snapInflight.delete(path));
@@ -1059,11 +1050,12 @@ export function startDashboard(
   /** stitchd's status endpoint — the only source of stream state. */
   statusUrl: string,
   transcription?: { ring: RingBuffer; stats: LiveStats },
-  media?: { ffmpegPath: string; baseUrl: string },
   /** Directory stitchd writes HLS segments into; served at /hls/<name>/... */
   hlsDir?: string
 ): Server<undefined> {
   const stitchdApi = statusUrl;
+  // Same server, different route.
+  const snapshotBase = statusUrl.replace(/\/api\/status$/, "") + "/api/snapshot/";
   // Cache of the last status payload so the sessions endpoint can serve from
   // the same fetch the paths table already makes, instead of hitting stitchd
   // twice per poll.
@@ -1107,10 +1099,10 @@ export function startDashboard(
 
   // Background snapshot pre-warm: every PREWARM_MS, refresh a cached frame
   // for each ready path so hovers in the dashboard load instantly. Serial
-  // (each grab awaits the previous) so we never run >1 snapshot ffmpeg at
-  // a time. Best-effort — failures are ignored.
-  if (media) {
-    const m = media;
+  // Best-effort — failures are ignored. Now that stitchd renders these from
+  // memory a cold hover would be fast anyway, but keeping the cache warm means
+  // the hover is instant and costs one small GET per stream per minute.
+  {
     const prewarm = async () => {
       try {
         const r = await fetchPaths();
@@ -1118,7 +1110,7 @@ export function startDashboard(
         const j = (await r.json()) as { items?: { name: string; ready?: boolean }[] };
         for (const p of j.items ?? []) {
           if (!p.ready) continue;
-          await grabSnapshot(m.ffmpegPath, m.baseUrl, p.name, true);
+          await grabSnapshot(snapshotBase, p.name, true);
         }
       } catch {
         // ignore
@@ -1204,11 +1196,11 @@ export function startDashboard(
 
       // Snapshot: /api/snapshot/<path> (path may contain a slash)
       if (url.pathname.startsWith("/api/snapshot/")) {
-        if (!media) return new Response("snapshots disabled", { status: 503 });
+
         const path = decodeURIComponent(
           url.pathname.slice("/api/snapshot/".length)
         );
-        const jpeg = await grabSnapshot(media.ffmpegPath, media.baseUrl, path);
+        const jpeg = await grabSnapshot(snapshotBase, path);
         if (!jpeg) return new Response("no frame", { status: 502 });
         return new Response(jpeg, {
           headers: {

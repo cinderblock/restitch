@@ -35,3 +35,17 @@ extern "C" void launch_crop_scale_rot180(
     int srcW, int srcH, int cropX, int cropY, int cropW, int cropH,
     uint8_t *dstY, int dstPitchY, uint8_t *dstUV, int dstPitchUV, int dstW,
     int dstH, int rot180, cudaStream_t stream);
+
+// Downscale an NV12 source into PLANAR YUV420 (separate Y, U, V), for JPEG.
+//
+// Snapshots used to be made by spawning an ffmpeg per stream, which reconnected
+// over RTSP and decoded a full frame just to throw away all but a thumbnail —
+// 16 processes a minute once the raw cameras were listed. stitchd already holds
+// every one of these frames in GPU memory, so a thumbnail is a downscale and a
+// tiny JPEG encode. Box-filter averaged, which is the right resampler going
+// this far down and cheap at thumbnail sizes.
+extern "C" void launch_nv12_to_yuv420p_scaled(
+    const uint8_t *srcY, int srcPitchY, const uint8_t *srcUV, int srcPitchUV,
+    int srcW, int srcH,
+    uint8_t *dstY, int dstStrideY, uint8_t *dstU, int dstStrideU,
+    uint8_t *dstV, int dstStrideV, int dstW, int dstH, cudaStream_t stream);

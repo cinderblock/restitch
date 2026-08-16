@@ -50,7 +50,7 @@ async function main() {
     );
   } else {
     console.log("Probing cameras...");
-    cameraProbes = await probeAllCameras(config);
+    cameraProbes = await probeAllCameras(config, values["stitchd-bin"] ?? "stitchd");
     for (const [name, probe] of cameraProbes) {
       console.log(
         `  ${name}: ${probe.width}x${probe.height} @ ${probe.fps.toFixed(1)}fps`
@@ -164,7 +164,6 @@ async function main() {
         config.dashboard,
         `http://127.0.0.1:${stitchdWebrtcPort}/api/status`,
         transcription,
-        { ffmpegPath: config.ffmpeg_path, baseUrl: config.output.base_url },
         hlsDir
       )
     : null;

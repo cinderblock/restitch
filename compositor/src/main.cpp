@@ -358,6 +358,80 @@ private:
   AVRational vtb_{1, 90000};
 };
 
+// ---- snapshot: a CUDA NV12 frame -> a small JPEG ---------------------------
+//
+// Everything here already exists in this process: the frame is on the GPU, the
+// downscale is one kernel, and libavcodec (which we link) has an mjpeg encoder.
+// The thumbnail is ~320px wide, so the encode is trivial and the only PCIe
+// traffic is the downscaled planes, not the full frame.
+std::vector<uint8_t> encode_snapshot_jpeg(AVFrame *cuda_frame, int target_w) {
+  std::vector<uint8_t> out;
+  if (!cuda_frame || cuda_frame->format != AV_PIX_FMT_CUDA) return out;
+  const int sw = cuda_frame->width, sh = cuda_frame->height;
+  if (sw <= 0 || sh <= 0) return out;
+
+  // Even dimensions: 4:2:0 has no half chroma samples.
+  int dw = std::min(target_w, sw) & ~1;
+  int dh = (int)std::lround((double)dw * sh / sw) & ~1;
+  if (dw < 2 || dh < 2) return out;
+
+  AVFrame *host = av_frame_alloc();
+  if (!host) return out;
+  host->format = AV_PIX_FMT_YUVJ420P; // what the mjpeg encoder wants
+  host->width = dw;
+  host->height = dh;
+  if (av_frame_get_buffer(host, 32) < 0) { av_frame_free(&host); return out; }
+
+  // Device staging for the planes, then one copy each back to the host frame.
+  uint8_t *dY = nullptr, *dU = nullptr, *dV = nullptr;
+  size_t pY = 0, pU = 0, pV = 0;
+  bool ok = cudaMallocPitch((void **)&dY, &pY, dw, dh) == cudaSuccess &&
+            cudaMallocPitch((void **)&dU, &pU, dw / 2, dh / 2) == cudaSuccess &&
+            cudaMallocPitch((void **)&dV, &pV, dw / 2, dh / 2) == cudaSuccess;
+  if (ok) {
+    launch_nv12_to_yuv420p_scaled(
+        cuda_frame->data[0], cuda_frame->linesize[0], cuda_frame->data[1],
+        cuda_frame->linesize[1], sw, sh, dY, (int)pY, dU, (int)pU, dV, (int)pV,
+        dw, dh, 0);
+    ok = cudaMemcpy2D(host->data[0], host->linesize[0], dY, pY, dw, dh,
+                      cudaMemcpyDeviceToHost) == cudaSuccess &&
+         cudaMemcpy2D(host->data[1], host->linesize[1], dU, pU, dw / 2, dh / 2,
+                      cudaMemcpyDeviceToHost) == cudaSuccess &&
+         cudaMemcpy2D(host->data[2], host->linesize[2], dV, pV, dw / 2, dh / 2,
+                      cudaMemcpyDeviceToHost) == cudaSuccess;
+  }
+  if (dY) cudaFree(dY);
+  if (dU) cudaFree(dU);
+  if (dV) cudaFree(dV);
+  if (!ok) { av_frame_free(&host); return out; }
+
+  const AVCodec *enc = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+  AVCodecContext *ctx = enc ? avcodec_alloc_context3(enc) : nullptr;
+  if (!ctx) { av_frame_free(&host); return out; }
+  ctx->pix_fmt = AV_PIX_FMT_YUVJ420P;
+  ctx->width = dw;
+  ctx->height = dh;
+  ctx->time_base = AVRational{1, 1};
+  ctx->flags |= AV_CODEC_FLAG_QSCALE;
+  ctx->global_quality = FF_QP2LAMBDA * 6; // visually clean at thumbnail size
+  if (avcodec_open2(ctx, enc, nullptr) >= 0) {
+    host->quality = ctx->global_quality;
+    host->pts = 0;
+    if (avcodec_send_frame(ctx, host) >= 0) {
+      avcodec_send_frame(ctx, nullptr);
+      AVPacket *pkt = av_packet_alloc();
+      while (pkt && avcodec_receive_packet(ctx, pkt) >= 0) {
+        out.insert(out.end(), pkt->data, pkt->data + pkt->size);
+        av_packet_unref(pkt);
+      }
+      if (pkt) av_packet_free(&pkt);
+    }
+  }
+  avcodec_free_context(&ctx);
+  av_frame_free(&host);
+  return out;
+}
+
 // ---- one output encoder + muxer -------------------------------------------
 struct Output {
   std::string name; // for the RTSP fan-out
@@ -602,6 +676,13 @@ public:
   }
   AVRational enc_time_base() const { return io_.enc->time_base; }
   long long encoded() const { return io_.encoded.load(); }
+  /** Newest composed frame (CUDA), for snapshots. False before the first. */
+  bool latest(AVFrame *dst) {
+    std::lock_guard<std::mutex> lk(latest_mu_);
+    if (!latest_) return false;
+    av_frame_unref(dst);
+    return av_frame_ref(dst, latest_) == 0;
+  }
   void note_pool_drop() { ++dropped_; }
   long long dropped() const { return dropped_; }
 
@@ -621,6 +702,19 @@ private:
         f = q_.front();
         q_.pop();
       }
+      // Keep a reference to the most recent composed frame so /api/snapshot can
+      // make a thumbnail from what we already have on the GPU, instead of a
+      // separate process reconnecting over RTSP to decode it again.
+      {
+        AVFrame *keep = av_frame_alloc();
+        if (keep && av_frame_ref(keep, f) == 0) {
+          std::lock_guard<std::mutex> lk(latest_mu_);
+          if (latest_) av_frame_free(&latest_);
+          latest_ = keep;
+        } else if (keep) {
+          av_frame_free(&keep);
+        }
+      }
       if (avcodec_send_frame(io_.enc, f) < 0) LOGF("send_frame(%s)", name.c_str());
       av_frame_free(&f);
       drain(io_);
@@ -636,6 +730,8 @@ private:
   int max_depth_ = 6;
   AVCodecParameters *par_ = nullptr;
   std::atomic<long long> dropped_{0};
+  std::mutex latest_mu_;
+  AVFrame *latest_ = nullptr;
 };
 
 // =========================================================================
@@ -1000,6 +1096,26 @@ int run(const Config &cfg, const char *dest, long long max_frames,
         << "}";
       return o.str();
     });
+    // Thumbnails come from the frames this process already holds: composed
+    // frames for the outputs, decoded camera frames for the raw/<name>
+    // republishes. Replaces one ffmpeg spawn per stream per minute, each of
+    // which reconnected over RTSP and decoded a full frame for a 320px image.
+    webrtc_srv->set_snapshot_provider(
+        [&workers, &all_inputs](const std::string &want) -> std::vector<uint8_t> {
+          AVFrame *f = av_frame_alloc();
+          if (!f) return {};
+          bool got = false;
+          for (auto *w : workers)
+            if (w->name == want) { got = w->latest(f); break; }
+          if (!got)
+            for (auto *d : all_inputs)
+              if (d->log_name() == want) { got = d->latest(f); break; }
+          std::vector<uint8_t> jpeg;
+          if (got) jpeg = encode_snapshot_jpeg(f, 320);
+          av_frame_free(&f);
+          return jpeg;
+        });
+
     if (webrtc_srv->start(webrtc_opt)) {
       g_webrtc = webrtc_srv.get();
     } else {
@@ -1146,7 +1262,56 @@ int run(const Config &cfg, const char *dest, long long max_frames,
 
 } // namespace
 
+// `stitchd --probe <url>...` — print each input's video geometry as JSON.
+//
+// The supervisor needs width/height/fps to generate this program's own config
+// (comp-dim and every piece rectangle), so it has to ask before stitchd starts.
+// It used to spawn one ffprobe per camera to find out; stitchd opens these
+// exact URLs with the same libavformat, so it can answer itself — one process
+// instead of N, and one less external binary in the image.
+int probe_main(int argc, char **argv, int first) {
+  std::printf("[");
+  for (int i = first, n = 0; i < argc; ++i, ++n) {
+    const char *url = argv[i];
+    AVFormatContext *fmt = nullptr;
+    AVDictionary *opt = nullptr;
+    av_dict_set(&opt, "rtsp_transport", "tcp", 0);
+    av_dict_set(&opt, "timeout", "10000000", 0);
+    int err = avformat_open_input(&fmt, url, nullptr, &opt);
+    av_dict_free(&opt);
+    int w = 0, h = 0;
+    double fps = 0;
+    if (err >= 0 && avformat_find_stream_info(fmt, nullptr) >= 0) {
+      const int vs = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+      if (vs >= 0) {
+        AVStream *st = fmt->streams[vs];
+        w = st->codecpar->width;
+        h = st->codecpar->height;
+        // r_frame_rate (the nominal rate) before avg_frame_rate (measured over
+        // however much we happened to read). They agree on the bays, but a
+        // camera that throttles when idle reports a much lower average — the
+        // bullet measured 9 against a nominal 20 — and the layout should not
+        // depend on how busy a scene was at startup.
+        const AVRational r = st->r_frame_rate.num ? st->r_frame_rate
+                                                  : st->avg_frame_rate;
+        if (r.den) fps = (double)r.num / r.den;
+      }
+    }
+    if (fmt) avformat_close_input(&fmt);
+    // Emit a row per URL either way; the caller decides whether a zero is
+    // fatal, and a silent omission would misalign it with its camera list.
+    std::printf("%s{\"width\":%d,\"height\":%d,\"fps\":%.6f}", n ? "," : "", w, h,
+                fps);
+  }
+  std::printf("]\n");
+  std::fflush(stdout);
+  return 0;
+}
+
 int main(int argc, char **argv) {
+  for (int i = 1; i < argc; ++i)
+    if (std::string(argv[i]) == "--probe") return probe_main(argc, argv, i + 1);
+
   const char *config = nullptr, *out = nullptr;
   long long max_frames = 0;
   bool unpaced = false;

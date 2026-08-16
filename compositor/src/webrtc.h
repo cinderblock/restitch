@@ -57,6 +57,11 @@ public:
   // Serves GET /api/status. Set before start(). Lets the dashboard read
   // stream state from stitchd instead of from mediamtx's control API.
   void set_status_provider(std::function<std::string()> fn);
+  // Returns a JPEG thumbnail for a stream name, or empty if it has no frame
+  // yet. Served at GET /api/snapshot/<name>; stitchd already holds every frame
+  // on the GPU, so nothing has to reconnect and decode to make one.
+  void set_snapshot_provider(
+      std::function<std::vector<uint8_t>(const std::string &)> fn);
 
   bool start(const Options &opt);
   void stop();

@@ -6,8 +6,9 @@
 #   - whisper-server (CUDA)
 #   - dashboard HTTP server
 #
-# ffmpeg/ffprobe remain in the image for camera probing at startup and for the
-# dashboard's snapshot thumbnails — not for compositing.
+# No ffmpeg or ffprobe binary ships here: stitchd static-links libav* and does
+# both jobs they used to do — `stitchd --probe` reports camera geometry at
+# startup, and /api/snapshot renders thumbnails from frames already on the GPU.
 #
 # Built with --gpus all on the target host. NVIDIA_DRIVER_CAPABILITIES
 # includes 'video' so NVENC/NVDEC encoder libraries are mounted in.
@@ -145,11 +146,6 @@ RUN apt-get update -qq && \
         iproute2 procps && \
     rm -rf /var/lib/apt/lists/*
 
-# FFmpeg from our own CUDA+NPP build (see ffmpeg-builder above). The binary
-# static-links its libav* and dynamically links libnpp*/cudart, which the
-# nvidia/cuda runtime image ships.
-COPY --from=ffmpeg-builder /opt/ffmpeg/bin/ffmpeg  /usr/local/bin/ffmpeg
-COPY --from=ffmpeg-builder /opt/ffmpeg/bin/ffprobe /usr/local/bin/ffprobe
 
 # stitchd, the CUDA compositor. It is the only compositor.
 # Static-links libav*, dynamically links libnpp*/cudart from the cuda runtime.

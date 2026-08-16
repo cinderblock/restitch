@@ -333,8 +333,6 @@ export const ConfigSchema = z.object({
       "Conversation in a warehouse. Voices may be muffled by machinery, " +
       "forklifts, drills, and other industrial equipment in the background.",
   }),
-  ffmpeg_path: z.string().default("ffmpeg"),
-  ffprobe_path: z.string().default("ffprobe"),
   log_level: z.enum(["quiet", "error", "warning", "info", "verbose", "debug"]).default("info"),
 });
 

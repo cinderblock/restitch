@@ -61,6 +61,7 @@ struct Server::Viewer {
 struct Server::Impl {
   Options opt;
   std::function<std::string()> status_fn;
+  std::function<std::vector<uint8_t>(const std::string &)> snapshot_fn;
   rtc::Configuration rtc_cfg;
 
   std::map<std::string, AVCodecParameters *> streams;
@@ -87,6 +88,11 @@ Server::Server() : impl_(std::make_unique<Impl>()) {}
 
 void Server::set_status_provider(std::function<std::string()> fn) {
   impl_->status_fn = std::move(fn);
+}
+
+void Server::set_snapshot_provider(
+    std::function<std::vector<uint8_t>(const std::string &)> fn) {
+  impl_->snapshot_fn = std::move(fn);
 }
 Server::~Server() { stop(); }
 
@@ -341,6 +347,28 @@ void Server::handle_http(int fd) {
     respond("200 OK", "", body, "application/json");
     ::close(fd);
     return;
+  }
+
+  // Thumbnails, from the frames this process already holds.
+  {
+    const std::string pfx = "/api/snapshot/";
+    std::string u = uri;
+    const size_t q = u.find('?');
+    if (q != std::string::npos) u = u.substr(0, q);
+    if (u.rfind(pfx, 0) == 0) {
+      std::string sname = u.substr(pfx.size());
+      while (!sname.empty() && sname.back() == '/') sname.pop_back();
+      std::vector<uint8_t> jpeg =
+          impl_->snapshot_fn ? impl_->snapshot_fn(sname) : std::vector<uint8_t>();
+      if (jpeg.empty()) {
+        respond("503 Service Unavailable", "", "no frame yet\n", "text/plain");
+      } else {
+        respond("200 OK", "Cache-Control: no-store\r\n",
+                std::string(jpeg.begin(), jpeg.end()), "image/jpeg");
+      }
+      ::close(fd);
+      return;
+    }
   }
 
   // /whep/<stream>
