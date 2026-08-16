@@ -256,7 +256,10 @@ private:
       // raw/* republish: the camera's ORIGINAL packets, no decode, no
       // re-encode. Lets Home Assistant read per-camera streams from stitchd
       // instead of opening a second connection to the NVR.
-      if (g_rtsp && !passthrough_.empty()) g_rtsp->broadcast(passthrough_, pkt);
+      if (g_rtsp && !passthrough_.empty()) {
+        g_rtsp->broadcast(passthrough_, pkt);
+        ++republished_;
+      }
       if (!dec_) { av_packet_unref(pkt); continue; } // audio-only input
       err = avcodec_send_packet(dec_, pkt);
       av_packet_unref(pkt);
@@ -295,6 +298,13 @@ public:
   // -1. Flag them, or anything watching for a stale input reads them as frozen
   // forever — a false positive that would make the whole signal useless.
   bool has_video() const { return need_video_; }
+  // Republished verbatim at raw/<name>? Those streams are real RTSP endpoints
+  // and belong in the UI's stream list alongside the composites.
+  bool republished() const { return !passthrough_.empty(); }
+  // Packets forwarded to raw/<name>. The right liveness signal for an
+  // audio-only input like blue or bullet: it republishes video without ever
+  // decoding one, so its frame count and age stay at zero/-1 forever.
+  long long republished_count() const { return republished_.load(); }
   // A name safe to print and to serve from /api/status. The bare URL is not:
   // a UniFi RTSP path is a bearer token in all but name, and the status JSON
   // reaches the dashboard.
@@ -334,6 +344,7 @@ private:
   audio::Tap *tap_orig_ = nullptr; // not owned; tap_ is nulled when unusable
   std::atomic<long long> reconnects_{0};
   std::atomic<long long> last_frame_ms_{0};
+  std::atomic<long long> republished_{0};
 
 public:
   // Republish this input's video packets under `name` on the RTSP server.
@@ -934,7 +945,24 @@ int run(const Config &cfg, const char *dest, long long max_frames,
           << ",\"codec\":\"" << (p->codec_id == AV_CODEC_ID_HEVC ? "hevc" : "h264")
           << "\",\"width\":" << w->w << ",\"height\":" << w->h
           << ",\"dropped\":" << w->dropped()
-          << ",\"frames\":" << w->encoded() << "}";
+          << ",\"frames\":" << w->encoded() << ",\"kind\":\"output\"}";
+      }
+      // The raw/<name> passthroughs are served over RTSP exactly like the
+      // composites, but they used to be invisible here: this list was built
+      // from the encoders alone, so the cutover from mediamtx (whose
+      // /v3/paths/list enumerated every path) silently dropped 10 working
+      // streams out of the dashboard while they carried on being served.
+      for (auto *d : all_inputs) {
+        if (!d->republished()) continue;
+        const AVCodecParameters *p = d->video_par();
+        if (!p) continue;
+        if (!first) o << ",";
+        first = false;
+        o << "{\"name\":\"" << d->log_name() << "\",\"ready\":true"
+          << ",\"codec\":\"" << (p->codec_id == AV_CODEC_ID_HEVC ? "hevc" : "h264")
+          << "\",\"width\":" << p->width << ",\"height\":" << p->height
+          << ",\"dropped\":0,\"frames\":" << d->republished_count()
+          << ",\"kind\":\"raw\"}";
       }
       o << "],\"sessions\":[";
       bool sfirst = true;
@@ -964,6 +992,7 @@ int run(const Config &cfg, const char *dest, long long max_frames,
         o << "{\"name\":\"" << d->log_name() << "\",\"frames\":" << d->count_
           << ",\"ageMs\":" << d->frame_age_ms()
           << ",\"reconnects\":" << d->reconnects()
+          << ",\"pkts\":" << d->republished_count()
           << ",\"video\":" << (d->has_video() ? "true" : "false") << "}";
       }
       o << "],\"rtspClients\":" << (g_rtsp ? g_rtsp->client_count() : 0)
