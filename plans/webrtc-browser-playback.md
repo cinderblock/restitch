@@ -98,3 +98,42 @@ diffs the answer's m-lines against it — that reproduces bug 1 in one command
 without a browser. Bugs 2 and 3 needed a real browser and `getStats()`;
 `framesReceived` vs `framesDecoded` vs a missing `codec` entry is what separates
 "wrong payload type" from "cannot decode" from "not arriving".
+
+## Follow-up 2026-08-16: mediamtx and the ffmpeg compositor deleted
+
+Answering "why are we still using mediamtx?" turned up that we weren't — it had
+not run since the cutover — but it survived as a `compositor: ffmpeg|native`
+fallback, along with the entire ffmpeg filtergraph builder. Deleted outright
+(`df5a8b6`).
+
+Gone: `src/mediamtx.ts`, `src/hwaccel.ts`, `buildPipeline` /
+`buildExtraCompositePipeline` / `buildCommand` / `ensureHwaccelWorks`, the
+mediamtx launch and its CLI flags, the mediamtx control-API fallbacks in the
+dashboard and watchdog, the second ffmpeg audio pump in `transcribe.ts`, the
+52 MB mediamtx download in the Dockerfile, and the `compositor` / `hwaccel` /
+`mediamtx_api_url` config keys. `src/ffmpeg.ts` became `src/stitchd.ts` with
+only the config builder left. **4895 -> 3339 lines**, and `bun run check` is
+clean for the first time in this work.
+
+Kept deliberately: **ffprobe** probes cameras at startup and **ffmpeg** renders
+the dashboard's snapshot thumbnails. Those are live users, not a fallback.
+
+The GPU-or-loud-error rule moved rather than vanished: `ensureHwaccelWorks`
+probed *ffmpeg's* CUDA support, which proved nothing about stitchd. stitchd
+creates a CUDA device and opens NVDEC/NVENC at startup and exits on failure.
+
+Verified before deploying: a dry run against the live `config.yaml` produced a
+**byte-identical 45-line stitchd.conf**, so the process under supervision got
+exactly what it got before.
+
+### Raw streams in the dashboard
+
+The same status change that lists `raw/<name>` (see
+`stitchd: list the raw/<name> republishes`) is now rendered. All **16** paths
+appear — 6 outputs and 10 raw. Raw rows are tagged `raw · rtsp only` and carry
+just the RTSP link, because stitchd registers WebRTC and writes HLS only for
+the encoded outputs; offering those links on a raw row would be two dead ends.
+
+While in that markup, every `title=` tooltip was removed (invisible on touch);
+the snapshot/copy affordance is now an inline hint. The page reports **0**
+`title` attributes.
