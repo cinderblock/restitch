@@ -137,3 +137,45 @@ the encoded outputs; offering those links on a raw row would be two dead ends.
 While in that markup, every `title=` tooltip was removed (invisible on touch);
 the snapshot/copy affordance is now an inline hint. The page reports **0**
 `title` attributes.
+
+## Follow-up 2026-08-16b: the last two ffmpeg binaries are gone
+
+"Can't stitchd do everything?" — yes. First, a correction that matters: stitchd
+**is** ffmpeg where it counts. It static-links libavformat/libavcodec/libavutil/
+libswresample. The goal was never to remove ffmpeg's code, only the external
+binaries and the duplicated work they were doing.
+
+**Snapshots.** The dashboard spawned an ffmpeg per stream per minute that
+reconnected over RTSP and decoded a full frame — up to 2688x1512 — to make a
+320px thumbnail. Listing the raw cameras had just taken that from 6 spawns a
+minute to **16**, so this got worse before it got better. stitchd already holds
+every one of those frames on the GPU: a new kernel box-filters NV12 down to
+thumbnail size as planar YUV420, and libavcodec's mjpeg encoder (already
+linked) makes the JPEG. Served at `GET /api/snapshot/<name>`.
+
+`blue` and `bullet` are opened audio-only, so nothing decodes their video and
+they were the only two of sixteen with no thumbnail. They now decode exactly
+one frame on request, starting at a keyframe, from packets already in hand —
+the first request after startup arms it and returns 503, the next serves. The
+dashboard prewarms every 60 s, so a hover is always warm.
+
+**Probing.** The supervisor needs camera geometry before it can generate
+stitchd's config, so it shelled out to ffprobe per camera. `stitchd --probe
+<url>...` answers with the same libavformat — one process for ten. It prefers
+`r_frame_rate` over `avg_frame_rate`: they agree on the bays, but the bullet
+throttles when idle and measured **9 fps against its nominal 20**, and the
+layout must not depend on how busy a scene was at startup.
+
+### Result
+
+| | before | after |
+| --- | --- | --- |
+| Binaries in `/usr/local/bin` | bun, ffmpeg, ffprobe, mediamtx, stitchd, whisper×2 | bun, stitchd, whisper×2 |
+| Image weight removed | — | **~104 MB** (52 mediamtx + 52 ffmpeg/ffprobe) |
+| Snapshot cost | 16 process spawns + 16 RTSP sessions + 16 full decodes / min | 16 GETs against frames already in memory |
+| `client playing` log lines / 3 min | ~48 | **5** |
+| Container CPU | ~35 % | **~28 %** |
+| Snapshots working | 16/16 | **16/16** (verified through the dashboard's own route) |
+
+Verified before deploying: a full dry run against the live `config.yaml`, now
+probing through stitchd, produced a **byte-identical 45-line stitchd.conf**.
