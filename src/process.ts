@@ -36,7 +36,7 @@ export function launchManaged(
   // Set by restart() so the exit handler doesn't ALSO schedule a respawn —
   // otherwise an intentional restart spawns two processes (the one restart()
   // creates + the one the exit handler creates), which then fight over the
-  // mediamtx publish path ("closing existing publisher" → Broken pipe →
+  // old publish path ("closing existing publisher" → Broken pipe →
   // crash loop).
   let intentionalRestart = false;
   // Guards restart() against re-entry. The watchdog polls on an interval and
@@ -49,7 +49,7 @@ export function launchManaged(
   // MUST cancel it: if a process exits on its own and the watchdog calls
   // restart() before the timer fires, restart() spawns the replacement and
   // then the stale timer spawns a SECOND one. Observed in production
-  // 2026-07-29 — two stitchd instances publishing to the same mediamtx paths,
+  // 2026-07-29 — two stitchd instances publishing the same paths,
   // which stuttered every consumer of every output.
   let pendingRespawn: ReturnType<typeof setTimeout> | null = null;
   let proc: Subprocess;
@@ -161,7 +161,7 @@ export function launchManaged(
         // If the process already died on its own, the exit handler has a
         // respawn timer armed. Cancel it before we spawn our own replacement —
         // otherwise both fire and we end up with two live instances fighting
-        // over the same mediamtx publish paths.
+        // over the same publish paths.
         cancelPendingRespawn();
         // Tell the exit handler not to auto-respawn; we'll spawn the one
         // replacement ourselves once the old process is gone.

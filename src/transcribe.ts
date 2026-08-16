@@ -22,7 +22,7 @@ import type {
   Camera,
   Transcription,
 } from "./config.ts";
-import { rawStreamName } from "./mediamtx.ts";
+import { rawStreamName } from "./stitchd.ts";
 import { launchManaged, type ManagedProcess } from "./process.ts";
 
 export interface Contributor {
@@ -213,7 +213,7 @@ export interface LiveStats {
    *  The pump is a live capture, so in the steady state it must deliver
    *  SAMPLE_RATE * channels * 2 bytes per wall-clock second. Any shortfall
    *  means ffmpeg is not draining its RTSP inputs fast enough — which is
-   *  exactly when mediamtx starts logging "reader is too slow" and discarding
+   *  exactly when the server starts dropping a slow reader and discarding
    *  frames for those inputs. A lag that grows with uptime is the signature of
    *  progressive drift (amerge waiting ever longer on a laggard input); a lag
    *  that jumps once and stays flat is a one-off stall. */
@@ -237,9 +237,8 @@ function startCombinedPump(
   config: Config,
   whisperUrl: string,
   ring: RingBuffer,
-  stats: LiveStats,
-  spawnPump: boolean = true
-): { proc?: ManagedProcess; onPcm: (chunk: Uint8Array) => void } {
+  stats: LiveStats
+): { onPcm: (chunk: Uint8Array) => void } {
   const t = config.transcription;
   const N = cameras.length;
   const SAMPLE_RATE = 16000;
@@ -322,7 +321,7 @@ function startCombinedPump(
     }
 
     // Periodic line so hours of history land in the container log next to
-    // mediamtx's discard warnings — correlating the two is the whole point.
+    // the server's discard warnings — correlating the two is the whole point.
     if (bytesIn - lastLogBytes >= LOG_EVERY_BYTES) {
       lastLogBytes = bytesIn;
       console.log(
@@ -550,72 +549,11 @@ function startCombinedPump(
   };
 
   // Build the ffmpeg invocation.
-  const cmd: string[] = [
-    config.ffmpeg_path,
-    "-loglevel",
-    "warning",
-  ];
-  for (const cam of cameras) {
-    cmd.push(
-      "-use_wallclock_as_timestamps",
-      "1",
-      // Exit if no RTSP data for 30s so the supervisor restarts the
-      // pump instead of running forever with one input frozen.
-      "-timeout",
-      "30000000",
-      "-rtsp_transport",
-      "tcp",
-      "-allowed_media_types",
-      "audio",
-      "-i",
-      `${config.output.base_url}/${rawStreamName(cam)}`
-    );
-  }
-  // Per-input: resample to 16k mono, then amerge into N channels.
-  const filterParts: string[] = [];
-  for (let i = 0; i < cameras.length; i++) {
-    filterParts.push(
-      `[${i}:a]aresample=async=1,aformat=sample_rates=16000:channel_layouts=mono[a${i}]`
-    );
-  }
-  const inputs = Array.from({ length: cameras.length }, (_, i) => `[a${i}]`).join("");
-  filterParts.push(`${inputs}amerge=inputs=${cameras.length}[merged]`);
-  cmd.push(
-    "-filter_complex",
-    filterParts.join("; "),
-    "-map",
-    "[merged]",
-    "-ac",
-    String(cameras.length),
-    "-ar",
-    "16000",
-    "-f",
-    "s16le",
-    "-"
-  );
-
-  if (!spawnPump) return { onPcm: onStdout };
-
-  const proc = launchManaged(
-    "audio-combined",
-    () => ({
-      cmd,
-      onStdout,
-      onStderr: (line) => {
-        // ffmpeg runs at -loglevel warning, and its timestamp complaints are
-        // the most diagnostic thing it emits for this pump — "timestamp
-        // discontinuity", "non-monotonic DTS", aresample compensation. The old
-        // /error|fail/ filter dropped every one of them, so the pump looked
-        // silent while it was falling behind. Match those explicitly rather
-        // than forwarding everything, which would spam the log on startup.
-        if (/error|fail|discontinu|non-monotonic|timestamp|aresample|async/i.test(line)) {
-          console.error(`[combined] ${line}`);
-        }
-      },
-    }),
-    { restartDelayMs: 5000 }
-  );
-  return { proc, onPcm: onStdout };
+  // stitchd produces the merged PCM on its stdout; this function only owns
+  // the consumer side. It used to also build an ffmpeg that opened one RTSP
+  // audio input per camera and amerged them — a second full set of camera
+  // connections, deleted with the rest of the ffmpeg pipeline.
+  return { onPcm: onStdout };
 }
 
 /**
@@ -641,10 +579,10 @@ export interface PcmSink {
 export function startTranscription(
   config: Config,
   processes: ManagedProcess[],
-  /** When provided, stitchd supplies the merged PCM and NO ffmpeg pump is
-   *  spawned. The sink stays null until whisper is up, so early bytes are
+  /** stitchd supplies the merged PCM here. The sink stays null until whisper
+   *  is up, so early bytes are
    *  dropped rather than queued against a server that cannot answer. */
-  pcmSink?: PcmSink
+  pcmSink: PcmSink
 ): { ring: RingBuffer; stats: LiveStats } {
   const t = config.transcription;
   const ring = new RingBuffer(t.max_entries_per_camera);
@@ -691,22 +629,13 @@ export function startTranscription(
       await waitForServer(whisperUrl);
       console.log(`[transcribe] whisper-server ready at ${whisperUrl}`);
       const skipped = config.cameras.length - cameras.length;
-      const external = pcmSink != null;
       console.log(
-        `[transcribe] ${external ? "attaching to stitchd audio" : "starting combined pump"}` +
+        `[transcribe] attaching to stitchd audio` +
           ` for ${cameras.length} camera(s)` +
           (skipped > 0 ? ` (${skipped} excluded via transcribe: false)` : "")
       );
-      const pump = startCombinedPump(
-        cameras,
-        config,
-        whisperUrl,
-        ring,
-        stats,
-        !external
-      );
-      if (pump.proc) processes.push(pump.proc);
-      if (pcmSink) pcmSink.write = pump.onPcm;
+      const pump = startCombinedPump(cameras, config, whisperUrl, ring, stats);
+      pcmSink.write = pump.onPcm;
     } catch (err) {
       console.error("[transcribe] whisper-server never came up:", err);
     }

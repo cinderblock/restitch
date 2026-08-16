@@ -50,7 +50,9 @@ const HTML = `<!DOCTYPE html>
   code { font: 13px/1 "JetBrains Mono", Consolas, "Courier New", monospace; color: var(--accent); }
   .empty { color: var(--muted); text-align: center; padding: 12px; font-style: italic; }
   /* Streams: name cell holds clickable name + inline open links */
-  .name-cell { display: flex; align-items: baseline; gap: 10px; }
+  .kind-tag { color: var(--muted); font-size: 11px; letter-spacing: .02em; }
+.hint { color: var(--muted); font-size: 11px; opacity: .75; }
+.name-cell { display: flex; align-items: baseline; gap: 10px; }
   .stream-name {
     font: 13px/1 "JetBrains Mono", Consolas, "Courier New", monospace;
     color: var(--accent); cursor: pointer; text-decoration: none;
@@ -177,9 +179,8 @@ const slugToCameraName = slug => slug
   .join(' ');
 
 const HOST = location.hostname;
-// stitchd's layout, not mediamtx's: WHEP lives under /whep/ on the WebRTC port
-// (same URL serves the player on GET), and HLS is served by this dashboard
-// rather than by a separate :8890.
+// WHEP lives under /whep/ on stitchd's WebRTC port (the same URL serves the
+// player page on GET); HLS is served by this dashboard.
 const streamUrls = name => ({
   rtsp: 'rtsp://' + HOST + ':8554/' + name,
   webrtc: 'http://' + HOST + ':8889/whep/' + name,
@@ -223,15 +224,20 @@ function createPathRow(p) {
   const tr = document.createElement('tr');
 
   const nameTd = document.createElement('td');
+  // Raw republishes are RTSP-only, so they get the rtsp link and nothing else.
+  const links = p.kind === 'raw'
+    ? '<span class="kind-tag">raw · rtsp only</span>'
+    : '<span class="name-links">'
+      +   '<a href="' + urls.webrtc + '" target="_blank" rel="noopener">webrtc</a>'
+      +   '<span class="sep">·</span>'
+      +   '<a href="' + urls.hls + '" target="_blank" rel="noopener">hls</a>'
+      + '</span>';
   nameTd.innerHTML =
     '<div class="name-cell">'
     + '<a class="stream-name" data-rtsp="' + urls.rtsp + '" data-path="' + p.name + '" '
-    + 'href="' + urls.rtsp + '" title="click to copy ' + urls.rtsp + ' · hover for a snapshot">' + p.name + '</a>'
-    + '<span class="name-links">'
-    +   '<a href="' + urls.webrtc + '" target="_blank" rel="noopener" title="' + urls.webrtc + '">webrtc</a>'
-    +   '<span class="sep">·</span>'
-    +   '<a href="' + urls.hls + '" target="_blank" rel="noopener" title="' + urls.hls + '">hls</a>'
-    + '</span>'
+    + 'href="' + urls.rtsp + '">' + p.name + '</a>'
+    + links
+    + '<span class="hint">click name to copy the rtsp url · hover for a snapshot</span>'
     + '</div>';
 
   const stateTd   = document.createElement('td');
@@ -397,7 +403,7 @@ function renderTimeline(transcriptItems, paths) {
   const start = now - TIMELINE_WINDOW_MS;
   const trimmed = gpuHistory.filter(p => p.ts >= start);
 
-  // Per-camera rows: derived from raw/* mediamtx paths (always show all
+  // Per-camera rows: derived from the raw/* paths (always show all
   // cameras, even ones with no recent voice activity).
   const cameraOrder = (paths.items || [])
     .filter(p => p.name.startsWith('raw/'))
@@ -706,7 +712,7 @@ async function tick() {
       // Pump health: lag is how many seconds of audio ffmpeg is behind real
       // time. It should sit near 0; a value that grows with uptime means the
       // pump is not draining its RTSP inputs fast enough, which is what makes
-      // mediamtx discard frames. Shown inline (not a tooltip) so it is visible
+      // discarded frames. Shown inline (not a tooltip) so it is visible
       // on a phone without hovering.
       const lagS = audioStats.pump_lag_s ?? 0;
       const ratioPct = ((audioStats.pump_recent_ratio ?? 1) * 100);
@@ -742,7 +748,7 @@ async function tick() {
             + '<span style="width: 170px; color: ' + labelColor + '; font-weight: ' + labelWeight + ';">' + e.name + '</span>'
             + '<div style="flex: 1; position: relative; height: 10px; background: #1a1c22; border-radius: 2px; overflow: hidden;">'
             +   '<div style="position: absolute; left: 0; top: 0; bottom: 0; width: ' + pct.toFixed(1) + '%; background: ' + fillColor + ';"></div>'
-            +   '<div style="position: absolute; left: ' + thresholdPct.toFixed(1) + '%; top: -2px; bottom: -2px; width: 1px; background: var(--bad);" title="silence threshold ' + threshold + ' dB"></div>'
+            +   '<div style="position: absolute; left: ' + thresholdPct.toFixed(1) + '%; top: -2px; bottom: -2px; width: 1px; background: var(--bad);"></div>'
             + '</div>'
             + '<span style="width: 70px; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); margin-left: 8px;">' + e.db.toFixed(1) + ' dB</span>'
             + '</div>';
@@ -836,7 +842,7 @@ async function proxyJson(url: string): Promise<Response> {
  * address) into a human-readable executable name.
  *
  * Runs `ss -tnpH`. In the container we are root so no sudo is needed and
- * all child PIDs (ffmpeg/mediamtx/whisper) are visible in our PID
+ * all child PIDs (stitchd/whisper/ffmpeg snapshots) are visible in our PID
  * namespace. We try plain `ss` first and fall back to `sudo -n ss` for a
  * non-root host runner. If neither works, returns empty and the dashboard
  * shows raw addresses.
@@ -984,7 +990,7 @@ async function grabSnapshot(
 
 /**
  * Player page for an HLS stream, served at /hls/<name> (and, through the public
- * Caddy mount, at /all-field). mediamtx served an equivalent page and the
+ * Caddy mount, at /all-field). The pre-stitchd stack served an equivalent page and the
  * scoreboard embed points at that URL, so we owe one.
  *
  * Every URL is derived from location.pathname at runtime rather than baked in,
@@ -1050,29 +1056,24 @@ if (v.canPlayType('application/vnd.apple.mpegurl')) {
 
 export function startDashboard(
   dashboard: Dashboard,
+  /** stitchd's status endpoint — the only source of stream state. */
+  statusUrl: string,
   transcription?: { ring: RingBuffer; stats: LiveStats },
   media?: { ffmpegPath: string; baseUrl: string },
   /** Directory stitchd writes HLS segments into; served at /hls/<name>/... */
-  hlsDir?: string,
-  /** stitchd's status endpoint; when set, mediamtx is not consulted at all. */
-  statusUrl?: string
-): Server {
-  const apiBase = dashboard.mediamtx_api_url.replace(/\/$/, "");
-  // With the native compositor there is no mediamtx: stitchd serves its own
-  // status on the WHEP HTTP port. Shaped like mediamtx's /v3/paths/list so the
-  // UI reads from a different source without a rewrite.
-  const stitchdApi = statusUrl ?? null;
+  hlsDir?: string
+): Server<undefined> {
+  const stitchdApi = statusUrl;
   // Cache of the last status payload so the sessions endpoint can serve from
   // the same fetch the paths table already makes, instead of hitting stitchd
   // twice per poll.
   let lastSessions: { peer: string; stream: string; via: string }[] = [];
 
   const fetchPaths = async (): Promise<Response> => {
-    if (!stitchdApi) return fetch(`${apiBase}/v3/paths/list`);
     const r = await fetch(stitchdApi);
     if (!r.ok) return r;
     const j = (await r.json()) as {
-      items?: { name: string; ready?: boolean; codec?: string; width?: number; height?: number; dropped?: number }[];
+      items?: { name: string; ready?: boolean; codec?: string; width?: number; height?: number; dropped?: number; kind?: string }[];
       sessions?: { peer: string; stream: string; via: string }[];
       rtspClients?: number;
       webrtcViewers?: number;
@@ -1091,6 +1092,11 @@ export function startDashboard(
       width: it.width,
       height: it.height,
       dropped: it.dropped ?? 0,
+      // "raw" = a camera republished verbatim; "output" = a composite stitchd
+      // encodes. Raw paths exist on RTSP only — stitchd registers WebRTC and
+      // writes HLS for the encoded outputs, so offering those links on a raw
+      // row would just hand the user two dead ends.
+      kind: it.kind ?? "output",
     }));
     return new Response(
       JSON.stringify({ items, rtspClients: j.rtspClients ?? 0, webrtcViewers: j.webrtcViewers ?? 0 }),
@@ -1165,7 +1171,7 @@ export function startDashboard(
         }
 
         // A bare stream name (no file component) is a browser asking to watch,
-        // not to fetch a segment. mediamtx served a player page here and the
+        // not to fetch a segment. The pre-stitchd stack served a player page here and the
         // public mount still points at it; without this the URL 404s because
         // Bun.file() on a directory is not a readable file.
         const bare = rel.replace(/\/+$/, "");
@@ -1220,10 +1226,9 @@ export function startDashboard(
           });
         case "/api/paths":
           return fetchPaths();
-        case "/api/rtsp":
-          if (stitchdApi) {
-            // Served from the status payload the paths table already fetched.
-            await fetchPaths();
+        case "/api/rtsp": {
+          // Served from the status payload the paths table already fetched.
+          await fetchPaths();
             return new Response(
               JSON.stringify({
                 items: lastSessions
@@ -1239,11 +1244,9 @@ export function startDashboard(
               }),
               { headers: { "content-type": "application/json" } }
             );
-          }
-          return proxyJson(`${apiBase}/v3/rtspsessions/list`);
-        case "/api/webrtc":
-          if (stitchdApi) {
-            await fetchPaths();
+        }
+        case "/api/webrtc": {
+          await fetchPaths();
             return new Response(
               JSON.stringify({
                 items: lastSessions
@@ -1258,14 +1261,11 @@ export function startDashboard(
               }),
               { headers: { "content-type": "application/json" } }
             );
-          }
-          return proxyJson(`${apiBase}/v3/webrtcsessions/list`);
+        }
         case "/api/hls":
-          // No mediamtx to ask any more. stitchd exposes aggregate counts via
-          // /api/status; per-session detail is not tracked yet, so return an
-          // empty list rather than proxying to a server that is gone.
-          if (stitchdApi) return new Response('{"items":[]}', { headers: { "content-type": "application/json" } });
-          return proxyJson(`${apiBase}/v3/hlsmuxers/list`);
+          // stitchd exposes aggregate counts via /api/status; per-session HLS
+          // detail is not tracked, so return an empty list.
+          return new Response('{"items":[]}', { headers: { "content-type": "application/json" } });
         case "/api/system":
           return Response.json(await readSystemInfo());
         case "/api/peers":

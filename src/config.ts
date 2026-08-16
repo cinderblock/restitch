@@ -19,18 +19,18 @@ const CameraSchema = z
       .boolean()
       .default(true)
       .describe(
-        "If false, restream this camera through mediamtx but exclude it from the composite stack"
+        "If false, republish this camera at raw/<name> but exclude it from the composite stack"
       ),
     transcribe: z
       .boolean()
       .default(true)
       .describe(
         "If false, exclude this camera's audio from the transcription pump. " +
-          "Every camera costs one more RTSP input on the single amerge'd ffmpeg " +
+          "Every camera costs one more channel in stitchd's audio mixer " +
           "and one more channel for the consumer to process, so cameras whose " +
           "audio is never useful (outdoor/bullet cams, duplicate coverage) are " +
           "worth turning off — the pump has been observed saturating and " +
-          "triggering mediamtx 'reader is too slow' discards across ALL inputs."
+          "starving the other inputs behind it."
       ),
   })
   .refine((cam) => cam.composite === false || cam.order !== undefined, {
@@ -79,10 +79,6 @@ const SubStreamSchema = z.object({
     .optional()
     .describe("VBV buffer for this sub-stream (e.g. '10M'). Smaller = smoother keyframes. Defaults to maxrate when maxrate is set."),
 });
-
-const HwAccelSchema = z
-  .enum(["none", "vaapi", "qsv", "nvenc", "auto"])
-  .default("auto");
 
 const StackDirectionSchema = z.enum(["vertical", "horizontal"]).default("vertical");
 
@@ -156,31 +152,15 @@ const CompositeSchema = z.object({
     .describe("Optional scale for the composite output. Omit for full resolution"),
 });
 
+// Only what stitchd actually consumes. preset/crf/pixel_format/extra_args/
+// scale_flags were ffmpeg encoder arguments and did nothing once stitchd took
+// over — it sets its own NVENC parameters. keyframe_interval_seconds went the
+// same way: stitchd hardcodes a ~2s GOP (see out.enc->gop_size in
+// compositor/src/main.cpp), which is the value this was tuned to anyway.
 const EncoderSchema = z.object({
-  codec: z.string().default("libx264").describe("FFmpeg encoder name"),
-  preset: z.string().default("medium").describe("Encoder preset"),
-  crf: z.number().int().min(0).max(51).default(18).describe("Quality (lower = better)"),
+  codec: z.string().default("h264_nvenc").describe("NVENC encoder name"),
   maxrate: z.string().optional().describe("Max bitrate, e.g. '20M'"),
   bufsize: z.string().optional().describe("Buffer size, e.g. '40M'"),
-  pixel_format: z.string().default("yuv420p"),
-  keyframe_interval_seconds: z
-    .number()
-    .positive()
-    .default(1)
-    .describe(
-      "Seconds between keyframes (GOP length). Lower = lower latency / faster " +
-        "stream start, at the cost of more bitrate. 1s is a good low-latency default."
-    ),
-  extra_args: z.array(z.string()).default([]).describe("Additional FFmpeg encoder args"),
-  scale_flags: z
-    .string()
-    .default("lanczos")
-    .describe(
-      "swscale algorithm for all scale filters (composite + sub-streams + extra " +
-        "composites). 'lanczos' is highest quality but CPU-heavy; 'bilinear' is " +
-        "much cheaper (relevant since scaling runs on the CPU, not the GPU) with " +
-        "minor quality loss on downscales. Others: bicubic, area, neighbor, fast_bilinear."
-    ),
 });
 
 const OutputSchema = z.object({
@@ -196,7 +176,7 @@ const WebRTCSchema = z.object({
     .array(z.string())
     .default([])
     .describe(
-      "STUN/TURN server URLs (mediamtx webrtcICEServers2), e.g. " +
+      "STUN/TURN server URLs, e.g. " +
         "'stun:stun.l.google.com:19302'. With STUN, the server discovers its " +
         "WAN address through the UDP mux port and advertises it as a " +
         "numeric-IP srflx candidate — required for Safari/iOS viewers, which " +
@@ -208,7 +188,7 @@ const WebRTCSchema = z.object({
     .array(z.string())
     .default([])
     .describe(
-      "Extra hosts/IPs advertised as ICE candidates (mediamtx " +
+      "Extra hosts/IPs advertised as ICE candidates (" +
         "webrtcAdditionalHosts) alongside the interface addresses. WebRTC " +
         "media bypasses any HTTP reverse proxy, so off-LAN viewers need a " +
         "candidate they can actually reach: add a public DNS name here (a " +
@@ -225,10 +205,6 @@ const DashboardSchema = z.object({
     .string()
     .default(":9000")
     .describe("Bind address for the dashboard HTTP server (host:port or :port)"),
-  mediamtx_api_url: z
-    .string()
-    .default("http://localhost:9997")
-    .describe("Where the dashboard reaches the mediamtx control API"),
 });
 
 const TranscriptionSchema = z.object({
@@ -329,30 +305,13 @@ export const ConfigSchema = z.object({
       "Additional composites built from arbitrary camera subsets. Each runs " +
         "as its own FFmpeg pipeline alongside the main composite."
     ),
-  encoder: EncoderSchema.default({
-    codec: "libx264",
-    preset: "medium",
-    crf: 18,
-    pixel_format: "yuv420p",
-    extra_args: [],
-  }),
-  hwaccel: HwAccelSchema,
-  // Which compositor produces the streams. "ffmpeg" = the classic
-  // filtergraph pipeline (main compositor + one ffmpeg per extra composite).
-  // "native" = stitchd, the custom CUDA compositor (compositor/), which
-  // decodes each camera once and builds every output GPU-resident with
-  // deterministic frame pairing + per-output drop scheduling.
-  compositor: z.enum(["ffmpeg", "native"]).default("ffmpeg"),
+  encoder: EncoderSchema.default({ codec: "h264_nvenc" }),
   output: OutputSchema.default({
     format: "rtsp",
     base_url: "rtsp://localhost:8554",
   }),
   webrtc: WebRTCSchema.default({ ice_servers: [], additional_hosts: [] }),
-  dashboard: DashboardSchema.default({
-    enabled: true,
-    address: ":9000",
-    mediamtx_api_url: "http://localhost:9997",
-  }),
+  dashboard: DashboardSchema.default({ enabled: true, address: ":9000" }),
   transcription: TranscriptionSchema.default({
     enabled: true,
     whisper_server: {

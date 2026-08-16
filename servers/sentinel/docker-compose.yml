@@ -8,9 +8,9 @@ services:
     container_name: restitch
     restart: unless-stopped
     # host networking so the RTSP (8554), WebRTC (8889 + UDP 8189), HLS (8890),
-    # mediamtx API (9997), and dashboard (9000) ports are reachable on the LAN
+    # and dashboard (9000) ports are reachable on the LAN
     # without per-port mappings, AND so the compositor can pull
-    # rtsp://localhost:8554/raw/* from mediamtx (same process tree).
+    # rtsp://localhost:8554/raw/* from stitchd (same process tree).
     network_mode: host
     runtime: nvidia
     deploy:

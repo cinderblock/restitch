@@ -1,5 +1,5 @@
 import type { Config, Camera } from "./config.ts";
-import type { ProbeResult } from "./ffmpeg.ts";
+import type { ProbeResult } from "./stitchd.ts";
 
 /**
  * Probe a single camera stream to get its native resolution and frame rate.

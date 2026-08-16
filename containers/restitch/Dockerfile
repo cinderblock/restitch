@@ -1,12 +1,13 @@
 # syntax=docker/dockerfile:1.7
 #
 # Single-container restitch image. One bun process supervises:
-#   - mediamtx (RTSP + WebRTC + HLS + control API)
-#   - main ffmpeg compositor (vstack + sub-stream crops)
-#   - one ffmpeg per extra_composite (camera or stream: inputs)
+#   - stitchd (CUDA compositor; also serves RTSP, HLS and WebRTC/WHEP, and
+#     republishes each camera verbatim at raw/<name>)
 #   - whisper-server (CUDA)
-#   - audio fusion ffmpeg (N-channel amerge for transcription)
 #   - dashboard HTTP server
+#
+# ffmpeg/ffprobe remain in the image for camera probing at startup and for the
+# dashboard's snapshot thumbnails — not for compositing.
 #
 # Built with --gpus all on the target host. NVIDIA_DRIVER_CAPABILITIES
 # includes 'video' so NVENC/NVDEC encoder libraries are mounted in.
@@ -150,16 +151,9 @@ RUN apt-get update -qq && \
 COPY --from=ffmpeg-builder /opt/ffmpeg/bin/ffmpeg  /usr/local/bin/ffmpeg
 COPY --from=ffmpeg-builder /opt/ffmpeg/bin/ffprobe /usr/local/bin/ffprobe
 
-# stitchd, the custom CUDA compositor (used when config `compositor: native`).
+# stitchd, the CUDA compositor. It is the only compositor.
 # Static-links libav*, dynamically links libnpp*/cudart from the cuda runtime.
 COPY --from=compositor-builder /opt/compositor/build/stitchd /usr/local/bin/stitchd
-
-# mediamtx (RTSP/WebRTC/HLS + control API). Version pinned via ARG so the
-# build script can override from versions.json.
-ARG MEDIAMTX_VERSION=1.16.3
-RUN curl -fsSL "https://github.com/bluenviron/mediamtx/releases/download/v${MEDIAMTX_VERSION}/mediamtx_v${MEDIAMTX_VERSION}_linux_amd64.tar.gz" \
-    | tar -xz -C /usr/local/bin mediamtx && \
-    chmod +x /usr/local/bin/mediamtx
 
 # Bun (TypeScript runtime). Bun's installer scopes to BUN_INSTALL.
 ARG BUN_VERSION=1.3.0

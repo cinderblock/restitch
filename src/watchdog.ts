@@ -1,5 +1,5 @@
 /**
- * Watchdog: periodically polls mediamtx and restarts ffmpeg processes that are
+ * Watchdog: periodically polls stitchd's status and restarts it when it is
  * alive but stuck (the supervisor only restarts on process exit). Two triggers:
  *
  *  1. Output byte-stall — a watched output path's bytesReceived hasn't grown in
@@ -16,7 +16,7 @@ import type { ManagedProcess } from "./process.ts";
 export interface WatchedProcess {
   /** Display name for log messages. */
   name: string;
-  /** mediamtx path names this process publishes to. */
+  /** Stream names this process publishes. */
   paths: string[];
   /** The supervisor entry for the ffmpeg. */
   process: ManagedProcess;
@@ -25,11 +25,11 @@ export interface WatchedProcess {
    *  output keeps publishing but one input branch silently freezes,
    *  which the byte-rate check can't detect (output bytes keep growing). */
   periodicRestartMs?: number;
-  /** mediamtx path names this process READS as inputs (e.g. raw/foyer). When
+  /** Stream names this process READS as inputs (e.g. raw/foyer). When
    *  one of these paths' source reconnects, ffmpeg's read of it can wedge on the
    *  dead connection while the fps filter keeps duplicating the last frame —
    *  that half of the composite freezes but bytes keep flowing, so the byte-rate
-   *  check is blind. mediamtx reports each path's readyTime; when it changes, the
+   *  check is blind. Each input reports when it last reconnected; when that changes, the
    *  source reconnected, so we restart this process to re-establish a clean read.
    *  This is the actual trigger for the entry/foyer freeze (the freeze timestamp
    *  matched raw/foyer's readyTime exactly). */
@@ -42,11 +42,9 @@ interface PathState {
 }
 
 export interface WatchdogOptions {
-  /** mediamtx control API base URL. Default: http://localhost:9997 */
-  mediamtxApi?: string;
-  /** stitchd's status endpoint. When set, mediamtx is not polled at all and
+  /** stitchd's status endpoint. Polled for
    *  stall detection uses each output's encoded-frame counter. */
-  statusUrl?: string;
+  statusUrl: string;
   /** Poll interval in ms. Default: 15_000 */
   pollMs?: number;
   /** Considered stalled if bytesReceived hasn't grown in this many ms.
@@ -59,14 +57,13 @@ export interface WatchdogOptions {
 
 export function startWatchdog(
   watched: WatchedProcess[],
-  opts: WatchdogOptions = {}
+  opts: WatchdogOptions
 ): { stop: () => void } {
-  const apiBase = (opts.mediamtxApi ?? "http://localhost:9997").replace(/\/$/, "");
-  // With the native compositor there is no mediamtx: stitchd reports its own
+  // stitchd reports its own
   // liveness. Polling the dead :9997 API left the watchdog permanently
   // erroring, which meant a wedged output was never restarted — the safety net
   // was silently gone from the cutover until 2026-08-05.
-  const statusUrl = opts.statusUrl ?? null;
+  const statusUrl = opts.statusUrl;
   const pollMs = opts.pollMs ?? 15_000;
   const stallMs = opts.stallMs ?? 60_000;
   const graceMs = opts.postRestartGraceMs ?? 45_000;
@@ -91,11 +88,11 @@ export function startWatchdog(
   };
   // stitchd's /api/status, shaped into what the stall check needs. A stream is
   // "receiving bytes" when its encoded-frame counter advances; that is a
-  // stronger signal than mediamtx's bytesReceived, which also ticked for a
+  // stronger signal than a byte counter, which also ticked for a
   // stream nobody was watching.
   const fetchStitchd = async (): Promise<PathsList | null> => {
     try {
-      const r = await fetch(statusUrl!);
+      const r = await fetch(statusUrl);
       if (!r.ok) {
         console.warn(`[watchdog] stitchd status ${r.status}`);
         return null;
@@ -122,24 +119,8 @@ export function startWatchdog(
   };
 
   const tick = async () => {
-    let paths: PathsList;
-    if (statusUrl) {
-      const p = await fetchStitchd();
-      if (!p) return;
-      paths = p;
-    } else {
-      try {
-        const r = await fetch(`${apiBase}/v3/paths/list`);
-        if (!r.ok) {
-          console.warn(`[watchdog] paths/list ${r.status}`);
-          return;
-        }
-        paths = (await r.json()) as PathsList;
-      } catch (e) {
-        console.warn(`[watchdog] paths/list fetch failed:`, e);
-        return;
-      }
-    }
+    const paths = await fetchStitchd();
+    if (!paths) return;
 
     const byName = new Map<
       string,
@@ -221,7 +202,7 @@ export function startWatchdog(
       for (const path of w.paths) {
         const cur = byName.get(path);
         // Skip paths that have never received a byte: our output paths are
-        // statically declared in mediamtx, so they exist at 0 bytes before the
+        // declared up front, so they exist at 0 bytes before the
         // publisher connects — treating that as a stall would false-restart
         // slow-starting pipelines. Stall detection begins at first byte.
         if (!cur || cur.bytesReceived === 0) continue;

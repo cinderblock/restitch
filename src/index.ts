@@ -3,20 +3,9 @@ import { resolve } from "path";
 import YAML from "yaml";
 import { ConfigSchema, type Config } from "./config.ts";
 import { writeFileSync } from "fs";
-import {
-  buildPipeline,
-  buildExtraCompositePipeline,
-  buildCommand,
-  buildStitchdConfig,
-  ensureHwaccelWorks,
-  type ProbeResult,
-  type Pipeline,
-  type PipelineOutput,
-} from "./ffmpeg.ts";
+import { buildStitchdConfig, type ProbeResult } from "./stitchd.ts";
 import { probeAllCameras } from "./probe.ts";
-import { writeMediaMTXConfig, rawStreamName } from "./mediamtx.ts";
 import { launchManaged, type ManagedProcess } from "./process.ts";
-import { detectHwAccel, suggestEncoder } from "./hwaccel.ts";
 import { startDashboard } from "./dashboard.ts";
 import { startTranscription, type PcmSink } from "./transcribe.ts";
 import { startWatchdog, type WatchedProcess } from "./watchdog.ts";
@@ -27,9 +16,7 @@ const { values } = parseArgs({
     config: { type: "string", short: "c", default: "config.yaml" },
     "dry-run": { type: "boolean", default: false },
     "skip-probe": { type: "boolean", default: false },
-    "mediamtx-bin": { type: "string", default: "mediamtx" },
     "stitchd-bin": { type: "string", default: "stitchd" },
-    "no-mediamtx": { type: "boolean", default: false },
   },
 });
 
@@ -43,23 +30,13 @@ async function main() {
   const configPath = resolve(values.config!);
   console.log(`Loading config from ${configPath}`);
 
-  let config = await loadConfig(configPath);
+  const config = await loadConfig(configPath);
 
-  // Auto-detect hardware acceleration
-  if (config.hwaccel === "auto") {
-    const detected = await detectHwAccel(config.ffmpeg_path);
-    console.log(`[hwaccel] Detected: ${detected}`);
-    // Re-parse with the detected value applied
-    config = { ...config, hwaccel: detected } as Config;
-  }
-
-  // Fail loudly if hwaccel is requested but the box can't actually use it
-  // (driver missing, container missing NVIDIA capabilities, etc.). Catches
-  // the "silent CPU fallback" footgun before we spawn long-running pipelines.
-  await ensureHwaccelWorks(config);
-  if (config.hwaccel !== "none") {
-    console.log(`[hwaccel] ${config.hwaccel}: probe ok`);
-  }
+  // No hwaccel probe here any more. It tested ffmpeg's CUDA support for the
+  // filtergraph compositor, which is gone. stitchd builds a CUDA device and
+  // opens NVDEC/NVENC at startup and exits with an error if it can't — the
+  // GPU-or-loud-error guarantee now lives in the thing that actually uses the
+  // GPU, rather than in a proxy check against a different binary.
 
   // Probe cameras for native resolution
   let cameraProbes: Map<string, ProbeResult>;
@@ -81,104 +58,24 @@ async function main() {
     }
   }
 
-  // Which compositor? "native" = stitchd (custom CUDA compositor, one process
-  // for ALL outputs); "ffmpeg" = the classic filtergraph (main + one per extra).
-  const nativeCompositor = config.compositor === "native";
-  const cameraByName = new Map(config.cameras.map((c) => [c.name, c]));
-
-  let pipeline: Pipeline | undefined;
-  let extraPipelines: {
-    name: string;
-    extra: (typeof config.extra_composites)[number];
-    pipeline: Pipeline;
-    cmd: string[];
-  }[] = [];
-  let stitchd:
-    | { text: string; inputPaths: string[]; outputNames: string[] }
-    | undefined;
-  let allOutputs: PipelineOutput[];
-
-  if (nativeCompositor) {
-    stitchd = buildStitchdConfig(config, cameraProbes);
-    allOutputs = stitchd.outputNames.map((name) => ({ name, mapLabel: name }));
-    console.log("\n--- stitchd (native compositor) config ---");
-    console.log(stitchd.text);
-    console.log("--- Output Streams ---");
-    for (const n of stitchd.outputNames)
-      console.log(`  ${n} -> ${config.output.base_url}/${n}`);
-  } else {
-    // Main FFmpeg pipeline (composite + sub-streams) + one pipeline per extra
-    // composite (each its own process; see the launch note below). Kept as
-    // `extra` config so the launch factory can rebuild the command per spawn.
-    pipeline = buildPipeline(config, cameraProbes);
-    extraPipelines = config.extra_composites.map((extra) => {
-      const p = buildExtraCompositePipeline(config, extra, cameraProbes);
-      return { name: extra.name, extra, pipeline: p, cmd: buildCommand(config, p) };
-    });
-    console.log("\n--- Filter Complex (main) ---");
-    console.log(pipeline.filterComplex);
-    console.log("\n--- Output Streams ---");
-    allOutputs = [
-      ...pipeline.outputs,
-      ...extraPipelines.flatMap((e) => e.pipeline.outputs),
-    ];
-    for (const out of allOutputs)
-      console.log(`  ${out.name} -> ${config.output.base_url}/${out.name}`);
-    if (extraPipelines.length > 0) {
-      console.log("\n--- Extra Composites ---");
-      for (const e of extraPipelines) {
-        console.log(`[${e.name}]`);
-        console.log(e.pipeline.filterComplex);
-      }
-    }
-  }
+  const stitchd = buildStitchdConfig(config, cameraProbes);
+  console.log("\n--- stitchd config ---");
+  console.log(stitchd.text);
+  console.log("--- Output Streams ---");
+  for (const n of stitchd.outputNames)
+    console.log(`  ${n} -> ${config.output.base_url}/${n}`);
 
   if (values["dry-run"]) {
-    if (nativeCompositor) {
-      console.log("\n--- stitchd command (dry run) ---");
-      console.log(
-        `stitchd --config <runtime>/stitchd.conf --out ${config.output.base_url}`
-      );
-    } else {
-      console.log("\n--- FFmpeg Command (main, dry run) ---");
-      console.log(buildCommand(config, pipeline!).join(" \\\n  "));
-      for (const e of extraPipelines) {
-        console.log(`\n--- FFmpeg Command (${e.name}, dry run) ---`);
-        console.log(e.cmd.join(" \\\n  "));
-      }
-    }
+    console.log("\n--- stitchd command (dry run) ---");
+    console.log("stitchd --config <runtime>/stitchd.conf --out null");
     return;
   }
 
-  // Write mediamtx config and launch it.
-  // NOTE: write the generated mediamtx config to a WRITABLE runtime dir, not
-  // next to config.yaml — in the container the config dir is mounted
-  // read-only (it's owned by the jackson ops repo), so writing there fails
-  // with EROFS. RESTITCH_RUNTIME_DIR overrides; default /tmp.
+  // Generated config goes in a WRITABLE runtime dir, not next to config.yaml —
+  // in the container the config dir is mounted read-only (owned by the ops
+  // repo), so writing there fails with EROFS. RESTITCH_RUNTIME_DIR overrides.
   const processes: ManagedProcess[] = [];
   const runtimeDir = process.env.RESTITCH_RUNTIME_DIR || "/tmp";
-
-  // mediamtx is only started for the legacy ffmpeg compositor. With the native
-  // compositor stitchd serves RTSP, HLS and WebRTC itself and ingests straight
-  // from the cameras, so there is nothing left for mediamtx to do — running it
-  // would just re-introduce the localhost round-trip this replaced.
-  const useMediamtx = !values["no-mediamtx"] && !nativeCompositor;
-  if (useMediamtx) {
-    const mtxConfigPath = await writeMediaMTXConfig(
-      runtimeDir,
-      config,
-      allOutputs
-    );
-    const mtxBin = values["mediamtx-bin"]!;
-
-    const mtxProc = launchManaged("mediamtx", () => ({
-      cmd: [mtxBin, mtxConfigPath],
-    }));
-    processes.push(mtxProc);
-
-    // Give mediamtx a moment to start listening
-    await new Promise((r) => setTimeout(r, 2000));
-  }
 
   // Stderr filter to suppress noisy progress lines
   const stderrFilter = (prefix: string) => (line: string) => {
@@ -192,16 +89,6 @@ async function main() {
     console.error(`[${prefix}] ${line}`);
   };
 
-  // Main FFmpeg: composite + sub-streams.
-  //
-  // REBUILD the command on every (re)spawn rather than reusing `fullCmd`. The
-  // setpts expressions embed a wall-clock baseline (ptsBaselineMicros, captured
-  // when buildPipeline runs). If we baked the baseline once at startup and the
-  // supervisor restarted ffmpeg minutes/hours later, the first frame's PTS would
-  // be (now − stale_baseline) = a large value; combined with CFR output that
-  // makes ffmpeg duplicate-fill the entire gap before emitting a real frame, so
-  // sub-streams took 9–14 min to start publishing after a restart. Recomputing
-  // the baseline per spawn keeps PTS ~0 and the stream live immediately.
   const watched: WatchedProcess[] = [];
 
   // stitchd emits the merged N-channel PCM on its stdout. The consumer is
@@ -211,152 +98,74 @@ async function main() {
   // answer just builds a backlog.
   const pcmSink: PcmSink = { write: null };
 
-  // stitchd writes fMP4 HLS segments here and the dashboard serves them at
-  // /hls/<output>/index.m3u8 — one step toward taking HLS off mediamtx.
-  // Only the native compositor can produce them.
-  const hlsDir = nativeCompositor ? `${runtimeDir}/hls` : undefined;
+  // stitchd writes fMP4 HLS segments here; the dashboard serves them at
+  // /hls/<output>/index.m3u8.
+  const hlsDir = `${runtimeDir}/hls`;
 
-  // stitchd's own RTSP server. mediamtx still owns 8554, so this runs
-  // alongside on 8555 until clients are cut over; both serve the same
-  // encoded packets, so a client can be moved one at a time.
-  // CUTOVER: stitchd owns the client-facing ports outright. mediamtx is no
-  // longer started for the native compositor, so 8554 (RTSP), 8889 (WHEP) and
-  // 8189 (media UDP mux) are stitchd's. 8189 in particular must not move — the
-  // office WAN forward points at exactly that port.
-  const stitchdRtspPort = nativeCompositor ? 8554 : 0;
-  const stitchdWebrtcPort = nativeCompositor ? 8889 : 0;
+  // stitchd owns the client-facing ports outright: 8554 (RTSP), 8889 (WHEP +
+  // /api/status) and 8189 (media UDP mux). 8189 in particular must not move —
+  // the office WAN forward points at exactly that port.
+  const stitchdRtspPort = 8554;
+  const stitchdWebrtcPort = 8889;
   const stitchdWebrtcUdp = 8189;
 
-  if (nativeCompositor) {
-    // stitchd: ONE process produces every output. Rewrite its config file each
-    // (re)spawn (cheap; keeps behavior identical to the ffmpeg factory which
-    // rebuilds per spawn). The watchdog restarts it if any output path stalls
-    // or any input source reconnects — same contract as the ffmpeg compositor.
-    const stitchdConfPath = `${runtimeDir}/stitchd.conf`;
-    const stitchdProc = launchManaged("stitchd", () => {
-      writeFileSync(
-        stitchdConfPath,
-        buildStitchdConfig(config, cameraProbes).text
-      );
-      return {
-        cmd: [
-          values["stitchd-bin"] ?? "stitchd",
-          "--config",
-          stitchdConfPath,
-          "--out",
-          // Nothing to publish to any more: stitchd serves RTSP/HLS/WebRTC
-          // itself, so the outputs stay in-process instead of being pushed
-          // back out over localhost RTSP and read in again.
-          nativeCompositor ? "null" : config.output.base_url,
-          ...(hlsDir ? ["--hls-dir", hlsDir] : []),
-          ...(stitchdRtspPort ? ["--rtsp-port", String(stitchdRtspPort)] : []),
-          ...(stitchdWebrtcPort
-            ? [
-                "--webrtc-port", String(stitchdWebrtcPort),
-                "--webrtc-udp", String(stitchdWebrtcUdp),
-                ...config.webrtc.ice_servers.flatMap((u) => ["--ice-server", u]),
-                ...config.webrtc.additional_hosts.flatMap((h) => ["--webrtc-host", h]),
-              ]
-            : []),
-        ],
-        onStderr: stderrFilter("stitchd"),
-        // Raw interleaved s16le from stitchd's audio mixer. Only meaningful
-        // when the config declares audio-ch lines; otherwise stitchd writes
-        // nothing here and this is never called.
-        onStdout: (chunk: Uint8Array) => pcmSink.write?.(chunk),
-      };
-    });
-    processes.push(stitchdProc);
-    watched.push({
-      name: "stitchd",
-      paths: stitchd!.outputNames,
-      process: stitchdProc,
-      inputPaths: stitchd!.inputPaths,
-    });
-  } else {
-  const ffmpegProc = launchManaged("ffmpeg", () => ({
-    cmd: buildCommand(config, buildPipeline(config, cameraProbes)),
-    onStderr: stderrFilter("ffmpeg"),
-  }));
-  processes.push(ffmpegProc);
-  // Raw input paths the main compositor reads (the composite cameras). If any
-  // of these sources reconnects, the watchdog restarts the compositor before a
-  // wedged read can silently freeze that bay.
+  // ONE process produces every output. Its config file is rewritten on each
+  // (re)spawn — cheap, and it keeps a restart picking up any config change.
+  // The watchdog restarts it if an output path stalls or an input reconnects.
+  const stitchdConfPath = `${runtimeDir}/stitchd.conf`;
+  const stitchdProc = launchManaged("stitchd", () => {
+    writeFileSync(stitchdConfPath, buildStitchdConfig(config, cameraProbes).text);
+    return {
+      cmd: [
+        values["stitchd-bin"] ?? "stitchd",
+        "--config", stitchdConfPath,
+        // Nothing to publish to: stitchd serves RTSP/HLS/WebRTC itself, so the
+        // outputs stay in-process rather than being pushed back out over
+        // localhost RTSP and read in again.
+        "--out", "null",
+        "--hls-dir", hlsDir,
+        "--rtsp-port", String(stitchdRtspPort),
+        "--webrtc-port", String(stitchdWebrtcPort),
+        "--webrtc-udp", String(stitchdWebrtcUdp),
+        ...config.webrtc.ice_servers.flatMap((u) => ["--ice-server", u]),
+        ...config.webrtc.additional_hosts.flatMap((h) => ["--webrtc-host", h]),
+      ],
+      onStderr: stderrFilter("stitchd"),
+      // Raw interleaved s16le from stitchd's audio mixer. Only meaningful when
+      // the config declares audio-ch lines; otherwise stitchd writes nothing
+      // here and this is never called.
+      onStdout: (chunk: Uint8Array) => pcmSink.write?.(chunk),
+    };
+  });
+  processes.push(stitchdProc);
   watched.push({
-    name: "ffmpeg",
-    paths: pipeline!.outputs.map((o) => o.name),
-    process: ffmpegProc,
-    inputPaths: config.cameras
-      .filter((c) => c.composite !== false)
-      .map((c) => rawStreamName(c)),
+    name: "stitchd",
+    paths: stitchd.outputNames,
+    process: stitchdProc,
+    inputPaths: stitchd.inputPaths,
   });
 
-  // One FFmpeg per extra composite — independent restart, independent CPU/GPU
-  for (const e of extraPipelines) {
-    // Rebuild per spawn for a fresh setpts baseline — same reason as the main
-    // compositor above.
-    const proc = launchManaged(`ffmpeg-${e.name}`, () => ({
-      cmd: buildCommand(config, buildExtraCompositePipeline(config, e.extra, cameraProbes)),
-      onStderr: stderrFilter(`ffmpeg-${e.name}`),
-    }));
-    processes.push(proc);
-    watched.push({
-      name: `ffmpeg-${e.name}`,
-      paths: e.pipeline.outputs.map((o) => o.name),
-      process: proc,
-      // Restart this composite when one of its input sources reconnects — that
-      // reconnect is what wedges the read and freezes a half (e.g. foyer).
-      // Camera refs watch raw/<slug>; stream refs watch the produced stream's
-      // own path (so e.g. all-field restarts right after the main compositor).
-      inputPaths: e.extra.inputs.flatMap((ref) => {
-        if (ref.stream !== undefined) return [ref.stream];
-        const cam = cameraByName.get(ref.name!);
-        return cam ? [rawStreamName(cam)] : [];
-      }),
-    });
-  }
-  }
+  // Transcription stack (whisper-server). Spawns its own supervised
+  // subprocesses into `processes`. stitchd already demuxes every camera and
+  // hands us the merged audio directly, so there is no separate audio pump.
+  const transcription = startTranscription(config, processes, pcmSink);
 
-  // Transcription stack (whisper-server + audio fusion pump). Spawns its
-  // own supervised subprocesses into `processes`. Returns the ring+stats
-  // synchronously; the audio pump attaches once whisper warms up.
-  // With the native compositor, stitchd already demuxes every camera and now
-  // hands us the merged audio directly — no second ffmpeg, and none of the
-  // RTSP reader sessions mediamtx was discarding for.
-  const transcription = startTranscription(
-    config,
-    processes,
-    nativeCompositor ? pcmSink : undefined
-  );
+  // Watchdog: restart stitchd if an output stops producing, or if one of its
+  // inputs reconnects. Catches a stuck-but-alive process the supervisor
+  // cannot see.
+  const watchdog = startWatchdog(watched, {
+    statusUrl: `http://127.0.0.1:${stitchdWebrtcPort}/api/status`,
+  });
 
-  // Watchdog: restart any ffmpeg whose mediamtx output path stops receiving
-  // bytes, OR whose input source reconnects (which wedges the read and freezes
-  // a composite half). Catches stuck-but-alive ffmpegs the supervisor can't see.
-  // Point the watchdog at stitchd's own status; mediamtx's API is gone, and
-  // polling it left the watchdog dead so nothing restarted a wedged output.
-  const watchdog = startWatchdog(
-    watched,
-    nativeCompositor
-      ? { statusUrl: `http://127.0.0.1:${stitchdWebrtcPort}/api/status` }
-      : {}
-  );
-
-  // Dashboard HTTP server (proxies mediamtx API + exposes /api/system +
-  // /api/transcriptions + /api/transcription-stats from the in-process
-  // ring buffer)
+  // Dashboard HTTP server: stream state from stitchd's /api/status, plus
+  // /api/system and the transcription ring buffer.
   const dashServer = config.dashboard.enabled
     ? startDashboard(
         config.dashboard,
+        `http://127.0.0.1:${stitchdWebrtcPort}/api/status`,
         transcription,
-        {
-          ffmpegPath: config.ffmpeg_path,
-          baseUrl: config.output.base_url,
-        },
-        hlsDir,
-        // Native compositor: read stream state from stitchd, not mediamtx.
-        nativeCompositor
-          ? `http://127.0.0.1:${stitchdWebrtcPort}/api/status`
-          : undefined
+        { ffmpegPath: config.ffmpeg_path, baseUrl: config.output.base_url },
+        hlsDir
       )
     : null;
   if (dashServer) {
