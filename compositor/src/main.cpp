@@ -173,6 +173,25 @@ private:
     return 0;
   }
 
+  // Decoder used only to render a thumbnail for an audio-only input. Built on
+  // first request and kept (it is idle unless a snapshot is asked for).
+  bool open_snapshot_decoder() {
+    if (dec_snap_) return true;
+    if (!vpar_ || !device_) return false;
+    const AVCodec *dec = avcodec_find_decoder(vpar_->codec_id);
+    if (!dec) return false;
+    dec_snap_ = avcodec_alloc_context3(dec);
+    if (!dec_snap_) return false;
+    avcodec_parameters_to_context(dec_snap_, vpar_);
+    dec_snap_->hw_device_ctx = av_buffer_ref(device_);
+    dec_snap_->get_format = get_hw_format;
+    if (avcodec_open2(dec_snap_, dec, nullptr) < 0) {
+      avcodec_free_context(&dec_snap_);
+      return false;
+    }
+    return true;
+  }
+
   // Release everything open_input() acquired, leaving the object reusable.
   // vpar_/vtb_ deliberately survive (see above), as does latest_ — the
   // compositor keeps painting the last good frame while we reconnect, which is
@@ -197,6 +216,7 @@ public:
   }
   ~Decoder() {
     stop();
+    if (dec_snap_) avcodec_free_context(&dec_snap_);
     if (latest_) av_frame_free(&latest_);
     if (dec_) avcodec_free_context(&dec_);
     if (fmt_) avformat_close_input(&fmt_);
@@ -260,7 +280,26 @@ private:
         g_rtsp->broadcast(passthrough_, pkt);
         ++republished_;
       }
-      if (!dec_) { av_packet_unref(pkt); continue; } // audio-only input
+      if (!dec_) {
+        // Audio-only input: we forward its video packets to raw/<name> but
+        // never decode them, so there is no frame for a thumbnail. Decode
+        // exactly one, on request, starting at a keyframe — the packets are
+        // already in hand, so this costs one frame per snapshot and no second
+        // connection. Without it `blue` and `bullet` are the only two streams
+        // in the UI with no thumbnail.
+        if (snapshot_wanted_.load() && (pkt->flags & AV_PKT_FLAG_KEY) &&
+            open_snapshot_decoder()) {
+          if (avcodec_send_packet(dec_snap_, pkt) >= 0) {
+            while (avcodec_receive_frame(dec_snap_, frame) >= 0) {
+              if (frame->format == AV_PIX_FMT_CUDA) publish(frame);
+              av_frame_unref(frame);
+            }
+          }
+          snapshot_wanted_.store(false);
+        }
+        av_packet_unref(pkt);
+        continue;
+      }
       err = avcodec_send_packet(dec_, pkt);
       av_packet_unref(pkt);
       if (err < 0) continue;
@@ -298,6 +337,8 @@ public:
   // -1. Flag them, or anything watching for a stale input reads them as frozen
   // forever — a false positive that would make the whole signal useless.
   bool has_video() const { return need_video_; }
+  /** Ask an audio-only input to decode one frame so a thumbnail can be made. */
+  void request_snapshot_frame() { snapshot_wanted_.store(true); }
   // Republished verbatim at raw/<name>? Those streams are real RTSP endpoints
   // and belong in the UI's stream list alongside the composites.
   bool republished() const { return !passthrough_.empty(); }
@@ -345,6 +386,8 @@ private:
   std::atomic<long long> reconnects_{0};
   std::atomic<long long> last_frame_ms_{0};
   std::atomic<long long> republished_{0};
+  AVCodecContext *dec_snap_ = nullptr;   // lazy, audio-only inputs only
+  std::atomic<bool> snapshot_wanted_{false};
 
 public:
   // Republish this input's video packets under `name` on the RTSP server.
@@ -1109,7 +1152,14 @@ int run(const Config &cfg, const char *dest, long long max_frames,
             if (w->name == want) { got = w->latest(f); break; }
           if (!got)
             for (auto *d : all_inputs)
-              if (d->log_name() == want) { got = d->latest(f); break; }
+              if (d->log_name() == want) {
+                got = d->latest(f);
+                // Audio-only inputs decode nothing until asked. The first
+                // request arms it; the frame lands on the next keyframe, so
+                // the caller's retry (or the next prewarm) gets an image.
+                if (!got && !d->has_video()) d->request_snapshot_frame();
+                break;
+              }
           std::vector<uint8_t> jpeg;
           if (got) jpeg = encode_snapshot_jpeg(f, 320);
           av_frame_free(&f);
