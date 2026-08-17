@@ -1,0 +1,53 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>restitch</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: contain; display: block; }
+  #msg {
+    position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
+    text-align: center; pointer-events: none; color: #999;
+    font: 13px system-ui, sans-serif;
+  }
+</style>
+<video id="v" autoplay muted playsinline controls></video>
+<div id="msg">loading…</div>
+<script>
+const v = document.getElementById('v');
+const msg = document.getElementById('msg');
+const base = location.pathname.replace(/\/+$/, '');
+const src = base + '/index.m3u8';
+const say = t => { msg.textContent = t || ''; };
+
+// Safari (and iOS in general) plays HLS natively and does it better than
+// hls.js can through MSE, so prefer it and only pull the 500 KB library down
+// for the browsers that actually need it.
+if (v.canPlayType('application/vnd.apple.mpegurl')) {
+  v.src = src;
+  v.addEventListener('loadeddata', () => say(''));
+  v.addEventListener('error', () => say('stream unavailable — retrying'));
+  setInterval(() => { if (v.error || v.readyState === 0) v.src = src; }, 5000);
+} else {
+  const s = document.createElement('script');
+  s.src = base + '/hls.js';
+  s.onerror = () => say('could not load player');
+  s.onload = () => {
+    if (!window.Hls || !Hls.isSupported()) return say('HLS not supported here');
+    const hls = new Hls({ lowLatencyMode: true, backBufferLength: 10 });
+    hls.on(Hls.Events.MANIFEST_PARSED, () => say(''));
+    // A scoreboard runs unattended for hours: recover from network and media
+    // errors in place instead of leaving a dead black frame on screen.
+    hls.on(Hls.Events.ERROR, (_e, data) => {
+      if (!data.fatal) return;
+      say(data.details || 'error');
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+      else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+      else { hls.destroy(); setTimeout(() => location.reload(), 5000); }
+    });
+    hls.loadSource(src);
+    hls.attachMedia(v);
+  };
+  document.head.appendChild(s);
+}
+</script>
