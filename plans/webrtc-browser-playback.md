@@ -179,3 +179,40 @@ layout must not depend on how busy a scene was at startup.
 
 Verified before deploying: a full dry run against the live `config.yaml`, now
 probing through stitchd, produced a **byte-identical 45-line stitchd.conf**.
+
+## Where the web UI lives (2026-08-16c)
+
+Four pieces, none of them previously a file on disk:
+
+| Surface | Source | Served by |
+| --- | --- | --- |
+| Dashboard | `src/web/dashboard.html` (808 lines) | bun, `:9000/` |
+| HLS player | `src/web/player.html` (53 lines) | bun, `/hls/<name>/` and `/all-field` via Caddy |
+| WHEP player | `compositor/src/player.h` (`kPlayerHtml`) | **stitchd**, `:8889/whep/<name>` |
+| hls.js | `node_modules/hls.js/dist/hls.min.js`, 543 KB | bun, `<base>/hls.js` |
+
+The first two were template literals inside `dashboard.ts` — 861 lines of
+markup, CSS and browser JS with no highlighting, no formatting and nothing to
+catch a typo short of loading the page (`bun run check` validated the
+TypeScript around them and never looked inside). Now real files;
+`dashboard.ts` drops **1296 → 443** lines of actual server code.
+
+**Extraction gotcha worth keeping:** copy the template's *source text* and you
+ship its escapes. The player contains
+`location.pathname.replace(/\/+$/, '')`, which is written `\/` inside a
+template literal — a raw copy silently shipped the extra backslash and broke
+the regex. `scripts/extract-web-assets.ts` evaluates the literal in JS instead,
+so escape processing happens exactly as the browser saw it.
+
+**Measuring gotcha:** comparing the served page by piping curl through ssh into
+a file on Windows silently dropped 45 bytes from *both* sides, which read as a
+convincing "IDENTICAL". Compare on the Linux box (`cmp` served vs the deployed
+file) — that showed 36495 == 36495, and the regex survived intact.
+
+`player.h` stays embedded in stitchd deliberately: that binary deploys as a
+single static file, and a sibling asset it could fail to find is the worse
+trade there.
+
+Verified after deploy: dashboard renders 16 rows (6 outputs + 10 raw), live
+data populating, **zero JS errors**, and the HLS player page still returns 200
+with its `<video>` and an intact regex.
