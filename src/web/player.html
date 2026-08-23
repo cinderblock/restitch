@@ -54,6 +54,26 @@ if (!('MediaSource' in window) && !('ManagedMediaSource' in window)) {
     });
     hls.loadSource(src);
     hls.attachMedia(v);
+    // Stall watchdog. The error handlers above only fire when hls.js NOTICES
+    // something; the failure that actually bites here is the silent one — the
+    // server goes away (a deploy, a docker restart, the 02:00 kernel reboot)
+    // and the picture simply stops on a frame with no error at all. That is
+    // exactly how VLC dies, and a wall display should not need a human.
+    //
+    // Watch currentTime rather than any event: if it has not advanced while we
+    // are meant to be playing, the picture on screen is a lie regardless of the
+    // reason. Nudge the loader first, then reload the page if that fails.
+    let lastT = 0, stalledFor = 0;
+    setInterval(() => {
+      if (v.paused || v.seeking) return;
+      if (v.currentTime > lastT) { lastT = v.currentTime; stalledFor = 0; say(''); return; }
+      stalledFor += 5;
+      if (stalledFor < 15) return;
+      say('stream stalled — reconnecting');
+      if (stalledFor < 45) { hls.startLoad(); v.play().catch(() => {}); }
+      else location.reload();
+    }, 5000);
+
     // Muted autoplay is allowed, but a hidden or backgrounded tab still defers
     // playback — ask explicitly and let an autoplay-blocked page start on the
     // first user gesture rather than sitting on a black rectangle.
