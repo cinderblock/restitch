@@ -216,3 +216,58 @@ trade there.
 Verified after deploy: dashboard renders 16 rows (6 outputs + 10 raw), live
 data populating, **zero JS errors**, and the HLS player page still returns 200
 with its `<video>` and an intact regex.
+
+## 2026-08-23: "VLC hung on a frame overnight" — and the HLS player was dead too
+
+**What actually happened:** nothing to do with the streams. The host **rebooted
+at 02:00** — uptime 9:09, docker daemon start 02:00:48, container 02:00:43 —
+after unattended-upgrades installed `linux-generic` and
+`linux-modules-nvidia-595-generic` on Aug 22. VLC was connected, the machine
+went away, VLC froze on its last frame. My last deploy was Aug 17, so this was
+not a deploy.
+
+Restarts here are routine: **five docker daemon restarts in ten days** (Aug 20,
+22 ×3, 23). So "the viewer cannot survive a restart" is the real problem, not
+the restart itself. VLC has no reliable RTSP reconnect — it treats a mid-stream
+disconnect as fatal, which is why hitting *next* fixes it.
+
+**The thing that should have survived it was broken.** Chrome answers
+`canPlayType('application/vnd.apple.mpegurl')` with **`"maybe"`** and then
+cannot play a playlist from `<video src>`: it parks at `readyState 0 /
+networkState 2` and never fires an error. The player tested that first, so on
+every desktop browser it took the native branch, never fetched hls.js at all
+(confirmed live: zero `<script src>` in the DOM, `Hls` undefined) and sat on
+"loading…" forever — while the m3u8, `init.mp4` and segments all returned 200.
+It presumably worked for the user on iOS, where native HLS is real.
+
+Fixes:
+
+1. **Branch on MSE, not `canPlayType`** (`9a0c896`). Safari/iOS is the genuine
+   native case and is exactly the browser *without* MSE; everywhere else hls.js
+   does the work and brings its error recovery.
+2. **Stall watchdog** (`73525c0`). The failure that actually happens is silent:
+   the server goes away and the picture stops with no error event, so hls.js's
+   handlers never fire. Watch `currentTime` instead — if it has not advanced
+   while we are meant to be playing, what is on screen is a lie whatever the
+   cause. `startLoad()` after 15 s, page reload after 45 s.
+
+**Verified:** the HLS output itself is fine — ffmpeg decoded 30 frames straight
+from `index.m3u8` with no errors, which separates "server produces bad HLS"
+from "browser will not play it". Both fixes are deployed and present in the
+served page.
+
+**Not verified, and worth knowing:** playback could not be confirmed from the
+automation browser. In that extension-driven tab **MediaSource never opens** —
+`sourceopen` never fires and `readyState` stays `"closed"` — even with
+`Hls.isSupported()` true and every codec string (`avc1.4d4032` etc.) reporting
+supported, and even with the tab clicked into the foreground. That is a
+property of that tab, not of the page, but it means the last step needs a
+normal browser window.
+
+### Things not to do
+
+- Don't feature-detect HLS with `canPlayType('application/vnd.apple.mpegurl')`.
+  Chrome says "maybe" and means "no".
+- Don't conclude a player works because the manifest and segments return 200,
+  or because ffmpeg can decode them. Neither exercises MSE.
+- Don't trust media playback state measured in the automation tab.
