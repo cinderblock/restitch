@@ -20,10 +20,17 @@ const base = location.pathname.replace(/\/+$/, '');
 const src = base + '/index.m3u8';
 const say = t => { msg.textContent = t || ''; };
 
-// Safari (and iOS in general) plays HLS natively and does it better than
-// hls.js can through MSE, so prefer it and only pull the 500 KB library down
-// for the browsers that actually need it.
-if (v.canPlayType('application/vnd.apple.mpegurl')) {
+// Pick on Media Source Extensions, NOT on canPlayType.
+//
+// Chrome answers canPlayType('application/vnd.apple.mpegurl') with "maybe" and
+// then cannot play a playlist from <video src> at all: it parks at readyState 0
+// / networkState 2 and never fires an error, so nothing below recovers and
+// hls.js is never even fetched. This page sat on "loading…" forever on every
+// desktop browser, which was only survivable because the streams were normally
+// watched in VLC. Safari/iOS is the real native case and has no MSE, so that is
+// the thing worth testing for; everywhere else hls.js does the work and gives
+// us the error recovery an unattended display needs.
+if (!('MediaSource' in window) && !('ManagedMediaSource' in window)) {
   v.src = src;
   v.addEventListener('loadeddata', () => say(''));
   v.addEventListener('error', () => say('stream unavailable — retrying'));
@@ -47,6 +54,10 @@ if (v.canPlayType('application/vnd.apple.mpegurl')) {
     });
     hls.loadSource(src);
     hls.attachMedia(v);
+    // Muted autoplay is allowed, but a hidden or backgrounded tab still defers
+    // playback — ask explicitly and let an autoplay-blocked page start on the
+    // first user gesture rather than sitting on a black rectangle.
+    hls.on(Hls.Events.MANIFEST_PARSED, () => v.play().catch(() => {}));
   };
   document.head.appendChild(s);
 }
