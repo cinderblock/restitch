@@ -349,6 +349,53 @@ export function startDashboard(
         });
       }
 
+      // A VLC playlist that reconnects by itself: /vlc/<name>.m3u
+      //
+      // Every restart of this server drops each RTSP client, and VLC treats a
+      // mid-stream disconnect as fatal — it stops on the last frame and waits
+      // for a human to hit Next. That is not rare here: deploys, docker daemon
+      // restarts and the 02:00 kernel/NVIDIA reboot all do it, five-plus times
+      // in ten days.
+      //
+      // `input-repeat` is VLC's own answer — it reopens the input when it ends,
+      // and a dropped connection counts as an end. Delivered through the
+      // playlist so nothing has to be configured on the viewing machine: open
+      // this once and it keeps itself alive.
+      //
+      // The caching/clock options are here too because they are the other half
+      // of "lagging reality": VLC's defaults buffer ~1.5 s and its jitter
+      // compensation lets a live stream drift.
+      if (url.pathname.startsWith("/vlc/") && url.pathname.endsWith(".m3u")) {
+        const name = decodeURIComponent(
+          url.pathname.slice("/vlc/".length, -".m3u".length)
+        );
+        if (!/^[\w-]+(\/[\w-]+)*$/.test(name)) {
+          return new Response("bad stream name", { status: 400 });
+        }
+        // Same host the browser reached us on, so this works from anywhere on
+        // the LAN without baking in an address.
+        const rtsp = `rtsp://${url.hostname}:8554/${name}`;
+        const body = [
+          "#EXTM3U",
+          `#EXTINF:-1,${name}`,
+          "#EXTVLCOPT:rtsp-tcp",
+          // Reopen on disconnect, effectively forever.
+          "#EXTVLCOPT:input-repeat=65535",
+          // Keep the buffer short and stop VLC drifting on a live source.
+          "#EXTVLCOPT:network-caching=300",
+          "#EXTVLCOPT:live-caching=300",
+          "#EXTVLCOPT:clock-jitter=0",
+          rtsp,
+          "",
+        ].join("\n");
+        return new Response(body, {
+          headers: {
+            "content-type": "audio/x-mpegurl",
+            "content-disposition": `attachment; filename="${name.replace(/\//g, "-")}.m3u"`,
+          },
+        });
+      }
+
       // Snapshot: /api/snapshot/<path> (path may contain a slash)
       if (url.pathname.startsWith("/api/snapshot/")) {
 

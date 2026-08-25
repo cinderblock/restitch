@@ -181,6 +181,8 @@ const streamUrls = name => ({
   rtsp: 'rtsp://' + HOST + ':8554/' + name,
   webrtc: 'http://' + HOST + ':8889/whep/' + name,
   hls: location.origin + '/hls/' + name + '/',
+  // Playlist rather than the bare rtsp:// URL — see createPathRow.
+  vlc: location.origin + '/vlc/' + name + '.m3u',
 });
 
 // navigator.clipboard requires a secure context (HTTPS or localhost). The
@@ -221,12 +223,22 @@ function createPathRow(p) {
 
   const nameTd = document.createElement('td');
   // Raw republishes are RTSP-only, so they get the rtsp link and nothing else.
+  // 'vlc' is a generated .m3u, not the plain rtsp:// URL. It carries
+  // input-repeat so VLC reopens the stream by itself when this server restarts
+  // — otherwise VLC stops on the last frame and waits for a human.
+  const vlcLink = '<a href="' + urls.vlc + '">vlc</a>';
   const links = p.kind === 'raw'
-    ? '<span class="kind-tag">raw · rtsp only</span>'
+    ? '<span class="name-links">'
+      +   '<span class="kind-tag">raw · rtsp</span>'
+      +   '<span class="sep">·</span>'
+      +   vlcLink
+      + '</span>'
     : '<span class="name-links">'
       +   '<a href="' + urls.webrtc + '" target="_blank" rel="noopener">webrtc</a>'
       +   '<span class="sep">·</span>'
       +   '<a href="' + urls.hls + '" target="_blank" rel="noopener">hls</a>'
+      +   '<span class="sep">·</span>'
+      +   vlcLink
       + '</span>';
   nameTd.innerHTML =
     '<div class="name-cell">'
