@@ -235,7 +235,26 @@ void Server::accept_loop() {
 static int session_write(void *opaque, const uint8_t *buf, int size) {
   auto *s = static_cast<Server::Session *>(opaque);
   if (s->dead) return size; // swallow; the connection thread will clean up
-  uint8_t hdr[4] = {0x24, (uint8_t)s->rtp_channel, (uint8_t)(size >> 8),
+
+  // RTCP goes on the ODD channel, not the RTP one.
+  //
+  // libavformat's rtp muxer emits a Sender Report every ~5 s onto the same AVIO
+  // as the media, and we were framing all of it as channel 0. A Sender Report
+  // is what tells a receiver how the RTP clock maps to the sender's NTP wall
+  // clock; delivered on the RTP channel it is just an unknown payload type and
+  // the client throws it away. VLC then has no absolute reference at all, so it
+  // free-runs on its own jitter buffer and ANY latency it picks up — a hiccup, a
+  // slow decode, a busy moment — is permanent. That is "lagging reality and
+  // never catching up", which is what was reported repeatedly while the server
+  // side measured clean (queue 0, Send-Q 0, output 29.9987 fps).
+  //
+  // Same test ffmpeg's own RTSP muxer uses: RTCP payload types are 200-204.
+  // Our RTP payload type is 96, which is 96 or 224 with the marker bit — no
+  // overlap with that range.
+  const bool is_rtcp = size >= 2 && buf[1] >= 200 && buf[1] <= 204;
+  const uint8_t channel =
+      is_rtcp ? (uint8_t)(s->rtp_channel + 1) : (uint8_t)s->rtp_channel;
+  uint8_t hdr[4] = {0x24, channel, (uint8_t)(size >> 8),
                     (uint8_t)(size & 0xff)};
   if (!write_all(s->fd, hdr, 4) || !write_all(s->fd, buf, (size_t)size)) {
     // Shut the socket down so the connection thread's blocking recv() returns
