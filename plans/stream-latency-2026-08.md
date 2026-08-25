@@ -381,3 +381,52 @@ log at INFO.
 - Don't conclude anything about latency from `alive:` frame counts alone; the
   compositor can be perfectly on-time while a client falls arbitrarily behind.
 - Don't touch Caddy / the 8890 route without per-change authorization.
+
+## 2026-08-25: the actual cause of the drift — RTCP was on the wrong channel
+
+"Video in VLC is lagging reality again." Measured while it was happening, which
+is what finally separated the layers:
+
+| measurement | value | reading |
+| --- | --- | --- |
+| VLC's session `queued` | **0** | our userspace queue held nothing |
+| VLC's socket Send-Q | **1460 B** | one MTU; the kernel held nothing either |
+| output frame rate | **29.9987 fps** | vs nominal 30 → −0.2 s/hour, and in the starving direction |
+| fresh client vs camera OSD | **within ~1-2 s** | the server was delivering live |
+
+So the server had *nothing* buffered and was producing at the right rate, while
+the viewer was minutes behind. Everything left pointed at the client's clock —
+and that turned out to be our fault after all.
+
+**libavformat's rtp muxer emits an RTCP Sender Report every ~5 s onto the same
+AVIO as the media, and `session_write` framed all of it as interleaved channel
+0.** Captured from production: channel 0 carried 17800 packets of PT 96 *and 5
+of PT 200*, while channel 1 — the RTCP channel we advertise in
+`interleaved=0-1` — carried nothing.
+
+A Sender Report is the only thing that tells a receiver how the RTP clock maps
+to the sender's NTP wall clock. Delivered on the RTP channel it is an unknown
+payload type and the client throws it away. VLC then has no absolute reference
+at all: it free-runs on its own jitter buffer, and any latency it picks up — a
+hiccup, a slow decode, a busy moment — is **permanent**, because nothing ever
+tells it that it is behind. Hence drift that only a reconnect clears, which is
+exactly the reported behaviour from the very first message in this work.
+
+Fix (`7900bca`): route by payload type, the same test ffmpeg's own RTSP muxer
+uses — 200-204 is RTCP, so it goes on `rtp_channel + 1`. Our RTP payload type
+is 96 (224 with the marker bit), so there is no overlap.
+
+Verified on the side instance and then in production: channel 1 now carries an
+SR every ~5 s, channel 0 is pure RTP, ffmpeg still decodes clean.
+`plans/tmp-rtcp-check.py` is the probe — it counts interleaved frames by
+channel and by payload type.
+
+**Watch out when checking this yourself:** mask the payload type with `& 0x7f`
+and an SR (200 = 0xC8) reads as 72 and looks like an ordinary RTP type. The
+first run of the probe reported "no RTCP anywhere" for that reason; the byte
+has to be read unmasked.
+
+**Still not proven:** whether this cures the user's VLC over a full day. The
+server-side protocol defect is real and fixed, but VLC's willingness to *act*
+on an SR and pull itself back to live is its own behaviour. That needs a day of
+watching, not another measurement here.
