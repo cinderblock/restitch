@@ -430,3 +430,42 @@ has to be read unmasked.
 server-side protocol defect is real and fixed, but VLC's willingness to *act*
 on an SR and pull itself back to live is its own behaviour. That needs a day of
 watching, not another measurement here.
+
+## Deploys kill VLC — and now VLC comes back on its own
+
+Yes: every restart of this server drops every RTSP client, and every deploy in
+this work did exactly that to the user's stream. Measured on the last one: the
+deploy job ran 26 s, the container came up at 17:03:54 and stitchd then had to
+re-open ten cameras before serving — call it **20-30 s of no RTSP**.
+
+There is no way to hand a live RTP session between processes. stitchd holds
+per-client packetizer state (sequence numbers, timestamps, fragmentation), so a
+restart necessarily ends the session. What can change is (a) how often it
+happens and (b) whether the viewer notices.
+
+**(b) is solved: `GET /vlc/<name>.m3u`** (`bd180d1`) returns a playlist carrying
+VLC's own `input-repeat=65535`, which reopens the input when it ends — and a
+dropped connection counts as an end. It is delivered through the playlist so
+nothing has to be configured on the viewing machine; open it once and it keeps
+itself alive. Linked as **vlc** on all 16 rows, including the raw ones, which
+are RTSP-only and so are exactly where a bare `rtsp://` URL was the only option.
+
+The same playlist carries the other half of the drift story: `network-caching`
+and `live-caching` at 300 ms instead of VLC's ~1.5 s defaults, and
+`clock-jitter=0` so VLC stops letting a live stream slide. Those pair with the
+RTCP fix (`7900bca`): the sender reports give VLC a wall-clock reference, and
+these stop it padding the buffer.
+
+Verified in production: correct playlist for a composite and for a raw stream
+(the `/` in `raw/bay-1` survives), a bad name is rejected, and all 16 rows carry
+the link.
+
+**(a) is not addressed.** The deploy rebuilds one image and recreates one
+container, so a dashboard-only or HTML-only change still bounces the video. The
+obvious improvement is to split the supervisor/dashboard from stitchd so UI work
+never touches the streams — a real change to the container layout, not something
+to slip in.
+
+**Untested by me:** VLC's actual behaviour on `input-repeat` across a restart.
+The endpoint and its contents are verified; whether VLC reconnects the way its
+documentation says needs one real outage to confirm — the next deploy will do it.
