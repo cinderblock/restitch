@@ -25,8 +25,8 @@ services:
       # compute = CUDA (whisper), video = NVENC + NVDEC (ffmpeg)
       NVIDIA_DRIVER_CAPABILITIES: compute,video
     volumes:
-      # Config is owned by the jackson ops repo; this deploy never writes it.
-      # Mount the DIRECTORY (not the file) read-only: jackson delivers the
+      # Config is owned by the ops repo; this deploy never writes it.
+      # Mount the DIRECTORY (not the file) read-only: the ops repo delivers the
       # config by replacing /opt/restitch/config.yaml (new inode), and a
       # single-file bind mount would keep showing the old inode after a
       # `docker restart` — the container would silently run stale config.
