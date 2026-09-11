@@ -174,8 +174,8 @@ COPY src ./src
 ENV WHISPER_MODELS_DIR=/var/lib/whisper-models
 VOLUME /var/lib/whisper-models
 
-# Config is mounted by the host (jackson owns it; see servers/sentinel
-# in the jackson repo). Read-only inside the container.
+# Config is mounted by the host (the ops repo owns it; see servers/sentinel
+# in the ops repo). Read-only inside the container.
 VOLUME /etc/restitch
 
 # NVIDIA Container Toolkit reads these to mount the right driver libs:

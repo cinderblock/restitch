@@ -2,12 +2,12 @@
 # Deploy restitch to sentinel. Single self-hosted-runner workflow step
 # checks out the repo and runs this script.
 #
-# Assumptions (provided by jackson's ops deploy):
+# Assumptions (provided by the ops deploy):
 #   - Docker is installed
 #   - NVIDIA driver is loaded (nvidia-smi works)
 #   - nvidia-container-toolkit is installed and `nvidia` runtime is
 #     registered with Docker
-#   - /opt/restitch/config.yaml exists (delivered by jackson)
+#   - /opt/restitch/config.yaml exists (delivered by the ops deploy)
 #
 # What this does:
 #   1. Build restitch image locally from the checkout (no registry).
@@ -20,12 +20,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 echo "=== Validating host ==="
-command -v docker  >/dev/null || { echo "Error: docker not installed. Push jackson first to bootstrap sentinel." >&2; exit 1; }
+command -v docker  >/dev/null || { echo "Error: docker not installed. Deploy ops first to bootstrap sentinel." >&2; exit 1; }
 docker info >/dev/null 2>&1 || { echo "Error: docker socket not accessible to $(id -un)." >&2; exit 1; }
 docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q nvidia \
-    || { echo "Error: nvidia Docker runtime not registered. Push jackson first." >&2; exit 1; }
+    || { echo "Error: nvidia Docker runtime not registered. Deploy ops first." >&2; exit 1; }
 [ -f /opt/restitch/config.yaml ] \
-    || { echo "Error: /opt/restitch/config.yaml is missing. Push jackson first." >&2; exit 1; }
+    || { echo "Error: /opt/restitch/config.yaml is missing. Deploy ops first." >&2; exit 1; }
 
 echo "=== Building restitch image ==="
 cd "${REPO_ROOT}"

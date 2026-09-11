@@ -32,7 +32,7 @@ A single bun process supervises the whole stack:
 
 ## Deployment
 
-This project deploys via the **IaC + self-hosted-runner** pattern shared with the [jackson ops repo](https://github.com/cinderblock/ops). On push to `master`:
+This project deploys via the **IaC + self-hosted-runner** pattern shared with the [ops repo](https://github.com/cinderblock/ops). On push to `master`:
 
 1. A GitHub-hosted job builds the `restitch` container image and pushes it to GHCR.
 2. A self-hosted runner on the target box (`sentinel`) pulls the new image and runs `docker compose up -d`.
@@ -40,7 +40,7 @@ This project deploys via the **IaC + self-hosted-runner** pattern shared with th
 
 See [`servers/sentinel/README.md`](servers/sentinel/README.md) for the full deploy flow, runner registration, and box prerequisites.
 
-**Config (`/opt/restitch/config.yaml`) is owned by jackson**, not this repo. Push the YAML in `jackson/servers/sentinel/restitch/`; jackson's deploy writes it to the host and restarts the restitch container.
+**Config (`/opt/restitch/config.yaml`) is owned by the ops repo**, not this repo. Push the YAML in the ops repo's `servers/sentinel/restitch/`; the ops deploy writes it to the host and restarts the restitch container.
 
 ## Local development
 
