@@ -25,22 +25,46 @@ A single bun process supervises the whole stack:
 |---|---|
 | mediamtx | RTSP/WebRTC/HLS server + control API |
 | ffmpeg (main) | composite + sub-stream crops |
-| ffmpeg (extra) | one per `extra_composites` entry (camera or `stream:` inputs) |
+| ffmpeg (extra) | one per `extra_composites` entry |
 | whisper-server | CUDA speech-to-text |
-| ffmpeg (audio fusion) | N-channel amerge → max-abs mono for transcription. N = cameras with `transcribe: true` (the default); set `transcribe: false` per camera to keep its audio out of the pump |
+| ffmpeg (audio fusion) | N-channel amerge → max-abs mono for transcription |
 | dashboard | live status + per-stream actions |
 
 ## Deployment
 
-This project deploys via the **IaC + self-hosted-runner** pattern shared with the [jackson ops repo](https://github.com/cinderblock/ops). On push to `master`:
+Runs as a container on **sentinel** (RTX 4090), sharing the host's GPU through
+the NVIDIA Container Toolkit. Everything about *how* and *which build* is owned
+by the [ops repo](https://github.com/cinderblock/ops); this repo only produces
+the image.
 
-1. A GitHub-hosted job builds the `restitch` container image and pushes it to GHCR.
-2. A self-hosted runner on the target box (`sentinel`) pulls the new image and runs `docker compose up -d`.
-3. `deploy.sh` bootstraps Docker + the NVIDIA Container Toolkit on a clean box — only the NVIDIA driver itself is a one-time manual install.
+**Pushing to `master` does not deploy.** `.github/workflows/build.yml` builds
+`containers/restitch/Dockerfile` on a GitHub-hosted runner and publishes
+`ghcr.io/cinderblock/restitch:<sha>` — and stops. Which build sentinel runs is
+pinned in ops at `servers/sentinel/stacks/restitch/pin.json`; only an ops push
+changes it, and rollback is reverting that pin. The build is slow (whisper.cpp
+with cuBLAS and ffmpeg both compile from source against CUDA), so the workflow
+reclaims runner disk first and uses a registry build cache.
 
-See [`servers/sentinel/README.md`](servers/sentinel/README.md) for the full deploy flow, runner registration, and box prerequisites.
+**Config is owned by ops too.** `config.yaml` (cameras, composite layout,
+crops, transcription tuning) lives at `servers/sentinel/stacks/restitch/` in
+ops and is bind-mounted read-only at `/etc/restitch/config.yaml`. Editing it
+there and pushing ops recreates the container with the new config.
 
-**Config (`/opt/restitch/config.yaml`) is owned by jackson**, not this repo. Push the YAML in `jackson/servers/sentinel/restitch/`; jackson's deploy writes it to the host and restarts the restitch container.
+It used to work the other way: a self-hosted runner on sentinel built the
+image locally on every push and brought it up itself. That runner is gone.
+
+### Stream URLs
+
+After deploy, the box exposes (via `network_mode: host`):
+
+- RTSP `rtsp://sentinel:8554/<path>`
+- WebRTC `http://sentinel:8889/<path>/` (browser-playable, low latency)
+- HLS `http://sentinel:8890/<path>/`
+- mediamtx API `http://sentinel:9997/v3/paths/list`
+- Dashboard `http://sentinel:9000/`
+
+Paths come from `config.yaml`: `raw/<camera-slug>`, `full`, `full-low`,
+`the-field`, `john`, `entry`, plus any `extra_composites`.
 
 ## Local development
 

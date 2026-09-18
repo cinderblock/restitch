@@ -1,0 +1,115 @@
+name: Build image
+
+# Push to master → build the CUDA image and push it to GHCR. That is the whole
+# job: this repo publishes a *candidate*, it does not deploy.
+#
+# What runs on sentinel is decided in the ops repo (cinderblock/ops) by
+# servers/sentinel/stacks/restitch/pin.json, which names an image digest.
+# Shipping a build is two steps: push here, then edit that pin and push ops.
+#
+# This repo used to run `bash servers/sentinel/deploy.sh` on a self-hosted
+# runner as `cameron` — who is in the docker group, so root-equivalent — on a
+# box shared with another tenant. See ops plans/ops-owned-app-deploys.md.
+#
+# The trade this makes: sentinel's 24 cores and its local layer cache are gone,
+# so a cold build here is slow (whisper.cpp with cuBLAS and ffmpeg both compile
+# from source against CUDA). The repo is public, so hosted minutes are free —
+# the cost is wall-clock, not money. Registry cache below keeps the incremental
+# case sane.
+on:
+  push:
+    branches: [master]
+    paths:
+      - src/**
+      - compositor/**
+      - containers/restitch/**
+      - package.json
+      - bun.lock
+      - tsconfig.json
+      - .github/workflows/build.yml
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }} # cinderblock/restitch
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Reclaim runner disk
+        # nvidia/cuda:*-devel is ~7 GB and this build pulls it twice (two
+        # builder stages) plus the runtime base. A stock ubuntu-latest runner
+        # has ~14 GB free, which is not enough and fails late, after an hour of
+        # compiling. Dropping the preinstalled toolchains we don't use buys
+        # ~25 GB. Done inline rather than via a third-party action on purpose —
+        # the point of this whole migration is to stop running other people's
+        # code where it can hurt.
+        run: |
+          set -euo pipefail
+          echo "before:"; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          echo "after:"; df -h /
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: containers/restitch/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}:latest
+          # ops verifies this label against the commit its pin claims, so a
+          # hand-edited pin.json can't quietly ship a different build than the
+          # one that was reviewed. Required — the deploy fails without it.
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          # Registry cache, not `type=gha`: the GHA cache is capped at 10 GB per
+          # repo and these layers blow straight through it, so it would thrash
+          # and rebuild whisper/ffmpeg every run.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}:buildcache,mode=max
+
+      - name: Summarize how to deploy this build
+        run: |
+          {
+            echo "### Image published"
+            echo
+            echo '```json'
+            echo '{'
+            echo '  "image": "${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}",'
+            echo '  "digest": "${{ steps.push.outputs.digest }}",'
+            echo '  "source": {'
+            echo '    "repo": "${{ github.repository }}",'
+            echo '    "commit": "${{ github.sha }}"'
+            echo '  }'
+            echo '}'
+            echo '```'
+            echo
+            echo "Paste that into \`servers/sentinel/stacks/restitch/pin.json\`"
+            echo "in cinderblock/ops and push. Nothing reaches sentinel until you do."
+          } >> "$GITHUB_STEP_SUMMARY"
