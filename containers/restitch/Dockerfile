@@ -33,16 +33,23 @@ RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/libcuda.
     ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/libcuda.so.1
 # Repo moved from ggerganov to ggml-org. Note the binary names changed
 # from `server`/`main` to `whisper-server`/`whisper-cli` in 1.8.x.
+# One CUDA architecture and a bounded job count. Both matter on a 2-core, 7 GB
+# GitHub-hosted runner: ggml has dozens of .cu files, and a bare `-j` means
+# UNLIMITED parallel jobs to make, so nvcc x architectures x files starved the
+# runner agent until GitHub declared it lost (2026-09-18, after 52 minutes).
+# sm_89 is Ada, the RTX 4090 in sentinel; override CUDA_ARCH for another GPU.
+ARG CUDA_ARCH=89
 RUN git clone --depth 1 --branch "${WHISPER_REF}" \
         https://github.com/ggml-org/whisper.cpp.git /opt/whisper.cpp && \
     cd /opt/whisper.cpp && \
     cmake -B build \
         -DBUILD_SHARED_LIBS=OFF \
         -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
         -DWHISPER_BUILD_TESTS=OFF \
         -DWHISPER_BUILD_EXAMPLES=ON \
         -DWHISPER_BUILD_SERVER=ON && \
-    cmake --build build -j --config Release --target whisper-server whisper-cli
+    cmake --build build -j"$(nproc)" --config Release --target whisper-server whisper-cli
 
 
 # --- builder: FFmpeg with CUDA filters + NPP (GPU transpose/scale) ---
@@ -50,8 +57,11 @@ RUN git clone --depth 1 --branch "${WHISPER_REF}" \
 # transpose_npp needs NPP, which is nonfree and so absent from redistributable
 # builds. We compile our own — NVDEC/NVENC via ffnvcodec, CUDA filter kernels
 # via nvcc, NPP for transpose/scale — so the whole pixel path stays on the GPU
-# (user policy: GPU or error, never CPU fallback). nonfree is fine here: this
-# image is built and consumed locally on sentinel only (pull_policy: never),
+# (user policy: GPU or error, never CPU fallback). NOTE on nonfree: --enable-nonfree makes
+# this ffmpeg NON-REDISTRIBUTABLE, and since 2026-09-18 the image is published
+# to GHCR (the ops repo pins it) rather than built on the box, so the package
+# must not be public. Flagged to the owner at the time. The original reason
+# it was acceptable, continued:
 # never pushed to a registry.
 FROM nvidia/cuda:12.9.2-devel-ubuntu24.04 AS ffmpeg-builder
 
