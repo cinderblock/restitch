@@ -23,7 +23,7 @@ pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET
 pkg_check_modules(LIBAV_STATIC REQUIRED
   libavformat libavcodec libavutil libswresample)
 
-# --- CUDA runtime + NPP (from the CUDA devel image) ---
+# --- CUDA runtime (from the CUDA devel image) ---
 find_package(CUDAToolkit REQUIRED)
 
 # libdatachannel's exported targets reference OpenSSL::SSL/Crypto and

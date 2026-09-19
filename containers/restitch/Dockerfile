@@ -52,17 +52,19 @@ RUN git clone --depth 1 --branch "${WHISPER_REF}" \
     cmake --build build -j"$(nproc)" --config Release --target whisper-server whisper-cli
 
 
-# --- builder: FFmpeg with CUDA filters + NPP (GPU transpose/scale) ---
-# The stock BtbN GPL build has scale_cuda/overlay_cuda but no GPU rotation:
-# transpose_npp needs NPP, which is nonfree and so absent from redistributable
-# builds. We compile our own — NVDEC/NVENC via ffnvcodec, CUDA filter kernels
-# via nvcc, NPP for transpose/scale — so the whole pixel path stays on the GPU
-# (user policy: GPU or error, never CPU fallback). NOTE on nonfree: --enable-nonfree makes
-# this ffmpeg NON-REDISTRIBUTABLE, and since 2026-09-18 the image is published
-# to GHCR (the ops repo pins it) rather than built on the box, so the package
-# must not be public. Flagged to the owner at the time. The original reason
-# it was acceptable, continued:
-# never pushed to a registry.
+# --- builder: the libav* libraries stitchd links ---
+# ffmpeg here is only libavformat / libavcodec / libavutil / libswresample,
+# built static and linked into stitchd for RTSP demux, NVDEC/NVENC (through
+# ffnvcodec, whose headers are MIT) and audio resampling. No programs, no
+# libavfilter, nothing nonfree: the build is plain LGPL, so the image is
+# redistributable — which matters now that it is published to GHCR and pinned
+# by the ops repo instead of being built on the box.
+#
+# Until 2026-09-19 this stage was configured --enable-nonfree --enable-libnpp
+# --enable-cuda-nvcc for transpose_npp / scale_npp and ffmpeg's own CUDA
+# filters. Those served the retired ffmpeg-filtergraph compositor; stitchd does
+# its compositing in its own CUDA kernels and never linked libavfilter, so the
+# flags only made the libraries unredistributable on paper.
 FROM nvidia/cuda:12.9.2-devel-ubuntu24.04 AS ffmpeg-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -83,35 +85,25 @@ RUN git clone --depth 1 --branch "${FFNVCODEC_REF}" \
 ARG FFMPEG_REF=n7.1.5
 RUN git clone --depth 1 --branch "${FFMPEG_REF}" \
         https://github.com/FFmpeg/FFmpeg.git /opt/ffmpeg-src
-# vf_overlay_cuda emits frames cloned from the 32-aligned hw frame pool with
-# the POOL's padded dimensions (e.g. 1216x704 instead of 1200x676). Downstream
-# consumers treat frame dims as truth: NVENC encodes the unwritten padding
-# (green bars) and scale_npp/scale_cuda smear it into the edge columns. The
-# patch clamps the forwarded frame back to the negotiated link size.
-COPY containers/restitch/patches/vf_overlay_cuda_frame_dims.patch /tmp/
-RUN cd /opt/ffmpeg-src && git apply /tmp/vf_overlay_cuda_frame_dims.patch && \
-    grep -q "clamp back" libavfilter/vf_overlay_cuda.c
-# --nvccflags: ffmpeg's default nvcc gencode targets archs CUDA 12 dropped;
-# sm_89 = Ada (RTX 4090).
+# Libraries only. --disable-avfilter also drops the CUDA filter kernels (and
+# the nvcc / NPP dependencies they carried); nvenc, nvdec and cuvid are picked
+# up automatically from the ffnvcodec headers installed above.
 RUN cd /opt/ffmpeg-src && \
     ./configure \
         --prefix=/opt/ffmpeg \
         --disable-doc \
-        --disable-ffplay \
-        --enable-nonfree \
-        --enable-cuda-nvcc \
-        --enable-libnpp \
-        --nvccflags="-gencode arch=compute_89,code=sm_89 -O2" \
-        --extra-cflags=-I/usr/local/cuda/include \
-        --extra-ldflags=-L/usr/local/cuda/lib64 && \
+        --disable-programs \
+        --disable-avfilter \
+        --disable-avdevice \
+        --disable-postproc && \
     make -j"$(nproc)" && \
     make install
 
 
 # --- builder: stitchd, the custom CUDA compositor (compositor/) ---
-# Compiles against the libav* we just built (/opt/ffmpeg) + CUDA/NPP. Only used
-# when config `compositor: native`. Reuses the ffmpeg-builder stage so it has
-# the static libav*, headers, pkgconfig, nvcc and NPP already in place.
+# Compiles against the libav* we just built (/opt/ffmpeg) + the CUDA toolkit
+# for its own kernels. Reuses the ffmpeg-builder stage so it has the static
+# libav*, headers, pkgconfig and nvcc already in place.
 FROM ffmpeg-builder AS compositor-builder
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends cmake git libssl-dev && \
@@ -158,7 +150,8 @@ RUN apt-get update -qq && \
 
 
 # stitchd, the CUDA compositor. It is the only compositor.
-# Static-links libav*, dynamically links libnpp*/cudart from the cuda runtime.
+# Static-links libav*; its only dynamic CUDA dependency is libcudart, from the
+# runtime image.
 COPY --from=compositor-builder /opt/compositor/build/stitchd /usr/local/bin/stitchd
 
 # Bun (TypeScript runtime). Bun's installer scopes to BUN_INSTALL.
