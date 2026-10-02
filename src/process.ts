@@ -3,6 +3,11 @@ import type { Subprocess } from "bun";
 export interface ManagedProcess {
   name: string;
   process: Subprocess;
+  /** Wall-clock ms of the last stdout chunk the current child delivered (its
+   *  spawn time until the first one), or null when stdout is not piped. For a
+   *  child that writes on a clock — stitchd's PCM — a stale value means the
+   *  read side has stopped, whatever the reason. */
+  lastStdoutAt: number | null;
   restart(): Promise<void>;
   stop(): void;
 }
@@ -52,6 +57,7 @@ export function launchManaged(
   // 2026-07-29 — two stitchd instances publishing the same paths,
   // which stuttered every consumer of every output.
   let pendingRespawn: ReturnType<typeof setTimeout> | null = null;
+  let lastStdoutAt: number | null = null;
   let proc: Subprocess;
 
   function cancelPendingRespawn(): void {
@@ -71,6 +77,7 @@ export function launchManaged(
     });
 
     // Stream stdout to caller as raw byte chunks if requested
+    lastStdoutAt = onStdout ? Date.now() : null;
     if (onStdout && child.stdout) {
       const stdoutReader = child.stdout.getReader();
       (async () => {
@@ -78,11 +85,41 @@ export function launchManaged(
           while (true) {
             const { done, value } = await stdoutReader.read();
             if (done) break;
-            if (value) onStdout(value);
+            if (!value) continue;
+            if (child === proc) lastStdoutAt = Date.now();
+            // A consumer bug costs the chunk it threw on, not the stream. This
+            // loop is the ONLY thing draining the pipe: Bun keeps reading the
+            // child's stdout into memory whether or not anything here takes
+            // it, so a loop that ends while the child lives buffers every byte
+            // the child ever writes again. That is how the supervisor reached
+            // 122 GB and took the host into a global OOM on 2026-10-02 — at
+            // stitchd's PCM rate, 1.1 GB an hour, with nothing in the log.
+            try {
+              onStdout(value);
+            } catch (e) {
+              console.error(`[${name}] stdout consumer threw — chunk dropped:`, e);
+            }
           }
-        } catch {
-          // stream closed
+        } catch (e) {
+          console.error(`[${name}] stdout read failed:`, e);
         }
+        // EOF normally means the child is exiting; give the exit a moment to
+        // land before reading anything into it.
+        const exited = await Promise.race([
+          child.exited.then(() => true),
+          new Promise<false>((r) => setTimeout(() => r(false), 1000)),
+        ]);
+        if (exited) return;
+        // The stream ended but the process did not. Nothing will drain this
+        // pipe again, so close it (that is what stops Bun buffering — measured:
+        // without the cancel RSS keeps climbing at the writer's rate) and
+        // replace the child; a process whose output nobody reads is not doing
+        // its job anyway.
+        console.error(
+          `[${name}] stdout closed while the process is still running — restarting it`
+        );
+        await stdoutReader.cancel().catch(() => {});
+        child.kill();
       })();
     }
 
@@ -153,6 +190,9 @@ export function launchManaged(
     name,
     get process() {
       return proc;
+    },
+    get lastStdoutAt() {
+      return lastStdoutAt;
     },
     async restart() {
       if (stopped || restarting) return;

@@ -143,6 +143,9 @@ async function main() {
     paths: stitchd.outputNames,
     process: stitchdProc,
     inputPaths: stitchd.inputPaths,
+    // The mixer runs whenever the config declares audio channels, and writes
+    // from the moment stitchd starts — before, and regardless of, whisper.
+    expectStdout: stitchd.audioChannels.length > 0,
   });
 
   // Transcription stack (whisper-server). Spawns its own supervised

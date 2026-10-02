@@ -115,6 +115,13 @@ function makeWavHeader(
   return new Uint8Array(buf);
 }
 
+// Bounds on work queued against whisper-server. It transcribes one request at a
+// time, so anything past a few in flight is audio that will be stale by the
+// time it is heard — and every one of them pins up to max_segment_seconds of
+// PCM in memory for as long as it waits.
+const WHISPER_TIMEOUT_MS = 120_000;
+const MAX_INFLIGHT = 8;
+
 async function transcribe(
   serverUrl: string,
   pcm: Uint8Array,
@@ -135,6 +142,9 @@ async function transcribe(
   const r = await fetch(`${serverUrl}/inference`, {
     method: "POST",
     body: form,
+    // Each pending request holds its segment's audio. A whisper-server that
+    // stops answering must fail these, not collect them.
+    signal: AbortSignal.timeout(WHISPER_TIMEOUT_MS),
   });
   if (!r.ok) {
     throw new Error(
@@ -354,6 +364,12 @@ function startCombinedPump(
   }
 
   async function flushSegment(startByte: number, endByte: number): Promise<void> {
+    if (inflight >= MAX_INFLIGHT) {
+      console.warn(
+        `[combined] ${inflight} segments already waiting on whisper-server — dropped one`
+      );
+      return;
+    }
     inflight++;
     try {
       const padStart = Math.max(firstMonoByte, startByte - PAD_BYTES);

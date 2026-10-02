@@ -1,7 +1,9 @@
 /**
  * Watchdog: periodically polls stitchd's status and restarts it when it is
- * alive but stuck (the supervisor only restarts on process exit). Two triggers:
+ * alive but stuck (the supervisor only restarts on process exit). Three triggers:
  *
+ *  0. Stdout stall — a process that writes on a clock (expectStdout) has had
+ *     nothing read from its stdout for stallMs. See expectStdout.
  *  1. Output byte-stall — a watched output path's bytesReceived hasn't grown in
  *     stallMs (the publisher wedged).
  *  2. Input source reconnect — a watched INPUT path's readyTime changed, meaning
@@ -34,6 +36,12 @@ export interface WatchedProcess {
    *  This is the actual trigger for the entry/foyer freeze (the freeze timestamp
    *  matched raw/foyer's readyTime exactly). */
   inputPaths?: string[];
+  /** Set when this process writes to its stdout on a clock (stitchd's PCM
+   *  mixer emits a block every 10 ms whether or not anyone is talking). Then a
+   *  quiet stdout is never "nothing to say": either the writer wedged or our
+   *  read loop did, and in the second case Bun buffers the unread bytes
+   *  without limit. Restart on a stall of stallMs. */
+  expectStdout?: boolean;
 }
 
 interface PathState {
@@ -118,7 +126,33 @@ export function startWatchdog(
     }
   };
 
+  // Stdout stall check. Runs before, and independently of, the status fetch: it
+  // needs nothing from stitchd, and a stitchd too wedged to answer its status
+  // endpoint must not also disable this. No separate grace period — a respawn
+  // resets lastStdoutAt, so a new child gets a full stallMs to start writing.
+  const checkStdout = async (now: number) => {
+    for (let i = 0; i < watched.length; i++) {
+      const w = watched[i]!;
+      const last = w.process.lastStdoutAt;
+      if (!w.expectStdout || last === null || now - last < stallMs) continue;
+      console.warn(
+        `[watchdog] ${w.name}: nothing read from its stdout for ${Math.round(
+          (now - last) / 1000
+        )}s — restarting`
+      );
+      restartedAt.set(i, now);
+      for (const path of w.paths) state.delete(`${i}:${path}`);
+      try {
+        await w.process.restart();
+      } catch (e) {
+        console.error(`[watchdog] ${w.name}: stdout-stall restart failed:`, e);
+      }
+    }
+  };
+
   const tick = async () => {
+    await checkStdout(Date.now());
+
     const paths = await fetchStitchd();
     if (!paths) return;
 
