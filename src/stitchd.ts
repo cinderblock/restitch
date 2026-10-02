@@ -20,6 +20,26 @@ export interface ProbeResult {
 }
 
 /**
+ * The cameras whose native geometry decides a layout: members of the main
+ * composite, and cameras an extra composite takes by name. Only these are
+ * probed, and only these have to be reachable for stitchd's config to be built.
+ *
+ * Every other camera is republished verbatim (and maybe listened to) without
+ * its size mattering to anyone, so whether it is up at startup is its own
+ * business. Probing them anyway is what turned one unplugged restream-only
+ * camera into a crash loop for the whole service on 2026-10-02.
+ */
+export function layoutCameras(config: Config): Camera[] {
+  const byExtra = new Set<string>();
+  for (const extra of config.extra_composites)
+    for (const ref of extra.inputs)
+      if (ref.stream === undefined && ref.name) byExtra.add(ref.name);
+  return config.cameras.filter(
+    (c) => c.composite !== false || byExtra.has(c.name)
+  );
+}
+
+/**
  * Given a rotation string, return the effective width and height of a frame
  * after rotation. We need the input dimensions to compute this.
  */

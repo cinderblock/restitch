@@ -1,8 +1,9 @@
 import type { Config } from "./config.ts";
-import type { ProbeResult } from "./stitchd.ts";
+import { layoutCameras, type ProbeResult } from "./stitchd.ts";
 
 /**
- * Probe every camera for its native resolution and frame rate.
+ * Probe the cameras that size a layout for their native resolution and frame
+ * rate (see layoutCameras for why not all of them).
  *
  * These dimensions decide the whole layout — the composite size and every
  * piece rectangle in the generated stitchd config — so they have to be known
@@ -17,7 +18,7 @@ export async function probeAllCameras(
   config: Config,
   stitchdBin = "stitchd"
 ): Promise<Map<string, ProbeResult>> {
-  const cameras = config.cameras;
+  const cameras = layoutCameras(config);
   if (cameras.length === 0) return new Map();
 
   const proc = Bun.spawn(
