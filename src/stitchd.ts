@@ -22,7 +22,7 @@ export interface ProbeResult {
 /**
  * The cameras whose native geometry decides a layout: members of the main
  * composite, and cameras an extra composite takes by name. Only these are
- * probed, and only these have to be reachable for stitchd's config to be built.
+ * probed (see probeLayout for what happens when one does not answer).
  *
  * Every other camera is republished verbatim (and maybe listened to) without
  * its size mattering to anyone, so whether it is up at startup is its own
@@ -165,37 +165,62 @@ export function buildStitchdConfig(
   outputNames: string[];
   /** Cameras stitchd will emit audio for, in interleave order. */
   audioChannels: Camera[];
+  /** Outputs left out because a camera that sizes them has never been seen
+   *  (see probeLayout). They come back when the caller rebuilds with its
+   *  geometry. */
+  omitted: string[];
 } {
   if (config.composite.rotation !== "90") {
     throw new Error(
       `stitchd assumes composite rotation 90 (got "${config.composite.rotation}").`
     );
   }
-  const base = config.output.base_url;
   const cameras = config.cameras
     .filter((c) => c.composite !== false)
     .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
-  const fps = Math.round(cameraProbes.get(cameras[0]!.name)!.fps);
-  const comp = mainCompositeDims(config, cameraProbes);
+  // The main composite (and everything cut from it) needs its members'
+  // geometry. probeLayout fills all of them from any one that answered, so
+  // this is all or nothing.
+  const comp =
+    cameras.length > 0 && cameras.every((c) => cameraProbes.has(c.name))
+      ? mainCompositeDims(config, cameraProbes)
+      : null;
+  const anyProbe = comp
+    ? cameraProbes.get(cameras[0]!.name)
+    : cameraProbes.values().next().value;
+  const fps = Math.round(anyProbe?.fps ?? 30);
   const cameraByName = new Map(config.cameras.map((c) => [c.name, c]));
 
   const lines: string[] = [];
   const inputPaths: string[] = [];
   const outputNames: string[] = [];
+  const omitted: string[] = [];
+
+  // An extra composite is buildable when every input can be sized: a camera
+  // needs its probe, a `stream:` ref needs the main composite it is cut from.
+  const extras = config.extra_composites.filter((extra) => {
+    const ok = extra.inputs.every((ref) =>
+      ref.stream !== undefined ? comp !== null : cameraProbes.has(ref.name!)
+    );
+    if (!ok) omitted.push(extra.name);
+    return ok;
+  });
 
   lines.push(`fps ${fps}`);
-  lines.push(`comp-rot ${config.composite.rotation}`);
-  lines.push(`comp-dim ${comp.width} ${comp.height}`);
-  for (const cam of cameras) {
-    const slug = rawStreamName(cam);
-    // Straight to the camera: each is pulled exactly once, by stitchd.
-    lines.push(`comp-in ${cam.url}`);
-    inputPaths.push(slug);
+  if (comp) {
+    lines.push(`comp-rot ${config.composite.rotation}`);
+    lines.push(`comp-dim ${comp.width} ${comp.height}`);
+    for (const cam of cameras) {
+      const slug = rawStreamName(cam);
+      // Straight to the camera: each is pulled exactly once, by stitchd.
+      lines.push(`comp-in ${cam.url}`);
+      inputPaths.push(slug);
+    }
   }
 
   // Aux cameras: those referenced by extra composites (by name, not stream).
   const aux = new Map<string, string>(); // slug -> url
-  for (const extra of config.extra_composites)
+  for (const extra of extras)
     for (const ref of extra.inputs)
       if (ref.stream === undefined && ref.name) {
         const cam = cameraByName.get(ref.name);
@@ -235,32 +260,36 @@ export function buildStitchdConfig(
     outputNames.push(name);
   };
 
-  // Main composite (`full`): the whole composite, optional scale.
-  const mScale = config.composite.scale;
-  emit(config.composite.name, config.encoder.codec, 0, [
-    {
-      src: "composite", cx: 0, cy: 0, cw: comp.width, ch: comp.height,
-      sw: mScale?.width ?? comp.width, sh: mScale?.height ?? comp.height, rot: 0,
-    },
-  ]);
-
-  // Sub-streams: crop the composite, scale, rotate.
-  for (const sub of config.sub_streams) {
-    const cx = resolveDimension(sub.x, comp.width);
-    const cy = resolveDimension(sub.y, comp.height);
-    const cw = resolveDimension(sub.width, comp.width);
-    const ch = resolveDimension(sub.height, comp.height);
-    const scale = sub.scale ?? { width: cw, height: ch };
-    emit(sub.name, sub.codec ?? config.encoder.codec, parseRate(sub.maxrate), [
+  if (comp) {
+    // Main composite (`full`): the whole composite, optional scale.
+    const mScale = config.composite.scale;
+    emit(config.composite.name, config.encoder.codec, 0, [
       {
-        src: "composite", cx, cy, cw, ch, sw: scale.width, sh: scale.height,
-        rot: stitchdRot(sub.rotation, `sub_stream "${sub.name}"`),
+        src: "composite", cx: 0, cy: 0, cw: comp.width, ch: comp.height,
+        sw: mScale?.width ?? comp.width, sh: mScale?.height ?? comp.height, rot: 0,
       },
     ]);
+
+    // Sub-streams: crop the composite, scale, rotate.
+    for (const sub of config.sub_streams) {
+      const cx = resolveDimension(sub.x, comp.width);
+      const cy = resolveDimension(sub.y, comp.height);
+      const cw = resolveDimension(sub.width, comp.width);
+      const ch = resolveDimension(sub.height, comp.height);
+      const scale = sub.scale ?? { width: cw, height: ch };
+      emit(sub.name, sub.codec ?? config.encoder.codec, parseRate(sub.maxrate), [
+        {
+          src: "composite", cx, cy, cw, ch, sw: scale.width, sh: scale.height,
+          rot: stitchdRot(sub.rotation, `sub_stream "${sub.name}"`),
+        },
+      ]);
+    }
+  } else {
+    omitted.push(config.composite.name, ...config.sub_streams.map((s) => s.name));
   }
 
   // Extra composites: a vertical stack; each input a crop+scale+rot piece.
-  for (const extra of config.extra_composites) {
+  for (const extra of extras) {
     const raw = extra.inputs.map((ref, i) => {
       let src: string, srcW: number, srcH: number, rot: string;
       if (ref.stream !== undefined) {
@@ -307,5 +336,11 @@ export function buildStitchdConfig(
          parseRate(extra.maxrate), pieces);
   }
 
-  return { text: lines.join("\n") + "\n", inputPaths, outputNames, audioChannels };
+  return {
+    text: lines.join("\n") + "\n",
+    inputPaths,
+    outputNames,
+    audioChannels,
+    omitted,
+  };
 }

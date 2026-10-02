@@ -66,6 +66,22 @@ After deploy, the box exposes (via `network_mode: host`):
 Paths come from `config.yaml`: `raw/<camera-slug>`, `full`, `full-low`,
 `the-field`, `john`, `entry`, plus any `extra_composites`.
 
+## When a camera is down
+
+No camera is a startup dependency. Each input connects on its own thread
+inside stitchd and retries (1 s doubling to 30 s) for as long as the process
+runs, whether it was down at startup or dropped later:
+
+- A main-composite camera that is down is a black slot in the composite; the
+  layout does not change, and the slot fills in when the camera connects.
+- A restream-only camera's `raw/<slug>` appears on the RTSP server when it
+  first connects. No restart.
+- A camera an `extra_composites` entry takes by name, down *at startup*, has no
+  known geometry to lay out: that output is left out, the camera is re-probed
+  every 30 s, and stitchd restarts once to add the output when it answers. (If
+  not one main-composite camera answers at startup, the same goes for the main
+  composite and everything cut from it.)
+
 ## Local development
 
 ```bash

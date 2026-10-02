@@ -1,10 +1,10 @@
 import { parseArgs } from "util";
 import { resolve } from "path";
 import YAML from "yaml";
-import { ConfigSchema, type Config } from "./config.ts";
+import { ConfigSchema, type Camera, type Config } from "./config.ts";
 import { writeFileSync } from "fs";
 import { buildStitchdConfig, type ProbeResult } from "./stitchd.ts";
-import { probeAllCameras } from "./probe.ts";
+import { probeLayout } from "./probe.ts";
 import { launchManaged, type ManagedProcess } from "./process.ts";
 import { startDashboard } from "./dashboard.ts";
 import { startTranscription, type PcmSink } from "./transcribe.ts";
@@ -39,7 +39,10 @@ async function main() {
   // GPU, rather than in a proxy check against a different binary.
 
   // Probe cameras for native resolution
+  const stitchdBin = values["stitchd-bin"] ?? "stitchd";
   let cameraProbes: Map<string, ProbeResult>;
+  // Layout cameras whose geometry is not known yet (see probeLayout).
+  let missing: Camera[] = [];
   if (values["skip-probe"]) {
     console.log("Skipping camera probe (using defaults: 2560x1440@30fps)");
     cameraProbes = new Map(
@@ -50,12 +53,13 @@ async function main() {
     );
   } else {
     console.log("Probing cameras...");
-    cameraProbes = await probeAllCameras(config, values["stitchd-bin"] ?? "stitchd");
+    ({ probes: cameraProbes, missing } = await probeLayout(config, stitchdBin));
     for (const [name, probe] of cameraProbes) {
       console.log(
         `  ${name}: ${probe.width}x${probe.height} @ ${probe.fps.toFixed(1)}fps`
       );
     }
+    for (const cam of missing) console.warn(`  ${cam.name}: no answer`);
   }
 
   const stitchd = buildStitchdConfig(config, cameraProbes);
@@ -64,6 +68,11 @@ async function main() {
   console.log("--- Output Streams ---");
   for (const n of stitchd.outputNames)
     console.log(`  ${n} -> ${config.output.base_url}/${n}`);
+  if (stitchd.omitted.length > 0)
+    console.warn(
+      `  left out until ${missing.map((c) => c.name).join(", ")} ` +
+        `answer${missing.length === 1 ? "s" : ""}: ${stitchd.omitted.join(", ")}`
+    );
 
   if (values["dry-run"]) {
     console.log("\n--- stitchd command (dry run) ---");
@@ -117,7 +126,7 @@ async function main() {
     writeFileSync(stitchdConfPath, buildStitchdConfig(config, cameraProbes).text);
     return {
       cmd: [
-        values["stitchd-bin"] ?? "stitchd",
+        stitchdBin,
         "--config", stitchdConfPath,
         // Nothing to publish to: stitchd serves RTSP/HLS/WebRTC itself, so the
         // outputs stay in-process rather than being pushed back out over
@@ -138,7 +147,7 @@ async function main() {
     };
   });
   processes.push(stitchdProc);
-  watched.push({
+  const stitchdWatch: WatchedProcess = {
     name: "stitchd",
     paths: stitchd.outputNames,
     process: stitchdProc,
@@ -146,7 +155,38 @@ async function main() {
     // The mixer runs whenever the config declares audio channels, and writes
     // from the moment stitchd starts — before, and regardless of, whisper.
     expectStdout: stitchd.audioChannels.length > 0,
-  });
+  };
+  watched.push(stitchdWatch);
+
+  // Outputs were left out because a camera that sizes them did not answer the
+  // probe. Keep asking; when one does, restart stitchd so its config (rebuilt
+  // on every spawn, above) includes them. This is the one case where a camera
+  // coming back costs everyone a reconnect — its geometry was never known, so
+  // there was no rectangle to hold open for it. A camera that has been seen
+  // before rejoins inside stitchd without any of this.
+  const reprobe = async () => {
+    try {
+      const r = await probeLayout(config, stitchdBin, missing, cameraProbes);
+      if (r.missing.length < missing.length) {
+        const back = missing.filter((c) => !r.missing.includes(c));
+        cameraProbes = r.probes;
+        missing = r.missing;
+        const next = buildStitchdConfig(config, cameraProbes);
+        console.log(
+          `[probe] ${back.map((c) => c.name).join(", ")} answered — restarting ` +
+            `stitchd with ${next.outputNames.join(", ") || "no outputs"}` +
+            (next.omitted.length > 0 ? ` (still left out: ${next.omitted.join(", ")})` : "")
+        );
+        stitchdWatch.paths = next.outputNames;
+        stitchdWatch.inputPaths = next.inputPaths;
+        await stitchdProc.restart();
+      }
+    } catch (e) {
+      console.warn("[probe] re-probe failed:", e);
+    }
+    if (missing.length > 0) setTimeout(reprobe, 30_000);
+  };
+  if (missing.length > 0) setTimeout(reprobe, 30_000);
 
   // Transcription stack (whisper-server). Spawns its own supervised
   // subprocesses into `processes`. stitchd already demuxes every camera and
