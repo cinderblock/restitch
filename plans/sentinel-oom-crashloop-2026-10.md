@@ -64,8 +64,9 @@ roughly every 4.5 days of uptime, not a one-off.
 - **"Cameras being down shouldn't bring down the whole thing, nor should we run
   out of memory. Fix it."** (user, 2026-10-02). This is the bar: no camera, of
   any role, may be a startup dependency of the service.
-- Ops change approved and applied: pin `e736da4` + `mem_limit: 8g` /
-  `memswap_limit: 8g` on the restitch stack (ops `f508de7`).
+- Ops changes approved and applied: pin `e736da4` + `mem_limit: 8g` /
+  `memswap_limit: 8g` on the restitch stack (ops `f508de7`), then pin
+  `0c0d7b8` (ops `55991cc`).
 - Standing rules that apply: ops changes need a per-change yes; no dead
   fallback paths; GPU-or-error stays.
 
@@ -93,11 +94,13 @@ roughly every 4.5 days of uptime, not a one-off.
      is restarted with the full config once it answers. Same for the main
      composite if not one member answers.
 6. [x] Tested before pinning — see "How Tier 2 was tested".
-7. [ ] **(current)** Image build for `0c0d7b8`, then the ops pin — needs the
-       user's yes.
-8. [ ] After the pin: confirm on sentinel that `raw/bullet` is listed as an
-       input that is retrying (it is still offline) and everything else is up.
-9. [ ] Watch the next ~week of uptime for the read-loop log line that names the
+7. [x] Image `sha256:d3ef38c3…` built from `0c0d7b8`; pinned with the user's
+       yes in ops `55991cc`, deployed 13:49 PDT.
+8. [x] Verified on sentinel: 0 restarts, six outputs advancing with 0 drops,
+       nine raw streams, `raw/bullet` present as an input that is retrying
+       ("unavailable (Invalid data…) — retrying until it answers"), dashboard
+       200, 640 MiB of 8 GiB.
+9. [ ] **(open, needs elapsed time)** Watch the next ~week of uptime for the read-loop log line that names the
        original trigger (open question 1).
 
 ## How Tier 2 was tested
@@ -165,7 +168,11 @@ keep the literal out of the rest of the command.
 - [x] Leak fix + probe fix shipped and deployed; service verified up.
 - [x] Container memory cap in ops.
 - [x] Tier 2 written, tested on the GPU, committed, pushed (`d13f287`, `0c0d7b8`).
-- [ ] Tier 2 image built and pinned in ops (needs the user's yes).
+- [x] Tier 2 image built, pinned (ops `55991cc`), deployed and verified.
+- [ ] The trigger that stopped the read loop is still unnamed; the next
+      occurrence will log it (`[stitchd] stdout …` or
+      `[watchdog] stitchd: nothing read from its stdout …`). Check the container
+      log for those lines after ~5 days of uptime (around 2026-10-07).
 
 ## Open questions for the user
 
