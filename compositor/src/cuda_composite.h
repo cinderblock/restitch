@@ -28,7 +28,8 @@ extern "C" void launch_vstack_rotate90cw(const CompositeInputs *in,
 
 // Crop a rect (cropX,cropY,cropW,cropH) from an NV12 source, resample it to
 // (dstW x dstH) with scale-aware Lanczos-3, optionally rotating 180. When the
-// crop and dst dims are equal it's an exact (unfiltered) copy/flip. Used for
+// crop and dst dims are equal it's an exact (unfiltered) copy/flip. A null
+// source plane fills tv-black, as in the vstack kernel. Used for
 // sub-streams (full-low scale, the-field crop+scale, john crop+rot180).
 extern "C" void launch_crop_scale_rot180(
     const uint8_t *srcY, int srcPitchY, const uint8_t *srcUV, int srcPitchUV,

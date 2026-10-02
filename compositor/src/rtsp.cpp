@@ -143,7 +143,8 @@ void Server::add_stream(const std::string &name, const AVCodecParameters *par,
   si.par = avcodec_parameters_alloc();
   avcodec_parameters_copy(si.par, par);
   si.time_base = tb;
-  streams_[name] = si;
+  std::lock_guard<std::mutex> lk(streams_mu_);
+  if (!streams_.emplace(name, si).second) avcodec_parameters_free(&si.par);
 }
 
 bool Server::start(int port) {
@@ -348,8 +349,12 @@ void Server::serve_conn(int fd) {
         continue;
       }
 
-      auto it = streams_.find(name);
-      if (it == streams_.end()) { reply("404 Not Found", cseq); continue; }
+      std::map<std::string, StreamInfo>::iterator it;
+      {
+        std::lock_guard<std::mutex> lk(streams_mu_);
+        it = streams_.find(name);
+        if (it == streams_.end()) { reply("404 Not Found", cseq); continue; }
+      }
 
       if (method == "DESCRIBE") {
         // Build SDP from a throwaway rtp context for this stream's codec.

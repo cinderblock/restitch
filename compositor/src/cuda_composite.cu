@@ -97,6 +97,17 @@ __global__ void crop_scale_rot180_kernel(
   const int yo = blockIdx.y * blockDim.y + threadIdx.y;
   if (xo >= dstW || yo >= dstH)
     return;
+  // A source with no frame (an input that has not connected yet) fills tv
+  // black, as the vstack kernel does for a null input.
+  if (!srcY || !srcUV) {
+    dstY[yo * dstPitchY + xo] = 16;
+    if (((xo | yo) & 1) == 0) {
+      uint8_t *q = dstUV + (yo >> 1) * dstPitchUV + (xo >> 1) * 2;
+      q[0] = 128;
+      q[1] = 128;
+    }
+    return;
+  }
   const int xe = rot180 ? (dstW - 1 - xo) : xo;
   const int ye = rot180 ? (dstH - 1 - yo) : yo;
 

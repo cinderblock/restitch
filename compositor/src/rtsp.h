@@ -51,7 +51,9 @@ public:
   Server() = default;
   ~Server();
 
-  // Register a stream before start(). Copies `par`.
+  // Register a stream. Copies `par`. Safe at any time, from any thread: the
+  // composites are added before start(), a camera's raw/<name> whenever that
+  // camera first connects. Once added a stream is never changed or removed.
   void add_stream(const std::string &name, const AVCodecParameters *par,
                   AVRational time_base);
 
@@ -99,7 +101,10 @@ private:
   std::atomic<bool> running_{false};
   std::atomic<int> clients_{0};
 
-  std::map<std::string, StreamInfo> streams_; // built before start(), then read-only
+  // Insert-only, so a StreamInfo found under streams_mu_ stays valid (and
+  // unchanged) after the lock is dropped: std::map never moves its nodes.
+  std::mutex streams_mu_;
+  std::map<std::string, StreamInfo> streams_;
 
   mutable std::mutex sessions_mu_;
   std::vector<std::shared_ptr<Session>> sessions_;

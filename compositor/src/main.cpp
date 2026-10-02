@@ -58,8 +58,9 @@ extern "C" {
 #include "cuda_composite.h"
 
 static volatile std::sig_atomic_t g_stop = 0;
-// Set once before encoding starts; read-only thereafter.
-static rtsp::Server *g_rtsp = nullptr;
+// Set once the RTSP server is listening. Atomic because the input threads are
+// already running by then and pick it up to register their raw/<name> stream.
+static std::atomic<rtsp::Server *> g_rtsp{nullptr};
 #if STITCHD_WEBRTC
 static webrtc::Server *g_webrtc = nullptr;
 #endif
@@ -106,17 +107,23 @@ public:
   // Both share ONE connection to the camera — opening a second one just for
   // audio would double the load on the NVR, which is the thing this whole
   // change exists to avoid.
-  int open(const char *url, AVBufferRef *device, audio::Tap *tap = nullptr,
-           bool need_video = true) {
-    // Remembered so loop() can reopen this input after a drop. Without them a
-    // decode thread that lost its connection had nothing to reconnect to and
-    // simply exited, freezing that region of every composite it feeds.
+  //
+  // This only records what to open. The connection is made on the input's own
+  // thread and re-made there for as long as the process runs, so a camera that
+  // is down — at startup or later — is that camera's problem and nobody
+  // else's. Opening here, synchronously, made every input a startup
+  // dependency: one composite camera that would not answer was `return 1`
+  // for the whole compositor.
+  void init(const char *url, AVBufferRef *device, audio::Tap *tap = nullptr,
+            bool need_video = true) {
     url_ = url;
     device_ = device;
     need_video_ = need_video;
     tap_orig_ = tap;
-    return open_input(tap);
   }
+  // Republish this input's video packets at `name` ("raw/<slug>") on the RTSP
+  // server. Call before start(): the input thread reads it without a lock.
+  void set_raw_name(const std::string &name) { raw_name_ = name; }
 
 private:
   int open_input(audio::Tap *tap) {
@@ -132,7 +139,7 @@ private:
     av_dict_set(&opt, "timeout", "10000000", 0);
     int err = avformat_open_input(&fmt_, url, nullptr, &opt);
     av_dict_free(&opt);
-    if (err < 0) { LOGF("open %s: %s", url, av_err(err).c_str()); return err; }
+    if (err < 0) return err; // loop() reports it, by name rather than by URL
     if ((err = avformat_find_stream_info(fmt_, nullptr)) < 0) return err;
 
     if (tap_) {
@@ -149,15 +156,16 @@ private:
     // passthrough republishes the ORIGINAL packets, so an audio-only input
     // still needs its video stream index and parameters.
     stream_ = av_find_best_stream(fmt_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-    if (stream_ >= 0 && !vpar_) {
+    if (stream_ >= 0 && !vpar_.load()) {
       // First open only. The RTSP server has built this stream's SDP from these
       // parameters, so a reconnect must not swap them out underneath live
       // clients — they would be decoding against a description that no longer
       // matches. Same camera, so they should be identical anyway.
       AVStream *vs = fmt_->streams[stream_];
-      vpar_ = avcodec_parameters_alloc();
-      avcodec_parameters_copy(vpar_, vs->codecpar);
+      AVCodecParameters *par = avcodec_parameters_alloc();
+      avcodec_parameters_copy(par, vs->codecpar);
       vtb_ = vs->time_base;
+      vpar_.store(par); // published last: other threads read it via video_par()
     }
 
     if (!need_video) return 0;
@@ -177,12 +185,13 @@ private:
   // first request and kept (it is idle unless a snapshot is asked for).
   bool open_snapshot_decoder() {
     if (dec_snap_) return true;
-    if (!vpar_ || !device_) return false;
-    const AVCodec *dec = avcodec_find_decoder(vpar_->codec_id);
+    const AVCodecParameters *vpar = vpar_.load();
+    if (!vpar || !device_) return false;
+    const AVCodec *dec = avcodec_find_decoder(vpar->codec_id);
     if (!dec) return false;
     dec_snap_ = avcodec_alloc_context3(dec);
     if (!dec_snap_) return false;
-    avcodec_parameters_to_context(dec_snap_, vpar_);
+    avcodec_parameters_to_context(dec_snap_, vpar);
     dec_snap_->hw_device_ctx = av_buffer_ref(device_);
     dec_snap_->get_format = get_hw_format;
     if (avcodec_open2(dec_snap_, dec, nullptr) < 0) {
@@ -226,45 +235,60 @@ private:
   void loop() {
     AVPacket *pkt = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
-    // Outer loop = one connection attempt. Inner loop = reading that
-    // connection. Previously there was no outer loop: any read error broke out
-    // and the thread ENDED, so a camera reboot or a momentary network blip
-    // killed that input until the whole process was restarted, while the
+    // Two states, one loop: not connected (fmt_ is null — at startup, and
+    // after any drop) and connected. There used to be no way back from the
+    // first: a read error ended the thread, so a camera reboot or a network
+    // blip killed that input until the whole process was restarted, while the
     // compositor happily kept painting its last frame. That is how the
     // Doorbell froze the top half of `entry` for ~15 minutes on 2026-08-10
     // with the camera itself perfectly healthy.
-    int backoff_ms = kReconnectMinMs;
+    int backoff_ms = 0;       // the first attempt is immediate
+    bool ever = false;        // has this input ever connected?
+    bool down_logged = false; // one line per outage, not one per attempt
     while (running_ && !g_stop) {
+      if (!fmt_) {
+        // Sliced rather than one long sleep: stop() joins this thread, and a
+        // 30 s nap would hold up shutdown long enough for the supervisor's
+        // SIGTERM to be followed by a SIGKILL.
+        for (int slept = 0; slept < backoff_ms && running_ && !g_stop;
+             slept += 100)
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!running_ || g_stop) break;
+        int oerr = open_input(tap_orig_);
+        if (oerr < 0) {
+          close_input(); // a partial open leaves contexts behind
+          if (!down_logged) {
+            LOGF("input '%s' unavailable (%s) — retrying until it answers",
+                 log_name().c_str(), av_err(oerr).c_str());
+            down_logged = true;
+          }
+          // Capped so a camera that is down for hours costs one attempt every
+          // kReconnectMaxMs rather than a spin, and so a flapping camera
+          // can't hammer the NVR.
+          backoff_ms = backoff_ms ? std::min(backoff_ms * 2, kReconnectMaxMs)
+                                  : kReconnectMinMs;
+          continue;
+        }
+        if (ever) {
+          LOGF("input '%s' reconnected", log_name().c_str());
+          ++reconnects_;
+        } else if (down_logged) {
+          LOGF("input '%s' connected", log_name().c_str());
+        }
+        ever = true;
+        down_logged = false;
+        backoff_ms = kReconnectMinMs;
+        continue;
+      }
       int err = av_read_frame(fmt_, pkt);
       if (err < 0) {
         if (!running_ || g_stop) break;
         LOGF("input '%s' dropped (%s) — reconnecting", log_name().c_str(),
              av_err(err).c_str());
         close_input();
-        // Reopen until it takes. Backoff is capped so a camera that is down
-        // for hours costs one attempt every kReconnectMaxMs rather than a
-        // spin, and so a flapping camera can't hammer the NVR.
-        while (running_ && !g_stop) {
-          // Sliced rather than one long sleep: stop() joins this thread, and a
-          // 30 s nap would hold up shutdown long enough for the supervisor's
-          // SIGTERM to be followed by a SIGKILL.
-          for (int slept = 0; slept < backoff_ms && running_ && !g_stop;
-               slept += 100)
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-          if (!running_ || g_stop) break;
-          int rerr = open_input(tap_orig_);
-          if (rerr >= 0) {
-            LOGF("input '%s' reconnected", log_name().c_str());
-            ++reconnects_;
-            backoff_ms = kReconnectMinMs;
-            break;
-          }
-          close_input(); // a partial open leaves contexts behind
-          backoff_ms = std::min(backoff_ms * 2, kReconnectMaxMs);
-        }
+        backoff_ms = kReconnectMinMs;
         continue;
       }
-      backoff_ms = kReconnectMinMs;
       // Audio used to be discarded here; it is the same connection, so taking
       // it costs one decode and no extra network read.
       if (tap_ && pkt->stream_index == tap_->stream_index()) {
@@ -276,9 +300,21 @@ private:
       // raw/* republish: the camera's ORIGINAL packets, no decode, no
       // re-encode. Lets Home Assistant read per-camera streams from stitchd
       // instead of opening a second connection to the NVR.
-      if (g_rtsp && !passthrough_.empty()) {
-        g_rtsp->broadcast(passthrough_, pkt);
-        ++republished_;
+      if (!raw_name_.empty()) {
+        rtsp::Server *srv = g_rtsp.load();
+        // Registered from here, on the first video packet after the server is
+        // up, rather than once at startup: an input that was down when stitchd
+        // started used to be left out of the RTSP server for good, so its
+        // raw/<name> only came back with the next restart of everything.
+        if (srv && !republishing_.load()) {
+          srv->add_stream(raw_name_, vpar_.load(), vtb_);
+          republishing_.store(true);
+          LOGF("%s: republishing", raw_name_.c_str());
+        }
+        if (srv) {
+          srv->broadcast(raw_name_, pkt);
+          ++republished_;
+        }
       }
       if (!dec_) {
         // Audio-only input: we forward its video packets to raw/<name> but
@@ -341,7 +377,7 @@ public:
   void request_snapshot_frame() { snapshot_wanted_.store(true); }
   // Republished verbatim at raw/<name>? Those streams are real RTSP endpoints
   // and belong in the UI's stream list alongside the composites.
-  bool republished() const { return !passthrough_.empty(); }
+  bool republished() const { return republishing_.load(); }
   // Packets forwarded to raw/<name>. The right liveness signal for an
   // audio-only input like blue or bullet: it republishes video without ever
   // decoding one, so its frame count and age stay at zero/-1 forever.
@@ -350,7 +386,7 @@ public:
   // a UniFi RTSP path is a bearer token in all but name, and the status JSON
   // reaches the dashboard.
   std::string log_name() const {
-    if (!passthrough_.empty()) return passthrough_;
+    if (!raw_name_.empty()) return raw_name_;
     const size_t s = url_.find("://");
     const size_t h = (s == std::string::npos) ? 0 : s + 3;
     const size_t e = url_.find('/', h);
@@ -378,7 +414,7 @@ private:
   std::mutex mu_;
   AVFrame *latest_ = nullptr;
   audio::Tap *tap_ = nullptr; // not owned
-  // Reconnect state: what open() was originally called with.
+  // What init() was called with; every (re)connect opens from these.
   std::string url_;
   AVBufferRef *device_ = nullptr; // not owned
   bool need_video_ = true;
@@ -390,15 +426,14 @@ private:
   std::atomic<bool> snapshot_wanted_{false};
 
 public:
-  // Republish this input's video packets under `name` on the RTSP server.
-  void set_passthrough(const std::string &name) { passthrough_ = name; }
-  const AVCodecParameters *video_par() const { return vpar_; }
-  AVRational video_time_base() const { return vtb_; }
+  // Null until the input's first successful open.
+  const AVCodecParameters *video_par() const { return vpar_.load(); }
 
 private:
-  std::string passthrough_;
-  AVCodecParameters *vpar_ = nullptr;
-  AVRational vtb_{1, 90000};
+  std::string raw_name_; // set before start(), immutable after
+  std::atomic<bool> republishing_{false};
+  std::atomic<AVCodecParameters *> vpar_{nullptr};
+  AVRational vtb_{1, 90000}; // written before vpar_ is published
 };
 
 // ---- snapshot: a CUDA NV12 frame -> a small JPEG ---------------------------
@@ -611,7 +646,7 @@ int drain(Output &out) {
     // Same encoded packet again for any RTSP clients attached to stitchd
     // directly. Packets stay in the encoder time base; each session's rtp
     // muxer is registered with that same time base.
-    AVPacket *rtsp_pkt = g_rtsp ? av_packet_clone(pkt) : nullptr;
+    AVPacket *rtsp_pkt = g_rtsp.load() ? av_packet_clone(pkt) : nullptr;
 #if STITCHD_WEBRTC
     // Must be cloned HERE, before the primary write consumes `pkt`. Cloning it
     // afterwards is a use-after-free (segfault, exit 139).
@@ -624,7 +659,7 @@ int drain(Output &out) {
     av_packet_free(&pkt);
 
     if (rtsp_pkt) {
-      g_rtsp->broadcast(out.name, rtsp_pkt);
+      g_rtsp.load()->broadcast(out.name, rtsp_pkt);
       av_packet_free(&rtsp_pkt);
     }
 
@@ -781,7 +816,8 @@ private:
 // Config (generated by the restitch supervisor). Line format:
 //   fps <n>
 //   comp-rot <deg>            ; rotation applied after the vstack
-//   comp-dim <w> <h>          ; resolved composite dimensions
+//   comp-dim <w> <h>          ; composite dimensions; required with comp-in,
+//                             ;   and what the input geometry is derived from
 //   comp-in <url>             ; one per composite (stacked) camera, in order
 //   aux <name> <url>          ; a camera used by extra composites
 //   audio-ch <name> <url>     ; a transcription channel, IN ORDER (see below)
@@ -923,19 +959,32 @@ int run(const Config &cfg, const char *dest, long long max_frames,
     return t;
   };
 
+  // ---- inputs --------------------------------------------------------------
+  // One Decoder per camera URL, whatever it is needed for; each connects on
+  // its own thread (see Decoder::init), so nothing below waits on a camera and
+  // nothing below can fail because of one.
+  std::map<std::string, std::string> raw_by_url; // url -> "raw/<name>"
+  for (auto &r : cfg.raw) raw_by_url[r.second] = "raw/" + r.first;
+  auto make_input = [&](const std::string &url, audio::Tap *tap,
+                        bool need_video) {
+    auto *d = new Decoder();
+    d->init(url.c_str(), dev.ref, tap, need_video);
+    auto it = raw_by_url.find(url);
+    if (it != raw_by_url.end()) {
+      d->set_raw_name(it->second);
+      raw_by_url.erase(it); // claimed — one republisher per stream
+    }
+    d->start();
+    return d;
+  };
+
   // composite decoders
   const int N = (int)cfg.comp_in.size();
   std::vector<Decoder *> decs;
   std::vector<AVFrame *> cur;
   if (need_comp) {
     for (int i = 0; i < N; ++i) {
-      auto *d = new Decoder();
-      if (d->open(cfg.comp_in[i].c_str(), dev.ref, tap_for(cfg.comp_in[i])) < 0) {
-        LOGF("comp decoder %d open failed", i);
-        return 1;
-      }
-      d->start();
-      decs.push_back(d);
+      decs.push_back(make_input(cfg.comp_in[i], tap_for(cfg.comp_in[i]), true));
       cur.push_back(av_frame_alloc());
     }
   }
@@ -944,33 +993,22 @@ int run(const Config &cfg, const char *dest, long long max_frames,
   std::map<std::string, AVFrame *> auxf;
   for (auto &a : cfg.aux) {
     if (!need_aux[a.first]) continue;
-    auto *d = new Decoder();
-    if (d->open(a.second.c_str(), dev.ref, tap_for(a.second)) < 0) {
-      LOGF("aux %s open failed", a.first.c_str());
-      return 1;
-    }
-    d->start();
-    auxd[a.first] = d;
+    auxd[a.first] = make_input(a.second, tap_for(a.second), true);
     auxf[a.first] = av_frame_alloc();
   }
 
-  // ---- audio-only inputs + mixer ------------------------------------------
-  // Whatever is left in tap_by_url is a camera nobody decodes video for
-  // (today: blue and bullet). Open those audio-only — no decoder, no GPU.
-  std::vector<Decoder *> audio_only;
-  std::map<std::string, Decoder *> audio_only_by_url;
-  for (auto &kv : tap_by_url) {
-    auto *d = new Decoder();
-    if (d->open(kv.first.c_str(), dev.ref, kv.second, /*need_video=*/false) < 0) {
-      // Non-fatal: that channel goes silent, the rest of the system is fine.
-      LOGF("audio-only input %s open failed — channel silent",
-           kv.second->name().c_str());
-      delete d;
-      continue;
-    }
-    d->start();
-    audio_only.push_back(d);
-    audio_only_by_url[kv.first] = d;
+  // ---- undecoded inputs + mixer --------------------------------------------
+  // Cameras nobody decodes video for (today: blue and bullet): whatever is
+  // left in tap_by_url is listened to, whatever is left in raw_by_url is only
+  // republished. Same connection for both, no video decoder, no GPU.
+  std::vector<Decoder *> undecoded;
+  for (auto &kv : tap_by_url)
+    undecoded.push_back(make_input(kv.first, kv.second, /*need_video=*/false));
+  {
+    std::vector<std::string> rest;
+    for (auto &kv : raw_by_url) rest.push_back(kv.first);
+    for (auto &url : rest)
+      undecoded.push_back(make_input(url, nullptr, /*need_video=*/false));
   }
   std::unique_ptr<audio::Mixer> mixer;
   if (!tap_order.empty()) {
@@ -979,36 +1017,63 @@ int run(const Config &cfg, const char *dest, long long max_frames,
     // transcription consumer.
     mixer = std::make_unique<audio::Mixer>(1, tap_order);
     mixer->start();
-    LOGF("audio: %zu channels -> stdout (%d Hz s16le interleaved), %zu audio-only inputs",
-         tap_order.size(), audio::kSampleRate, audio_only.size());
+    LOGF("audio: %zu channels -> stdout (%d Hz s16le interleaved)",
+         tap_order.size(), audio::kSampleRate);
   }
-  LOGF("decoders: %d composite + %zu aux; cold start...", need_comp ? N : 0,
-       auxd.size());
+  LOGF("inputs: %d composite + %zu aux + %zu undecoded; cold start...",
+       need_comp ? N : 0, auxd.size(), undecoded.size());
 
-  // cold start: wait for a first frame from every decoder
-  for (;;) {
-    bool all = true;
+  // Cold start: give every decoded input a moment to deliver a first frame, so
+  // a healthy system does not open on a black composite. Only a moment — this
+  // used to wait for ALL of them, forever, which made every camera a startup
+  // dependency of every output. Whoever is missing at the deadline is painted
+  // black until it turns up.
+  {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+      bool all = true;
+      for (int i = 0; i < (int)decs.size(); ++i)
+        if (!decs[i]->latest(cur[i])) all = false;
+      for (auto &kv : auxd)
+        if (!kv.second->latest(auxf[kv.first])) all = false;
+      if (all || g_stop || std::chrono::steady_clock::now() >= deadline) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (g_stop) return 1;
+    std::string missing;
     for (int i = 0; i < (int)decs.size(); ++i)
-      if (!decs[i]->latest(cur[i])) all = false;
+      if (!cur[i]->data[0]) missing += " " + decs[i]->log_name();
     for (auto &kv : auxd)
-      if (!kv.second->latest(auxf[kv.first])) all = false;
-    if (all || g_stop) break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      if (!auxf[kv.first]->data[0]) missing += " " + kv.second->log_name();
+    if (!missing.empty())
+      LOGF("starting without a frame from:%s — black until they connect",
+           missing.c_str());
   }
-  if (g_stop) return 1;
 
   // composite work buffer
-  int compW = cfg.comp_w, compH = cfg.comp_h, inW = 0, inH = 0;
+  const int compW = cfg.comp_w, compH = cfg.comp_h;
+  int inW = 0, inH = 0;
   uint8_t *wbY = nullptr, *wbUV = nullptr;
   size_t pY = 0, pUV = 0;
   if (need_comp) {
-    inW = cur[0]->width;
-    inH = cur[0]->height;
-    if (compW == 0) { compW = N * inH; compH = inW; }
+    // Input geometry comes from the config, not from whichever frame arrived
+    // first: the kernel stacks N identical inputs and rotates, so the
+    // composite is (N*inH) x inW and that determines both.
+    if (compW <= 0 || compH <= 0 || N < 1 || N > 8 || compW % N != 0) {
+      LOGF("comp-in needs a comp-dim of (N*inH) x inW for 1..8 inputs "
+           "(got %dx%d for %d)", compW, compH, N);
+      return 1;
+    }
+    inW = compH;
+    inH = compW / N;
     cudaMallocPitch((void **)&wbY, &pY, compW, compH);
     cudaMallocPitch((void **)&wbUV, &pUV, compW, compH / 2);
     LOGF("composite %dx%d from %d x %dx%d", compW, compH, N, inW, inH);
   }
+  // One warning per input whose frames are not the size the layout was built
+  // for (a camera that came back at a different resolution).
+  std::vector<bool> size_warned(decs.size(), false);
 
   const bool to_null = std::strcmp(dest, "null") == 0;
   const bool to_rtsp = std::strncmp(dest, "rtsp://", 7) == 0;
@@ -1056,7 +1121,7 @@ int run(const Config &cfg, const char *dest, long long max_frames,
     };
     for (auto *d : decs) add(d);
     for (auto &kv : auxd) add(kv.second);
-    for (auto *d : audio_only) add(d);
+    for (auto *d : undecoded) add(d);
   }
 
   // Serve the outputs over RTSP ourselves. Registered AFTER the encoders exist
@@ -1105,8 +1170,8 @@ int run(const Config &cfg, const char *dest, long long max_frames,
       }
       o << "],\"sessions\":[";
       bool sfirst = true;
-      if (g_rtsp) {
-        for (const auto &si : g_rtsp->sessions()) {
+      if (rtsp::Server *srv = g_rtsp.load()) {
+        for (const auto &si : srv->sessions()) {
           if (!sfirst) o << ",";
           sfirst = false;
           o << "{\"peer\":\"" << si.peer << "\",\"stream\":\"" << si.stream
@@ -1134,7 +1199,7 @@ int run(const Config &cfg, const char *dest, long long max_frames,
           << ",\"pkts\":" << d->republished_count()
           << ",\"video\":" << (d->has_video() ? "true" : "false") << "}";
       }
-      o << "],\"rtspClients\":" << (g_rtsp ? g_rtsp->client_count() : 0)
+      o << "],\"rtspClients\":" << (g_rtsp.load() ? g_rtsp.load()->client_count() : 0)
         << ",\"webrtcViewers\":" << (g_webrtc ? g_webrtc->viewer_count() : 0)
         << "}";
       return o.str();
@@ -1175,31 +1240,15 @@ int run(const Config &cfg, const char *dest, long long max_frames,
   }
 #endif
 
-  // Map every open decoder by URL so a raw/* entry can attach to the
-  // connection that already exists rather than opening another one.
-  std::map<std::string, Decoder *> by_url;
-  for (int i = 0; i < (int)decs.size(); ++i) by_url[cfg.comp_in[i]] = decs[i];
-  for (auto &a : cfg.aux) { auto it = auxd.find(a.first); if (it != auxd.end()) by_url[a.second] = it->second; }
-  for (auto &kv : audio_only_by_url) by_url[kv.first] = kv.second;
-
   std::unique_ptr<rtsp::Server> rtsp_srv;
   if (rtsp_port > 0) {
     rtsp_srv = std::make_unique<rtsp::Server>();
     for (auto *w : workers)
       rtsp_srv->add_stream(w->name, w->enc_par(), w->enc_time_base());
-    // raw/* passthrough streams, one per camera that has an open connection.
-    for (auto &r : cfg.raw) {
-      auto it = by_url.find(r.second);
-      if (it == by_url.end() || !it->second->video_par()) {
-        LOGF("raw/%s: no open input for %s — skipped", r.first.c_str(), r.second.c_str());
-        continue;
-      }
-      const std::string nm = "raw/" + r.first;
-      rtsp_srv->add_stream(nm, it->second->video_par(), it->second->video_time_base());
-      it->second->set_passthrough(nm);
-    }
+    // The raw/<name> passthroughs are not listed here: each input adds its own
+    // once it has a connection to describe (see Decoder::loop).
     if (rtsp_srv->start(rtsp_port)) {
-      g_rtsp = rtsp_srv.get();
+      g_rtsp.store(rtsp_srv.get());
     } else {
       // Non-fatal: publishing to mediamtx still works, so a taken port must
       // not take the whole compositor down.
@@ -1225,6 +1274,20 @@ int run(const Config &cfg, const char *dest, long long max_frames,
       ci.inH = inH;
       for (int i = 0; i < N; ++i) {
         decs[i]->latest(cur[i]);
+        // No frame yet (this input has never connected): the planes stay null
+        // and the kernel paints that slot black. Same for a frame of the wrong
+        // size — the kernel indexes every input as inW x inH, so anything else
+        // would read outside the frame.
+        if (!cur[i]->data[0]) continue;
+        if (cur[i]->width != inW || cur[i]->height != inH) {
+          if (!size_warned[i]) {
+            size_warned[i] = true;
+            LOGF("input '%s' is %dx%d, layout expects %dx%d — painting it black",
+                 decs[i]->log_name().c_str(), cur[i]->width, cur[i]->height,
+                 inW, inH);
+          }
+          continue;
+        }
         ci.y[i] = cur[i]->data[0];
         ci.uv[i] = cur[i]->data[1];
         ci.pitchY[i] = cur[i]->linesize[0];
@@ -1249,7 +1312,12 @@ int run(const Config &cfg, const char *dest, long long max_frames,
         return {ai->second->data[0], ai->second->data[1],
                 ai->second->linesize[0], ai->second->linesize[1],
                 ai->second->width, ai->second->height};
-      AVFrame *f = built[s];
+      // A prior output whose frame could not be allocated this tick has
+      // nothing to sample. Null planes, like an aux input that has not
+      // delivered a frame yet: the gather kernel paints the piece black.
+      auto bi = built.find(s);
+      if (bi == built.end() || !bi->second) return {nullptr, nullptr, 0, 0, 0, 0};
+      AVFrame *f = bi->second;
       return {f->data[0], f->data[1], f->linesize[0], f->linesize[1],
               f->width, f->height};
     };
