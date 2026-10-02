@@ -80,23 +80,51 @@ roughly every 4.5 days of uptime, not a one-off.
 4. [x] Restore service: ops `f508de7`, deployed 13:23 PDT. Verified: 6 outputs +
        9 raw streams advancing, bullet "channel silent"/"skipped", 549 MiB of
        8 GiB, pump attached.
-5. [ ] **(current)** Tier 2 — layout cameras may be down at startup too:
-   - stitchd: every input opens on its own thread and retries forever; nothing
-     about an input is fatal. Composite members that have no frame paint black
-     (the vstack kernel already does this for a null plane); aux pieces need the
-     same in the crop/scale kernel. Cold start waits a bounded 10 s, not forever.
-     `raw/<name>` registers with the RTSP server on the input's first successful
-     open instead of only at startup (this is fix C).
+5. [x] Tier 2 — layout cameras may be down at startup too: stitchd `d13f287`,
+       supervisor `0c0d7b8`.
+   - stitchd: every input connects on its own thread and retries forever;
+     nothing about an input is fatal. No-frame composite members and aux pieces
+     paint black. Cold start waits a bounded 10 s. `raw/<name>` registers with
+     the RTSP server on the input's first video packet (this is fix C).
    - supervisor: a composite member that will not probe takes a sibling's
-     geometry (the kernel requires identical inputs, so this is the invariant,
-     not a guess). An extra-composite camera that will not probe has no
-     geometry to borrow: its outputs are left out, it is re-probed every 30 s,
-     and stitchd is restarted with the full config once it answers.
-6. [ ] Test Tier 2 on a GPU before pinning (side instance on sentinel, own
-       ports, one dead input that later comes alive).
-7. [ ] Ops pin for Tier 2 — needs the user's yes.
-8. [ ] Watch the next ~week of uptime for the read-loop log line that names the
-       original trigger (see open question 1).
+     geometry (the kernel requires identical inputs — the invariant, not a
+     guess). An extra-composite camera that will not probe has nothing to
+     borrow: its outputs are left out, it is re-probed every 30 s, and stitchd
+     is restarted with the full config once it answers. Same for the main
+     composite if not one member answers.
+6. [x] Tested before pinning — see "How Tier 2 was tested".
+7. [ ] **(current)** Image build for `0c0d7b8`, then the ops pin — needs the
+       user's yes.
+8. [ ] After the pin: confirm on sentinel that `raw/bullet` is listed as an
+       input that is retrying (it is still offline) and everything else is up.
+9. [ ] Watch the next ~week of uptime for the read-loop log line that names the
+       original trigger (open question 1).
+
+## How Tier 2 was tested
+
+sentinel cannot pull the CI image, so stitchd was built from source there in
+the old `stitchd-build:test` image (`cmake` with
+`-DCMAKE_PREFIX_PATH="/opt/ffmpeg;/opt/libdatachannel"`) and run as a side
+instance on ports 8556/8891/8191, reading production's own `raw/*` streams
+through `plans/tmp-rtsp-relay.py` relays so an input could be dead and then
+alive without touching a camera. All removed afterwards.
+
+- Started with a dead composite member, a dead aux and a dead restream-only
+  input: output encoded from the first tick, dead regions black.
+- Started the relays: all three connected, `raw/t2`, `raw/x`, `raw/t3` appeared
+  on the RTSP server (DESCRIBE 200), the composite filled in. No restart.
+- Killed and restarted one relay: `dropped` -> `unavailable` -> `reconnected`,
+  `reconnects` 1, 0 dropped frames on the output.
+- A config with no `comp-in` at all (the all-bays-down shape) ran.
+- Supervisor, with a fake `stitchd` binary: all cameras up generates a config
+  byte-identical to production's running `/tmp/stitchd.conf`; one bay down is
+  identical too (sibling geometry); Foyer down leaves out `entry` only; all
+  bays down leaves `entry` as the only output; Foyer answering 12 s after
+  start restarts stitchd once with all six outputs.
+
+Don't `pkill -f relay.py` over ssh: the pattern matches the remote shell's own
+command line and kills the session mid-script. Use `pkill -f "[r]elay"` and
+keep the literal out of the rest of the command.
 
 ## Findings / gotchas
 
@@ -136,8 +164,8 @@ roughly every 4.5 days of uptime, not a one-off.
 - [x] Root-caused the outage (OOM from a stalled stdout reader + fatal probe).
 - [x] Leak fix + probe fix shipped and deployed; service verified up.
 - [x] Container memory cap in ops.
-- [ ] Tier 2 (layout cameras offline at startup; raw streams return unaided).
-- [ ] Tier 2 pinned in ops.
+- [x] Tier 2 written, tested on the GPU, committed, pushed (`d13f287`, `0c0d7b8`).
+- [ ] Tier 2 image built and pinned in ops (needs the user's yes).
 
 ## Open questions for the user
 
