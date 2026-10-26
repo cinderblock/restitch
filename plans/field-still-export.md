@@ -19,8 +19,7 @@ composite was what was wanted.
 - The still is produced by `stitchd` (C++/CUDA, `compositor/`), which already holds every
   frame on the GPU and already answers `GET /api/snapshot/<name>` on its WebRTC HTTP port with
   a 320 px thumbnail (`encode_snapshot_jpeg` in `compositor/src/main.cpp`, the route in
-  `compositor/src/webrtc.cpp`). The bun supervisor's dashboard (`src/dashboard.ts`, port
-  9000) proxies and caches those thumbnails for its hover previews.
+  `compositor/src/webrtc.cpp`). The bun supervisor's dashboard (`src/dashboard.ts`, port 9000) proxies and caches those thumbnails for its hover previews.
 - `all-field` is 3686×3290; a full frame is ~18 MB of planes back over PCIe and a real MJPEG
   encode, still well inside a frame interval and only on request.
 - Compiling stitchd happens on sentinel in a container (`compositor/README.md`). The
