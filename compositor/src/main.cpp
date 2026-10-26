@@ -436,20 +436,28 @@ private:
   AVRational vtb_{1, 90000}; // written before vpar_ is published
 };
 
-// ---- snapshot: a CUDA NV12 frame -> a small JPEG ---------------------------
+// ---- snapshot: a CUDA NV12 frame -> a JPEG ---------------------------------
 //
 // Everything here already exists in this process: the frame is on the GPU, the
 // downscale is one kernel, and libavcodec (which we link) has an mjpeg encoder.
-// The thumbnail is ~320px wide, so the encode is trivial and the only PCIe
-// traffic is the downscaled planes, not the full frame.
-std::vector<uint8_t> encode_snapshot_jpeg(AVFrame *cuda_frame, int target_w) {
+// At thumbnail size (the dashboard's hover) the encode is trivial and the only
+// PCIe traffic is the downscaled planes. At the frame's own size (target_w of
+// 0: a still someone is going to keep, say a field issue report) it is the
+// whole frame coming back over PCIe, ~18 MB for all-field, and a real encode;
+// still well under a frame interval, and only on request.
+//
+// qscale is the mjpeg encoder's quality, 1 (best) to 31: thumbnails can take
+// 6, a still wants 3 or so.
+std::vector<uint8_t> encode_snapshot_jpeg(AVFrame *cuda_frame, int target_w,
+                                          int qscale) {
   std::vector<uint8_t> out;
   if (!cuda_frame || cuda_frame->format != AV_PIX_FMT_CUDA) return out;
   const int sw = cuda_frame->width, sh = cuda_frame->height;
   if (sw <= 0 || sh <= 0) return out;
 
-  // Even dimensions: 4:2:0 has no half chroma samples.
-  int dw = std::min(target_w, sw) & ~1;
+  // Even dimensions: 4:2:0 has no half chroma samples. The kernel is a box
+  // filter, which at 1:1 is a copy, so "full" is just target_w = source width.
+  int dw = (target_w > 0 ? std::min(target_w, sw) : sw) & ~1;
   int dh = (int)std::lround((double)dw * sh / sw) & ~1;
   if (dw < 2 || dh < 2) return out;
 
@@ -491,7 +499,7 @@ std::vector<uint8_t> encode_snapshot_jpeg(AVFrame *cuda_frame, int target_w) {
   ctx->height = dh;
   ctx->time_base = AVRational{1, 1};
   ctx->flags |= AV_CODEC_FLAG_QSCALE;
-  ctx->global_quality = FF_QP2LAMBDA * 6; // visually clean at thumbnail size
+  ctx->global_quality = FF_QP2LAMBDA * qscale;
   if (avcodec_open2(ctx, enc, nullptr) >= 0) {
     host->quality = ctx->global_quality;
     host->pts = 0;
@@ -1204,12 +1212,14 @@ int run(const Config &cfg, const char *dest, long long max_frames,
         << "}";
       return o.str();
     });
-    // Thumbnails come from the frames this process already holds: composed
+    // Pictures come from the frames this process already holds: composed
     // frames for the outputs, decoded camera frames for the raw/<name>
     // republishes. Replaces one ffmpeg spawn per stream per minute, each of
     // which reconnected over RTSP and decoded a full frame for a 320px image.
+    // `width` is what the caller asked for (0: the frame's own size).
     webrtc_srv->set_snapshot_provider(
-        [&workers, &all_inputs](const std::string &want) -> std::vector<uint8_t> {
+        [&workers, &all_inputs](const std::string &want,
+                                int width) -> std::vector<uint8_t> {
           AVFrame *f = av_frame_alloc();
           if (!f) return {};
           bool got = false;
@@ -1226,7 +1236,11 @@ int run(const Config &cfg, const char *dest, long long max_frames,
                 break;
               }
           std::vector<uint8_t> jpeg;
-          if (got) jpeg = encode_snapshot_jpeg(f, 320);
+          // A thumbnail can be compressed hard; a still is kept as a record of
+          // what the field looked like, so it gets the quality to show it.
+          if (got)
+            jpeg = encode_snapshot_jpeg(f, width,
+                                        width > 0 && width <= 640 ? 6 : 3);
           av_frame_free(&f);
           return jpeg;
         });

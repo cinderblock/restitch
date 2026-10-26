@@ -61,7 +61,7 @@ struct Server::Viewer {
 struct Server::Impl {
   Options opt;
   std::function<std::string()> status_fn;
-  std::function<std::vector<uint8_t>(const std::string &)> snapshot_fn;
+  std::function<std::vector<uint8_t>(const std::string &, int)> snapshot_fn;
   rtc::Configuration rtc_cfg;
 
   std::map<std::string, AVCodecParameters *> streams;
@@ -91,7 +91,7 @@ void Server::set_status_provider(std::function<std::string()> fn) {
 }
 
 void Server::set_snapshot_provider(
-    std::function<std::vector<uint8_t>(const std::string &)> fn) {
+    std::function<std::vector<uint8_t>(const std::string &, int)> fn) {
   impl_->snapshot_fn = std::move(fn);
 }
 Server::~Server() { stop(); }
@@ -349,7 +349,9 @@ void Server::handle_http(int fd) {
     return;
   }
 
-  // Thumbnails, from the frames this process already holds.
+  // Pictures of the newest frame, which this process already holds. No query
+  // (the dashboard's hover) is a 320px thumbnail; ?width=<px> picks a size and
+  // ?width=full is the frame as composed, for anything that keeps the picture.
   {
     const std::string pfx = "/api/snapshot/";
     std::string u = uri;
@@ -358,8 +360,30 @@ void Server::handle_http(int fd) {
     if (u.rfind(pfx, 0) == 0) {
       std::string sname = u.substr(pfx.size());
       while (!sname.empty() && sname.back() == '/') sname.pop_back();
-      std::vector<uint8_t> jpeg =
-          impl_->snapshot_fn ? impl_->snapshot_fn(sname) : std::vector<uint8_t>();
+      int width = 320;
+      if (q != std::string::npos) {
+        const std::string query = uri.substr(q + 1);
+        size_t at = query.find("width=");
+        while (at != std::string::npos && at != 0 && query[at - 1] != '&')
+          at = query.find("width=", at + 1);
+        if (at != std::string::npos) {
+          std::string v = query.substr(at + 6);
+          const size_t amp = v.find('&');
+          if (amp != std::string::npos) v = v.substr(0, amp);
+          if (v == "full") {
+            width = 0;
+          } else {
+            try {
+              width = std::clamp(std::stoi(v), 16, 16384);
+            } catch (...) {
+              // Not a number: the thumbnail it is.
+            }
+          }
+        }
+      }
+      std::vector<uint8_t> jpeg = impl_->snapshot_fn
+                                      ? impl_->snapshot_fn(sname, width)
+                                      : std::vector<uint8_t>();
       if (jpeg.empty()) {
         respond("503 Service Unavailable", "", "no frame yet\n", "text/plain");
       } else {

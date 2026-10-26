@@ -116,6 +116,11 @@ With the default config, streams are available at:
   is UDP on port 8189 — for off-LAN viewers, forward that port and list a
   publicly reachable name in `webrtc.additional_hosts`)
 - `http://host:9000/` — dashboard
+- `http://host:9000/api/still/<stream-name>` — a JPEG of the stream's newest
+  frame at full size, fresh each request (`?width=<px>` to shrink it). For
+  anything that keeps the picture, e.g. the practice-field scheduler's field
+  issue reports. `/api/snapshot/<stream-name>` is the dashboard's own 320px
+  thumbnail, cached for about a minute.
 - `http://host:9997/v3/paths/list` — mediamtx control API
 
 ## Hardware Encoding

@@ -187,6 +187,47 @@ async function grabSnapshot(
   return inflight;
 }
 
+// --- Stills: a fresh frame at full size, on request ---
+//
+// The thumbnail route above is cached for a minute and 320px wide, which is
+// right for a hover and wrong for a picture someone keeps: the practice-field
+// scheduler attaches one of these to a field issue report, and wants the field
+// as it is now, at a size you can read a broken bracket in. Never cached;
+// coalesced per path+width so a burst of identical requests costs stitchd one
+// encode (all-field is ~18 MB back over PCIe and a real JPEG encode).
+const stillInflight = new Map<string, Promise<Uint8Array | null>>();
+
+async function grabStill(
+  snapshotBase: string,
+  path: string,
+  width: string | null
+): Promise<Uint8Array | null> {
+  if (!/^[\w-]+(\/[\w-]+)*$/.test(path)) return null;
+  let w = "full";
+  if (width !== null) {
+    const n = Number.parseInt(width, 10);
+    if (!Number.isFinite(n) || n < 16 || n > 16384) return null;
+    w = String(n);
+  }
+  const key = `${path}?${w}`;
+  let inflight = stillInflight.get(key);
+  if (!inflight) {
+    inflight = (async () => {
+      try {
+        const r = await fetch(`${snapshotBase}${path}?width=${w}`);
+        if (!r.ok) return null;
+        const buf = new Uint8Array(await r.arrayBuffer());
+        return buf.length ? buf : null;
+      } catch {
+        return null;
+      }
+    })();
+    stillInflight.set(key, inflight);
+    inflight.finally(() => stillInflight.delete(key));
+  }
+  return inflight;
+}
+
 /**
  * Player page for an HLS stream, served at /hls/<name> (and, through the public
  * Caddy mount, at /all-field). The pre-stitchd stack served an equivalent page and the
@@ -408,6 +449,20 @@ export function startDashboard(
           headers: {
             "content-type": "image/jpeg",
             "cache-control": "no-cache",
+          },
+        });
+      }
+
+      // Still: /api/still/<path>[?width=<px>] — the newest frame, fresh, at its
+      // own size unless a width is given. See grabStill.
+      if (url.pathname.startsWith("/api/still/")) {
+        const path = decodeURIComponent(url.pathname.slice("/api/still/".length));
+        const jpeg = await grabStill(snapshotBase, path, url.searchParams.get("width"));
+        if (!jpeg) return new Response("no frame", { status: 502 });
+        return new Response(jpeg, {
+          headers: {
+            "content-type": "image/jpeg",
+            "cache-control": "no-store",
           },
         });
       }
