@@ -64,11 +64,10 @@ composite was what was wanted.
        `/api/still/all-field` → 200, 3686×3290, 2.3 MB, 0.13 s, `cache-control: no-store`;
        `?width=800` → 800×714, 166 KB; bare `/api/snapshot/all-field` still 320×286 with
        `no-cache`, so the dashboard hovers are untouched. The picture is the composite.
-8. [ ] Scheduler compose: `FIELD_CAMERAS: Field=http://sentinel.tsl:9000/api/still/all-field`
-       is written, uncommitted, in the ops worktree `C:/Users/camer/git/ops-restitch-pin`
-       (branch `restitch-pin-f86818a` off `origin/master`); waits on the user's per-change yes.
-       It only does something once a scheduler build with the feature (`d4f848f` or later)
-       is pushed and pinned in `servers/steamboat/stacks/practice-field-scheduler/pin.json`.
+8. [x] Scheduler compose: `FIELD_CAMERAS: Field=http://sentinel.tsl:9000/api/still/all-field`
+       authorized and shipped in ops `981a277` together with the scheduler pin `478f324`, live on
+       steamboat 1:20 PM PDT (20:20Z) 2026-10-26. The report dialog on the live site offers
+       "Include a frame from the shop camera (Field)", so the line reached the container.
 
 ## Findings / gotchas
 
