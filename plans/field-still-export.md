@@ -58,11 +58,18 @@ composite was what was wanted.
 5. [x] `README.md`: the two URLs documented.
 6. [x] `bun run check` (supervisor typecheck) clean; stitchd compiled clean on sentinel in
        `stitchd-build:test` (`[100%] Built target stitchd`, 2026-10-26 ~5:49 PM PDT).
-7. [ ] Push the branch, let CI build the image, pin it on sentinel (ops), then verify
-       `curl -o f.jpg http://sentinel.tsl:9000/api/still/all-field` is a 3686×3290 JPEG and
-       the dashboard hovers still work.
-8. [ ] Scheduler compose: `FIELD_CAMERAS="Field=http://sentinel.tsl:9000/api/still/all-field"`
-       (ops change, needs the user's per-change yes).
+7. [x] Pushed: `master` fast-forwarded to `f86818a` on 2026-10-26 at 12:28 PM PDT (19:28Z);
+       CI run 40386990134 built it in about 5 minutes (registry cache held). Pinned in ops
+       `8536ed7` (digest `sha256:23fea754…`), deploy run 40387918002 green, live on sentinel
+       by 12:50 PM PDT (19:50Z). Verified from this machine:
+       `/api/still/all-field` → 200, 3686×3290, 2.3 MB, 0.13 s, `cache-control: no-store`;
+       `?width=800` → 800×714, 166 KB; bare `/api/snapshot/all-field` still 320×286 with
+       `no-cache`, so the dashboard hovers are untouched. The picture is the composite.
+8. [ ] Scheduler compose: `FIELD_CAMERAS: Field=http://sentinel.tsl:9000/api/still/all-field`
+       is written, uncommitted, in the ops worktree `C:/Users/camer/git/ops-restitch-pin`
+       (branch `restitch-pin-f86818a` off `origin/master`); waits on the user's per-change yes.
+       It only does something once a scheduler build with the feature (`d4f848f` or later)
+       is pushed and pinned in `servers/steamboat/stacks/practice-field-scheduler/pin.json`.
 
 ## Findings / gotchas
 
@@ -75,17 +82,27 @@ composite was what was wanted.
   dev-container compile is the fastest pre-push check and matched the Dockerfile's
   `compositor-builder` stage (same `/opt/ffmpeg`, same libdatachannel prefix).
 - Not exercised at runtime yet: that needs the GPU and the camera config, i.e. a deploy.
+- The ops checkout at `C:/Users/camer/git/Personal Projects/ops` is a shared tree: another
+  thread's unpushed commit, 22 behind origin, edits in flight. The pin commit is made in a
+  separate worktree off `origin/master` and pushed as `HEAD:master` (a fast-forward), so
+  nothing in that tree is rebased or touched.
+- steamboat resolves `sentinel.tsl` (10.255.0.20) and gets the thumbnail route at 200; its
+  containers use Docker's embedded DNS, which forwards to the same UniFi resolvers
+  (10.0.100.1, 10.255.0.1, 10.55.0.1), so the scheduler container should reach it too.
+  Not proven from inside the container (no docker-group access over ssh); the first filed
+  report proves it.
 
 ## Progress log
 
 - [x] 2026-10-26: patch written, supervisor typecheck clean, stitchd compiled on sentinel,
       committed on `field-still-export`.
-- [ ] Pushed / built / pinned / verified live.
+- [x] 2026-10-26 12:28–12:50 PM PDT (19:28–19:50Z): pushed, built, pinned (ops `8536ed7`),
+      verified live. Branch `field-still-export` also pushed, for the record.
 
 ## Open questions for the user
 
-1. Push `field-still-export` and merge to `master`? Pushing triggers the image build in CI.
-   Pinning the new digest on sentinel is an ops change and needs your per-change yes.
+1. ~~Push `field-still-export` and merge to `master`?~~ Both answered "ok" on 2026-10-26:
+   pushed, and the pin is authorized.
 
 ## Things not to do
 
