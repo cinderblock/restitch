@@ -27,6 +27,16 @@ on:
       - bun.lock
       - tsconfig.json
       - .github/workflows/build.yml
+  pull_request:
+    branches: [master]
+    paths:
+      - src/**
+      - compositor/**
+      - containers/restitch/**
+      - package.json
+      - bun.lock
+      - tsconfig.json
+      - .github/workflows/build.yml
   workflow_dispatch:
 
 env:
@@ -85,7 +95,8 @@ jobs:
         with:
           context: .
           file: containers/restitch/Dockerfile
-          push: true
+          # Build only on a pull request: nothing is published until it reaches master.
+          push: ${{ github.event_name != 'pull_request' }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}:${{ github.sha }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}:latest
@@ -99,9 +110,10 @@ jobs:
           # repo and these layers blow straight through it, so it would thrash
           # and rebuild whisper/ffmpeg every run.
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}:buildcache,mode=max
+          cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/{1}:buildcache,mode=max', env.REGISTRY, env.IMAGE_PREFIX) || '' }}
 
       - name: Summarize how to deploy this build
+        if: github.event_name != 'pull_request'
         run: |
           {
             echo "### Image published"
