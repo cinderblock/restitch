@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.28
 #
 # Single-container restitch image. One bun process supervises:
 #   - stitchd (CUDA compositor; also serves RTSP, HLS and WebRTC/WHEP, and
