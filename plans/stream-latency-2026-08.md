@@ -469,3 +469,53 @@ to slip in.
 **Untested by me:** VLC's actual behaviour on `input-repeat` across a restart.
 The endpoint and its contents are verified; whether VLC reconnects the way its
 documentation says needs one real outage to confirm — the next deploy will do it.
+
+## 2026-11-09: `entry` in VLC is 2-3 s late — the server is not
+
+Asked: can the entry stream be closer to realtime without losing the frame
+sync? Measured against the Foyer camera's OSD clock (Doorbell's OSD is cropped
+out of `entry`), 2026-11-09 ~11:30 AM PST:
+
+- **Camera → NVR → sentinel:** 0.04-0.53 s (ffmpeg on sentinel,
+  `-use_wallclock_as_timestamps 1 -copyts`, arrival time vs OSD).
+- **stitchd `entry` output:** ~0.3-0.8 s. The OSD second ticks irregularly
+  through stitchd's newest-frame-per-tick pacing, so this is a band, not a
+  number. stitchd adds a few hundred ms at most.
+- **Server state for the one `entry` viewer:** `queued 0`, `dropped 0`, Send-Q
+  622 B. Nothing is buffered server-side.
+- **The viewer's long-running VLC** (started 2026-11-06 4:13 PM PST via
+  `~/scripts/Start-EntryCam.ps1`, flags `--network-caching=300` only): showing
+  OSD 11:33:58 at real time ~11:34:01.0, i.e. **2-3 s late**.
+- **Fresh headless VLCs, same stream** (20 s each):
+  - `--network-caching=300`: ~1.35 s
+  - `+ --clock-jitter=0`: same, as expected on a fresh session
+  - `--network-caching=100 --clock-jitter=0`: ~1.1 s
+
+So a fresh VLC is ~1.1-1.4 s behind the camera and the multi-day one had
+drifted another 1-1.5 s on top. The launcher bypasses the `/vlc/<name>.m3u`
+playlist, so it never got the playlist's `clock-jitter=0`.
+
+Changed `~/scripts/Start-EntryCam.ps1` (not in git): `network-caching=150`,
+`clock-jitter=0`, `input-repeat=65535`. Nothing server-side changed; frame
+pairing in stitchd is untouched by any of this.
+
+### How to measure this again
+
+- **This PC's clock was 8.6 s slow** (Windows Time service stopped). Correct
+  every local timestamp against sentinel (`ssh sentinel date +%s.%N`, take the
+  lowest-RTT sample) or the numbers are nonsense: the first raw read said VLC
+  was 6 s *ahead* of reality.
+- Headless VLC frame capture: `-I dummy --vout vdummy --avcodec-hw=none
+  --video-filter=scene --scene-ratio=10 --scene-path=<dir>`. Without
+  `--avcodec-hw=none` the D3D11 opaque frames can't be converted for the scene
+  filter and it silently writes nothing.
+- `-t` with `-copyts` on an RTSP input cuts every frame (the timestamps are
+  epoch-sized); use `-frames:v N`.
+
+### Left to confirm
+
+- [ ] Whether `clock-jitter=0` actually holds a multi-day VLC session near
+      ~1.1-1.3 s. Re-measure after the relaunched window has run a few days.
+- What remains (~1.1 s) is ~0.3-0.8 s server-side, most of it the camera and
+  the NVR, plus VLC's own buffer and decode. Going lower means a different
+  player (the WHEP page, `/whep/entry`), not server changes.
