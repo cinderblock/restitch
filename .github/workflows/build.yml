@@ -48,7 +48,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Bun version the image ships
+        # Test on the runtime that runs in production, not whatever is latest.
+        id: bun
+        run: |
+          set -euo pipefail
+          v="$(sed -n 's/^ARG BUN_VERSION=//p' containers/restitch/Dockerfile)"
+          test -n "$v"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ steps.bun.outputs.version }}
+
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun test
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
