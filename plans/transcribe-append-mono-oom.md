@@ -63,8 +63,11 @@ instead of logging a stack trace per chunk forever.
 - [x] Consumer supervision + exit escalation (`src/transcribe.ts`, `src/index.ts`).
 - [x] Rate-limited consumer-throw logging (`src/process.ts`).
 - [x] Tests: `src/transcribe.test.ts` (8 pass on Bun 1.3.0 and 1.4.4).
-- [ ] PR merged to master and the image built: report the digest to the
-      requesting thread. The ops pin and deploy are owned there, not here.
+- [x] [PR #9](https://github.com/cinderblock/restitch/pull/9) merged (`7e21efe`, `3842b46`);
+      master build run 46074973598 green; image
+      `ghcr.io/cinderblock/restitch@sha256:ae352531fd77a09b114a509783a295effa0094c53dadf5617044d4443d8be261`
+      (tags `3842b46…`, `latest`).
+- [ ] ops pin + deploy: owned by the requesting thread, not here.
 
 ## Not done here
 
