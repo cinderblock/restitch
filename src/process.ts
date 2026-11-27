@@ -80,6 +80,8 @@ export function launchManaged(
     lastStdoutAt = onStdout ? Date.now() : null;
     if (onStdout && child.stdout) {
       const stdoutReader = child.stdout.getReader();
+      let consumerThrows = 0;
+      let lastConsumerThrowLog = -Infinity;
       (async () => {
         try {
           while (true) {
@@ -94,10 +96,26 @@ export function launchManaged(
             // the child ever writes again. That is how the supervisor reached
             // 122 GB and took the host into a global OOM on 2026-10-02 — at
             // stitchd's PCM rate, 1.1 GB an hour, with nothing in the log.
+            //
+            // Consumers are expected to handle their own failures (the PCM one
+            // is rebuilt by superviseConsumer). One that throws anyway throws
+            // on every chunk, so the full error is logged at most once a
+            // minute, with a count of what was dropped meanwhile — a trace per
+            // chunk is what filled sentinel's disk with 79 GB of log in 2026-11.
             try {
               onStdout(value);
             } catch (e) {
-              console.error(`[${name}] stdout consumer threw — chunk dropped:`, e);
+              consumerThrows++;
+              const now = Date.now();
+              if (now - lastConsumerThrowLog >= 60_000) {
+                console.error(
+                  `[${name}] stdout consumer threw — ${consumerThrows} chunk(s) dropped ` +
+                    `since the last report:`,
+                  e
+                );
+                lastConsumerThrowLog = now;
+                consumerThrows = 0;
+              }
             }
           }
         } catch (e) {

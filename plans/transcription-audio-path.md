@@ -205,9 +205,9 @@ What the diagram makes obvious:
        for. Moving audio into stitchd deletes the reader rather than tuning it,
        so the bug cannot recur. stitchd already demuxes these streams and throws
        the audio away at main.cpp:130. See the VERDICT section.
-5. [ ] Optional, on its own merits: replace `appendMono`'s grow-and-copy with a
-       fixed-size ring buffer. Not the bottleneck, but it is a genuine O(n)
-       -per-chunk wart with real allocation churn.
+5. [x] Replace `appendMono`'s grow-and-copy with a fixed-size ring buffer.
+       Done after it took sentinel down: see
+       `plans/transcribe-append-mono-oom.md`.
 
 ## Instrumentation (shipped `d70e016`) — how to read it
 

@@ -235,33 +235,94 @@ export interface LiveStats {
 }
 
 /**
- * Build the PCM consumer (max-abs mono mix, per-channel RMS, silence
- * detection, whisper dispatch) and optionally the ffmpeg that feeds it.
+ * The most recent `capacity` mono samples, in one buffer allocated up front.
  *
- * `spawnPump: false` returns just the consumer, for when stitchd produces the
- * merged N-channel stream itself — same bytes, same channel order, one fewer
- * process and ten fewer RTSP readers.
+ * Samples are addressed by absolute index since the pump started (`start` is
+ * the oldest still held, `end` one past the newest). Appending past capacity
+ * overwrites the oldest audio — that is the policy, not an accident: the pump
+ * sizes the ring to the longest stretch a segment can ever need, so anything
+ * older is audio nobody will ask for again, and a request that reaches past
+ * `start` anyway is refused by `read` for the caller to report.
+ *
+ * This replaces a grow-and-copy buffer that reallocated and copied its whole
+ * ~730 KB contents on every append (>= 10 per second, roughly 13 MB/s of
+ * large-ArrayBuffer churn, forever). After days of that, Bun began failing those
+ * allocations with "RangeError: Out of memory" on every PCM chunk.
  */
-function startCombinedPump(
+export class MonoRing {
+  private readonly buf: Int16Array;
+  private written = 0;
+
+  constructor(readonly capacity: number) {
+    if (!Number.isInteger(capacity) || capacity <= 0) {
+      throw new RangeError(`MonoRing capacity must be a positive integer, got ${capacity}`);
+    }
+    this.buf = new Int16Array(capacity);
+  }
+
+  /** Absolute index of the oldest sample still held. */
+  get start(): number {
+    return Math.max(0, this.written - this.capacity);
+  }
+
+  /** Absolute index one past the newest sample. */
+  get end(): number {
+    return this.written;
+  }
+
+  append(samples: Int16Array): void {
+    let src = samples;
+    if (src.length > this.capacity) {
+      // Only the newest `capacity` of these can be held; the rest would be
+      // overwritten by this same call.
+      this.written += src.length - this.capacity;
+      src = src.subarray(src.length - this.capacity);
+    }
+    const at = this.written % this.capacity;
+    const first = Math.min(src.length, this.capacity - at);
+    this.buf.set(src.subarray(0, first), at);
+    if (first < src.length) this.buf.set(src.subarray(first), 0);
+    this.written += src.length;
+  }
+
+  /** A copy of samples [from, to), or null if any of it is no longer (or not
+   *  yet) held. */
+  read(from: number, to: number): Int16Array | null {
+    if (from < this.start || to > this.end || from > to) return null;
+    const out = new Int16Array(to - from);
+    const at = from % this.capacity;
+    const first = Math.min(out.length, this.capacity - at);
+    out.set(this.buf.subarray(at, at + first), 0);
+    if (first < out.length) out.set(this.buf.subarray(0, out.length - first), first);
+    return out;
+  }
+}
+
+/** Sends one segment of 16 kHz mono s16le to whisper and returns its text. */
+export type SegmentTranscriber = (pcm: Uint8Array) => Promise<string>;
+
+/**
+ * Build the PCM consumer: max-abs mono mix, per-channel RMS, silence
+ * detection, whisper dispatch. stitchd produces the merged N-channel stream it
+ * reads.
+ */
+export function startCombinedPump(
   cameras: Camera[],
   config: Config,
-  whisperUrl: string,
+  transcribeSegment: SegmentTranscriber,
   ring: RingBuffer,
   stats: LiveStats
-): { onPcm: (chunk: Uint8Array) => void } {
+): { onPcm: (chunk: Uint8Array) => void; mono: MonoRing } {
   const t = config.transcription;
   const N = cameras.length;
   const SAMPLE_RATE = 16000;
   const BYTES_PER_SAMPLE = 2;
   const GROUP_SIZE = N * BYTES_PER_SAMPLE; // bytes per output sample (one timestep across all channels)
-  const MONO_BYTES_PER_SEC = SAMPLE_RATE * BYTES_PER_SAMPLE;
 
-  const PAD_BYTES = Math.floor((t.pad_ms / 1000) * MONO_BYTES_PER_SEC);
-  const MIN_SEG_BYTES = Math.floor(t.min_segment_seconds * MONO_BYTES_PER_SEC);
-  const MAX_SEG_BYTES = Math.floor(t.max_segment_seconds * MONO_BYTES_PER_SEC);
-  const KEEP_BYTES = Math.floor(
-    (t.silence_min_seconds + t.max_segment_seconds + 2) * MONO_BYTES_PER_SEC
-  );
+  // Everything below is in mono samples, absolute since the pump started.
+  const PAD = Math.floor((t.pad_ms / 1000) * SAMPLE_RATE);
+  const MIN_SEG = Math.floor(t.min_segment_seconds * SAMPLE_RATE);
+  const MAX_SEG = Math.floor(t.max_segment_seconds * SAMPLE_RATE);
   const RMS_WINDOW_SAMPLES = Math.max(
     1,
     Math.floor((SAMPLE_RATE * t.rms_window_ms) / 1000)
@@ -272,15 +333,27 @@ function startCombinedPump(
   // RMS threshold compared as integer amplitude (16-bit range).
   const THRESHOLD_AMP = Math.pow(10, t.silence_threshold_db / 20) * 32768;
 
-  // --- Rolling mono PCM buffer ---
-  let monoBuffer = new Uint8Array(0);
-  let firstMonoByte = 0;
-  let nextMonoByte = 0;
-  let leftoverBytes = new Uint8Array(0); // unparsed bytes from prev chunk
+  // --- Rolling mono PCM, fixed size ---
+  // The longest history a segment can need: a speech run is force-flushed once
+  // it passes MAX_SEG (checked each window, and a pending/speaking flicker can
+  // carry it one window further), a segment ended by silence is flushed
+  // SILENCE_MIN after it ends, and each side gets PAD. One second of slack on
+  // top. A segment that still reaches past this is dropped loudly in
+  // flushSegment.
+  const mono = new MonoRing(
+    MAX_SEG + SILENCE_MIN_SAMPLES + 2 * PAD + 2 * RMS_WINDOW_SAMPLES + SAMPLE_RATE
+  );
+  // A chunk can end mid-timestep; the bytes of that partial group wait here.
+  const partial = new Uint8Array(GROUP_SIZE);
+  let partialLen = 0;
+  // Mixed samples of the chunk being processed. Reused; grows to the largest
+  // chunk seen, which the pipe bounds.
+  let scratch = new Int16Array(0);
 
   // --- Per-camera RMS history (one bin per completed RMS window) ---
+  // Trimmed with the ring, so it holds at most mono.capacity / window bins.
   type RmsBin = { sampleOffset: number; perCam: number[] };
-  let rmsHistory: RmsBin[] = [];
+  const rmsHistory: RmsBin[] = [];
 
   // --- Current window accumulators ---
   let windowSamples = 0;
@@ -289,8 +362,8 @@ function startCombinedPump(
 
   // --- Silence-detection state machine ---
   let state: "silent" | "speaking" | "pending" = "silent";
-  let speechStartByte = 0;
-  let silencePotentialStartByte = 0;
+  let speechStart = 0;
+  let silencePotentialStart = 0;
   let silencePendingSamples = 0;
 
   let inflight = 0;
@@ -345,66 +418,60 @@ function startCombinedPump(
 
   function appendMono(samples: Int16Array): void {
     if (samples.length === 0) return;
-    const bytes = new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength);
-    const merged = new Uint8Array(monoBuffer.length + bytes.length);
-    merged.set(monoBuffer, 0);
-    merged.set(bytes, monoBuffer.length);
-    monoBuffer = merged;
-    nextMonoByte += bytes.length;
-
-    if (monoBuffer.length > KEEP_BYTES + SAMPLE_RATE) {
-      const trim = monoBuffer.length - KEEP_BYTES;
-      monoBuffer = monoBuffer.slice(trim);
-      firstMonoByte += trim;
-      const sampleCutoff = firstMonoByte / BYTES_PER_SAMPLE;
-      while (rmsHistory.length > 0 && rmsHistory[0]!.sampleOffset < sampleCutoff) {
-        rmsHistory.shift();
-      }
-    }
+    mono.append(samples);
+    const cutoff = mono.start;
+    let drop = 0;
+    while (drop < rmsHistory.length && rmsHistory[drop]!.sampleOffset < cutoff) drop++;
+    if (drop > 0) rmsHistory.splice(0, drop);
   }
 
-  async function flushSegment(startByte: number, endByte: number): Promise<void> {
+  /** Cut [start, end) (plus padding) out of the ring now, then transcribe it
+   *  in the background. */
+  function flushSegment(start: number, end: number): void {
     if (inflight >= MAX_INFLIGHT) {
       console.warn(
         `[combined] ${inflight} segments already waiting on whisper-server — dropped one`
       );
       return;
     }
-    inflight++;
-    try {
-      const padStart = Math.max(firstMonoByte, startByte - PAD_BYTES);
-      const padEnd = Math.min(nextMonoByte, endByte + PAD_BYTES);
-      if (padEnd - padStart < MIN_SEG_BYTES) return;
-      const bufStart = padStart - firstMonoByte;
-      const bufEnd = padEnd - firstMonoByte;
-      if (bufStart < 0 || bufEnd > monoBuffer.length) {
-        console.warn("[combined] segment out of buffer range — dropped");
-        return;
-      }
-      const pcm = monoBuffer.slice(bufStart, bufEnd);
-
-      // Compute per-camera mean RMS across all bins that fall inside the
-      // unpadded segment [startByte, endByte).
-      const startSample = startByte / BYTES_PER_SAMPLE;
-      const endSample = endByte / BYTES_PER_SAMPLE;
-      const sumSq = new Float64Array(N);
-      let bins = 0;
-      for (const bin of rmsHistory) {
-        if (bin.sampleOffset >= startSample && bin.sampleOffset < endSample) {
-          for (let c = 0; c < N; c++) {
-            const r = bin.perCam[c]!;
-            sumSq[c]! += r * r;
-          }
-          bins++;
-        }
-      }
-
-      const text = await transcribe(
-        whisperUrl,
-        pcm,
-        t.language,
-        t.initial_prompt
+    if (start < mono.start) {
+      // The ring is sized so this cannot happen; if it does, the sizing is
+      // wrong and every long segment is being lost — say so, with numbers.
+      console.error(
+        `[combined] segment of ${((end - start) / SAMPLE_RATE).toFixed(1)}s starts ` +
+          `${((mono.start - start) / SAMPLE_RATE).toFixed(1)}s before the oldest audio held ` +
+          `(ring holds ${(mono.capacity / SAMPLE_RATE).toFixed(1)}s) — dropped`
       );
+      return;
+    }
+    const padStart = Math.max(mono.start, start - PAD);
+    const padEnd = Math.min(mono.end, end + PAD);
+    if (padEnd - padStart < MIN_SEG) return;
+    // In range by construction: mono.start <= padStart < padEnd <= mono.end.
+    const audio = mono.read(padStart, padEnd)!;
+    const pcm = new Uint8Array(audio.buffer, audio.byteOffset, audio.byteLength);
+
+    // Compute per-camera mean RMS across all bins that fall inside the
+    // unpadded segment [start, end).
+    const sumSq = new Float64Array(N);
+    let bins = 0;
+    for (const bin of rmsHistory) {
+      if (bin.sampleOffset >= start && bin.sampleOffset < end) {
+        for (let c = 0; c < N; c++) {
+          const r = bin.perCam[c]!;
+          sumSq[c]! += r * r;
+        }
+        bins++;
+      }
+    }
+
+    inflight++;
+    void attribute(pcm, sumSq, bins).finally(() => inflight--);
+  }
+
+  async function attribute(pcm: Uint8Array, sumSq: Float64Array, bins: number): Promise<void> {
+    try {
+      const text = await transcribeSegment(pcm);
       if (!text) return;
 
       // Attribution
@@ -446,8 +513,6 @@ function startCombinedPump(
       stats.last_segment_at = now;
     } catch (e) {
       console.error("[combined] transcribe failed:", e);
-    } finally {
-      inflight--;
     }
   }
 
@@ -458,10 +523,7 @@ function startCombinedPump(
     const perCam = new Array<number>(N);
     for (let c = 0; c < N; c++) perCam[c] = Math.sqrt(windowChanSumSq[c]! / samples);
 
-    rmsHistory.push({
-      sampleOffset: nextMonoByte / BYTES_PER_SAMPLE - samples,
-      perCam,
-    });
+    rmsHistory.push({ sampleOffset: mono.end - samples, perCam });
 
     // Live stats for the dashboard
     stats.mono_rms_db = monoRms > 0 ? 20 * Math.log10(monoRms / 32768) : -100;
@@ -474,10 +536,10 @@ function startCombinedPump(
     const prevState = state;
     if (state === "silent" && above) {
       state = "speaking";
-      speechStartByte = nextMonoByte - samples * BYTES_PER_SAMPLE;
+      speechStart = mono.end - samples;
     } else if (state === "speaking" && !above) {
       state = "pending";
-      silencePotentialStartByte = nextMonoByte - samples * BYTES_PER_SAMPLE;
+      silencePotentialStart = mono.end - samples;
       silencePendingSamples = samples;
     } else if (state === "pending") {
       if (above) {
@@ -486,8 +548,8 @@ function startCombinedPump(
       } else {
         silencePendingSamples += samples;
         if (silencePendingSamples >= SILENCE_MIN_SAMPLES) {
-          if (silencePotentialStartByte > speechStartByte) {
-            void flushSegment(speechStartByte, silencePotentialStartByte);
+          if (silencePotentialStart > speechStart) {
+            flushSegment(speechStart, silencePotentialStart);
           }
           state = "silent";
           silencePendingSamples = 0;
@@ -505,34 +567,17 @@ function startCombinedPump(
     for (let c = 0; c < N; c++) windowChanSumSq[c] = 0;
 
     // Emergency flush for absurdly long speech
-    if (
-      state === "speaking" &&
-      nextMonoByte - speechStartByte > MAX_SEG_BYTES
-    ) {
-      void flushSegment(speechStartByte, nextMonoByte);
-      speechStartByte = nextMonoByte;
+    if (state === "speaking" && mono.end - speechStart > MAX_SEG) {
+      flushSegment(speechStart, mono.end);
+      speechStart = mono.end;
     }
   }
 
-  const onStdout = (chunk: Uint8Array): void => {
-    recordBytes(chunk.length);
-    let data: Uint8Array;
-    if (leftoverBytes.length > 0) {
-      data = new Uint8Array(leftoverBytes.length + chunk.length);
-      data.set(leftoverBytes, 0);
-      data.set(chunk, leftoverBytes.length);
-    } else {
-      data = chunk;
-    }
-
-    const groupCount = Math.floor(data.length / GROUP_SIZE);
-    const usedBytes = groupCount * GROUP_SIZE;
-    leftoverBytes = data.slice(usedBytes);
-    if (groupCount === 0) return;
-
-    const dv = new DataView(data.buffer, data.byteOffset, usedBytes);
-    const mono = new Int16Array(groupCount);
-    let committed = 0; // index in `mono` of first uncommitted sample
+  /** Mix `groupCount` whole timesteps of `data`, starting at `byteOffset`. */
+  function mixGroups(data: Uint8Array, byteOffset: number, groupCount: number): void {
+    if (scratch.length < groupCount) scratch = new Int16Array(groupCount);
+    const dv = new DataView(data.buffer, data.byteOffset + byteOffset, groupCount * GROUP_SIZE);
+    let committed = 0; // index in `scratch` of first sample not yet in the ring
 
     for (let g = 0; g < groupCount; g++) {
       let maxAbs = 0;
@@ -547,29 +592,99 @@ function startCombinedPump(
           maxSigned = s;
         }
       }
-      mono[g] = maxSigned;
+      scratch[g] = maxSigned;
       windowMonoSumSq += maxSigned * maxSigned;
       windowSamples++;
 
       if (windowSamples >= RMS_WINDOW_SAMPLES) {
-        if (g + 1 > committed) {
-          appendMono(mono.slice(committed, g + 1));
-          committed = g + 1;
-        }
+        // finishWindow reads mono.end, so the window's samples go in first.
+        appendMono(scratch.subarray(committed, g + 1));
+        committed = g + 1;
         finishWindow();
       }
     }
-    if (committed < groupCount) {
-      appendMono(mono.slice(committed, groupCount));
+    appendMono(scratch.subarray(committed, groupCount));
+  }
+
+  const onPcm = (chunk: Uint8Array): void => {
+    recordBytes(chunk.length);
+    let offset = 0;
+    if (partialLen > 0) {
+      const take = Math.min(GROUP_SIZE - partialLen, chunk.length);
+      partial.set(chunk.subarray(0, take), partialLen);
+      partialLen += take;
+      offset = take;
+      if (partialLen < GROUP_SIZE) return;
+      mixGroups(partial, 0, 1);
+      partialLen = 0;
+    }
+    const groupCount = Math.floor((chunk.length - offset) / GROUP_SIZE);
+    if (groupCount > 0) mixGroups(chunk, offset, groupCount);
+    const rest = chunk.length - offset - groupCount * GROUP_SIZE;
+    if (rest > 0) {
+      partial.set(chunk.subarray(chunk.length - rest), 0);
+      partialLen = rest;
     }
   };
 
-  // Build the ffmpeg invocation.
   // stitchd produces the merged PCM on its stdout; this function only owns
-  // the consumer side. It used to also build an ffmpeg that opened one RTSP
-  // audio input per camera and amerged them — a second full set of camera
-  // connections, deleted with the rest of the ffmpeg pipeline.
-  return { onPcm: onStdout };
+  // the consumer side.
+  return { onPcm, mono };
+}
+
+/**
+ * Feed PCM to a consumer built by `make`, and rebuild it when it throws.
+ *
+ * A consumer that has thrown has state nobody can vouch for, and feeding it
+ * the next chunk just throws again — that is how one OOM became eight days of
+ * a stack trace per chunk (79 GB of log). So the first throw detaches it
+ * (`sink.write = null`, later chunks are dropped by the caller), logs the
+ * error once, and builds a fresh consumer after `retryMs`. More than
+ * `maxRestarts` failures inside `windowMs` means a fresh consumer does not
+ * help — the process itself is unwell — so it escalates to `onFatal`, which
+ * exits and lets the container's restart policy start everything clean.
+ */
+export function superviseConsumer(
+  sink: PcmSink,
+  make: () => (chunk: Uint8Array) => void,
+  opts: {
+    retryMs: number;
+    maxRestarts: number;
+    windowMs: number;
+    onFatal: (err: unknown) => void;
+  }
+): void {
+  const failures: number[] = [];
+  const attach = (): void => {
+    const consume = make();
+    const write = (chunk: Uint8Array): void => {
+      try {
+        consume(chunk);
+      } catch (err) {
+        if (sink.write === write) sink.write = null;
+        const now = Date.now();
+        while (failures.length > 0 && now - failures[0]! >= opts.windowMs) failures.shift();
+        failures.push(now);
+        const window = `${Math.round(opts.windowMs / 60_000)} min`;
+        if (failures.length > opts.maxRestarts) {
+          console.error(
+            `[transcribe] PCM consumer failed ${failures.length} times in ${window} — giving up:`,
+            err
+          );
+          opts.onFatal(err);
+          return;
+        }
+        console.error(
+          `[transcribe] PCM consumer failed (${failures.length}/${opts.maxRestarts} restarts ` +
+            `in ${window}) — transcription stopped, rebuilding it in ${opts.retryMs / 1000}s:`,
+          err
+        );
+        setTimeout(attach, opts.retryMs);
+      }
+    };
+    sink.write = write;
+  };
+  attach();
 }
 
 /**
@@ -598,7 +713,10 @@ export function startTranscription(
   /** stitchd supplies the merged PCM here. The sink stays null until whisper
    *  is up, so early bytes are
    *  dropped rather than queued against a server that cannot answer. */
-  pcmSink: PcmSink
+  pcmSink: PcmSink,
+  /** Called when the PCM consumer keeps failing however often it is rebuilt.
+   *  Expected to stop everything and exit non-zero. */
+  onFatal: (err: unknown) => void
 ): { ring: RingBuffer; stats: LiveStats } {
   const t = config.transcription;
   const ring = new RingBuffer(t.max_entries_per_camera);
@@ -650,8 +768,18 @@ export function startTranscription(
           ` for ${cameras.length} camera(s)` +
           (skipped > 0 ? ` (${skipped} excluded via transcribe: false)` : "")
       );
-      const pump = startCombinedPump(cameras, config, whisperUrl, ring, stats);
-      pcmSink.write = pump.onPcm;
+      superviseConsumer(
+        pcmSink,
+        () =>
+          startCombinedPump(
+            cameras,
+            config,
+            (pcm) => transcribe(whisperUrl, pcm, t.language, t.initial_prompt),
+            ring,
+            stats
+          ).onPcm,
+        { retryMs: 10_000, maxRestarts: 3, windowMs: 60 * 60_000, onFatal }
+      );
     } catch (err) {
       console.error("[transcribe] whisper-server never came up:", err);
     }
