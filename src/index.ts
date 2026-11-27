@@ -191,7 +191,11 @@ async function main() {
   // Transcription stack (whisper-server). Spawns its own supervised
   // subprocesses into `processes`. stitchd already demuxes every camera and
   // hands us the merged audio directly, so there is no separate audio pump.
-  const transcription = startTranscription(config, processes, pcmSink);
+  // A transcription consumer that keeps failing however often it is rebuilt
+  // means this process is unwell (it was out of memory, the one time it
+  // happened): exit so the container restarts clean, rather than run on with
+  // transcription dead. `stop` is defined below; this only runs later.
+  const transcription = startTranscription(config, processes, pcmSink, () => stop(1));
 
   // Watchdog: restart stitchd if an output stops producing, or if one of its
   // inputs reconnects. Catches a stuck-but-alive process the supervisor
@@ -217,18 +221,18 @@ async function main() {
   }
 
   // Handle shutdown
-  const shutdown = () => {
-    console.log("\nShutting down...");
+  function stop(code: number): void {
+    console.log(code === 0 ? "\nShutting down..." : `\nShutting down (exit ${code})...`);
     watchdog.stop();
     for (const p of processes) {
       p.stop();
     }
     dashServer?.stop();
-    process.exit(0);
-  };
+    process.exit(code);
+  }
 
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", () => stop(0));
+  process.on("SIGTERM", () => stop(0));
 
   console.log("\nRunning. Press Ctrl+C to stop.");
 

@@ -7,7 +7,8 @@
     "start": "bun run src/index.ts",
     "dry-run": "bun run src/index.ts --dry-run --skip-probe",
     "dev": "bun run src/index.ts --skip-probe",
-    "check": "bun run --bun tsc --noEmit"
+    "check": "bun run --bun tsc --noEmit",
+    "test": "bun test"
   },
   "devDependencies": {
     "@types/bun": "latest"

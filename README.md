@@ -92,6 +92,8 @@ cp config.example.yaml config.yaml
 bun run dry-run        # show ffmpeg command + exit (skips probing)
 bun run start          # full run (probes cameras at startup)
 bun run dev            # full run with skip-probe (assumes 2560x1440 @ 30fps)
+bun run check          # typecheck
+bun test               # unit tests (CI runs both before building the image)
 ```
 
 ### CLI Options
